@@ -24,7 +24,7 @@ services:
       # 将主机 Codex Desktop 的 loopback local-access 端点映射到 Docker host gateway。
       - CODEX_DOCKER_HOST=host.docker.internal
       # Codex CLI 必须走主机代理；容器内不能使用 127.0.0.1 访问主机。
-      - CODEX_PROXY_URL=http://host.docker.internal:7890
+      - CODEX_PROXY_URL=${CODEX_PROXY_URL:-http://host.docker.internal:7890}
     volumes:
       - ./data:/app/data
       - ./tiers.yaml:/app/tiers.yaml:ro
