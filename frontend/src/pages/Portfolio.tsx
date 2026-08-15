@@ -33,6 +33,7 @@ import {
 
 import { DatePicker } from '@/components/DatePicker'
 import { InstrumentSearchInput } from '@/components/InstrumentSearchInput'
+import { Modal } from '@/components/Modal'
 import { PageHeader } from '@/components/PageHeader'
 import { toast } from '@/components/Toast'
 import {
@@ -126,6 +127,7 @@ export function Portfolio() {
   const [tradeEditBusy, setTradeEditBusy] = useState(false)
   const [costEditTrade, setCostEditTrade] = useState<PortfolioTrade | null>(null)
   const [monitorPosition, setMonitorPosition] = useState<PortfolioPosition | null>(null)
+  const [tradeDetailPosition, setTradeDetailPosition] = useState<PortfolioPosition | null>(null)
   const [draft, setDraft] = useState<TradeDraft | null>(null)
   const [statementOpen, setStatementOpen] = useState(false)
   const [tradesView, setTradesView] = useState<'flat' | 'stock' | 'date'>('flat')
@@ -163,6 +165,10 @@ export function Portfolio() {
   )
   const snapshot = snapshotQuery.data
   const trades = tradesQuery.data?.items ?? []
+  const visibleTrades = useMemo(
+    () => asOf ? trades.filter(trade => trade.trade_date <= asOf) : [],
+    [asOf, trades],
+  )
   const rows = useMemo(() => (
     snapshot?.accounts.flatMap(account => account.positions.map(position => ({
       account,
@@ -183,7 +189,7 @@ export function Portfolio() {
   // trades 已由后端按 (trade_date, created_at, id) 倒序返回，分组时保持数组顺序即为组内最新在前
   const tradesByDate = useMemo<DateTradeGroup[]>(() => {
     const byDate = new Map<string, DateTradeGroup>()
-    for (const trade of trades) {
+    for (const trade of visibleTrades) {
       let group = byDate.get(trade.trade_date)
       if (!group) {
         group = { date: trade.trade_date, items: [], buyCount: 0, sellCount: 0, netAmount: 0 }
@@ -199,11 +205,11 @@ export function Portfolio() {
       }
     }
     return [...byDate.values()].sort((a, b) => b.date.localeCompare(a.date))
-  }, [trades])
+  }, [visibleTrades])
 
   const tradesByStock = useMemo<StockTradeGroup[]>(() => {
     const bySymbol = new Map<string, StockTradeGroup>()
-    for (const trade of trades) {
+    for (const trade of visibleTrades) {
       let group = bySymbol.get(trade.symbol)
       if (!group) {
         group = { symbol: trade.symbol, name: '', assetType: trade.asset_type, items: [], buyCount: 0, sellCount: 0, netAmount: 0, netQuantity: 0 }
@@ -229,7 +235,7 @@ export function Portfolio() {
         if (aDate !== bDate) return bDate.localeCompare(aDate)
         return a.symbol.localeCompare(b.symbol)
       })
-  }, [trades])
+  }, [visibleTrades])
 
   async function invalidatePortfolio() {
     await Promise.all([
@@ -386,10 +392,10 @@ export function Portfolio() {
   function handleTradeDragEnd(event: DragEndEvent) {
     const { active, over } = event
     if (!over || active.id === over.id) return
-    const activeTrade = trades.find(item => item.id === active.id)
-    const overTrade = trades.find(item => item.id === over.id)
+    const activeTrade = visibleTrades.find(item => item.id === active.id)
+    const overTrade = visibleTrades.find(item => item.id === over.id)
     if (!activeTrade || !overTrade || activeTrade.trade_date !== overTrade.trade_date) return
-    const dayTrades = trades.filter(item => item.trade_date === activeTrade.trade_date)
+    const dayTrades = visibleTrades.filter(item => item.trade_date === activeTrade.trade_date)
     const oldIndex = dayTrades.findIndex(item => item.id === active.id)
     const newIndex = dayTrades.findIndex(item => item.id === over.id)
     if (oldIndex < 0 || newIndex < 0) return
@@ -517,7 +523,7 @@ export function Portfolio() {
                           <td className="px-3 py-3"><PositionPrice position={position} /></td>
                           <td className="px-3 py-3 text-right tabular"><div>{position.market_value == null ? '不可估值' : `¥ ${formatMoney(position.market_value)}`}</div><div className={cn('mt-0.5', position.unrealized_pnl == null ? 'text-muted' : position.unrealized_pnl >= 0 ? 'text-bull' : 'text-bear')}>{position.unrealized_pnl == null ? '—' : `${position.unrealized_pnl >= 0 ? '+' : ''}¥ ${formatMoney(position.unrealized_pnl)} · ${formatRatio(position.unrealized_return_ratio)}`}</div></td>
                           <td className="px-3 py-3"><PositionMonitorCell monitor={monitorBySymbol[position.symbol]} loading={priceMonitorsQuery.isLoading} onOpen={() => setMonitorPosition(position)} /></td>
-                          <td className="px-4 py-3"><div className="flex justify-end gap-1"><button onClick={() => analyzePosition(position)} className="flex items-center gap-1 rounded-btn border border-accent/25 bg-accent/5 px-2 py-1.5 text-[11px] text-accent hover:bg-accent/10" title={`分析 ${asOf} 的持仓`}><Sparkles className="h-3.5 w-3.5" />分析</button><button onClick={() => openCreateTrade('buy', position)} className="flex items-center gap-1 rounded-btn border border-bull/20 bg-bull/5 px-2 py-1.5 text-[11px] text-bull"><ArrowDownLeft className="h-3.5 w-3.5" />买入</button><button onClick={() => openCreateTrade('sell', position)} className="flex items-center gap-1 rounded-btn border border-bear/20 bg-bear/5 px-2 py-1.5 text-[11px] text-bear"><ArrowUpRight className="h-3.5 w-3.5" />卖出</button></div></td>
+                          <td className="px-4 py-3"><div className="flex justify-end gap-1"><button onClick={() => setTradeDetailPosition(position)} className="flex items-center gap-1 rounded-btn border border-border bg-elevated/40 px-2 py-1.5 text-[11px] text-secondary hover:text-foreground" title={`查看 ${position.name || position.symbol} 的交易明细`}><History className="h-3.5 w-3.5" />明细</button><button onClick={() => analyzePosition(position)} className="flex items-center gap-1 rounded-btn border border-accent/25 bg-accent/5 px-2 py-1.5 text-[11px] text-accent hover:bg-accent/10" title={`分析 ${asOf} 的持仓`}><Sparkles className="h-3.5 w-3.5" />分析</button><button onClick={() => openCreateTrade('buy', position)} className="flex items-center gap-1 rounded-btn border border-bull/20 bg-bull/5 px-2 py-1.5 text-[11px] text-bull"><ArrowDownLeft className="h-3.5 w-3.5" />买入</button><button onClick={() => openCreateTrade('sell', position)} className="flex items-center gap-1 rounded-btn border border-bear/20 bg-bear/5 px-2 py-1.5 text-[11px] text-bear"><ArrowUpRight className="h-3.5 w-3.5" />卖出</button></div></td>
                         </tr>
                       ))}
                     </tbody>
@@ -544,11 +550,22 @@ export function Portfolio() {
                 </button>
               ))}
             </div>
-            <span className="font-mono text-[11px] text-muted">{trades.length} 笔</span>
+            <span className="font-mono text-[11px] text-muted">{visibleTrades.length} 笔</span>
           </div>
           {tradesQuery.isLoading ? (
             <div className="grid min-h-36 place-items-center"><Loader2 className="h-4 w-4 animate-spin text-muted" /></div>
-          ) : trades.length === 0 ? (
+          ) : tradesQuery.isError ? (
+            <div className="grid min-h-36 place-items-center gap-2 px-4 text-center text-xs text-danger">
+              <span>交易流水加载失败</span>
+              <button
+                type="button"
+                onClick={() => tradesQuery.refetch()}
+                className="rounded-btn border border-border px-3 py-1.5 text-secondary hover:text-foreground"
+              >
+                重试
+              </button>
+            </div>
+          ) : visibleTrades.length === 0 ? (
             <div className="grid min-h-36 place-items-center px-4 text-center text-xs text-muted">尚无交易记录</div>
           ) : tradesView === 'date' ? (
             <div className="space-y-3 p-3">
@@ -586,12 +603,12 @@ export function Portfolio() {
             </div>
           ) : (
             <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={handleTradeDragEnd}>
-              <SortableContext items={trades.map(trade => trade.id)} strategy={verticalListSortingStrategy}>
+              <SortableContext items={visibleTrades.map(trade => trade.id)} strategy={verticalListSortingStrategy}>
                 <div className="overflow-x-auto">
                   <table className="w-full min-w-[900px] text-left text-xs">
                     <thead className="bg-elevated/50 text-muted"><tr><th className="w-7" /><th className="px-4 py-2 font-medium">交易日</th><th className="px-3 py-2 font-medium">标的 / 账户</th><th className="px-3 py-2 font-medium">方向</th><th className="px-3 py-2 text-right font-medium">数量 × 成交价</th><th className="px-3 py-2 text-right font-medium">费用 / 税费</th><th className="px-3 py-2 font-medium">备注</th><th className="px-4 py-2 text-right font-medium">操作</th></tr></thead>
                     <tbody className="divide-y divide-border/70">
-                      {trades.map(trade => (
+                      {visibleTrades.map(trade => (
                         <SortableTradeRow key={trade.id} id={trade.id} busy={reorderBusy}>
                           <td className="px-4 py-3 font-mono">{trade.trade_date}</td>
                           <td className="px-3 py-3"><div>{trade.name || trade.symbol}</div><div className="font-mono text-[10px] text-muted">{trade.symbol} · {accountNameById[trade.account_id] || '未知账户'}</div></td>
@@ -626,6 +643,25 @@ export function Portfolio() {
           defaultAccountId={selectedAccountId ?? accounts[0]?.id ?? ''}
           onClose={() => setStatementOpen(false)}
           onCommitted={invalidatePortfolio}
+        />
+      )}
+      {tradeDetailPosition && (
+        <PositionTradesDialog
+          position={tradeDetailPosition}
+          accountName={accountNameById[tradeDetailPosition.account_id] || '未知账户'}
+          items={visibleTrades.filter(trade => (
+            trade.account_id === tradeDetailPosition.account_id
+            && trade.symbol === tradeDetailPosition.symbol
+          ))}
+          loading={tradesQuery.isLoading}
+          loadError={tradesQuery.isError}
+          reorderBusy={reorderBusy}
+          tradeEditBusy={tradeEditBusy}
+          onClose={() => setTradeDetailPosition(null)}
+          onDelete={deleteTrade}
+          onReorderDay={reorderDayTrades}
+          onRetry={() => tradesQuery.refetch()}
+          onUpdateExecution={updateTradeExecution}
         />
       )}
       {costEditTrade && (
@@ -822,6 +858,125 @@ function CostSourceChip({ source }: { source?: PortfolioTrade['cost_source'] }) 
 function SignedNetAmount({ value }: { value: number }) {
   const tone = value > 0 ? 'text-bull' : value < 0 ? 'text-bear' : 'text-muted'
   return <span className={`font-mono ${tone}`}>{value > 0 ? '+' : value < 0 ? '-' : ''}¥ {formatMoney(Math.abs(value))}</span>
+}
+
+function PositionTradesDialog({
+  position,
+  accountName,
+  items,
+  loading,
+  loadError,
+  reorderBusy,
+  tradeEditBusy,
+  onClose,
+  onDelete,
+  onReorderDay,
+  onRetry,
+  onUpdateExecution,
+}: {
+  position: PortfolioPosition
+  accountName: string
+  items: PortfolioTrade[]
+  loading: boolean
+  loadError: boolean
+  reorderBusy: boolean
+  tradeEditBusy: boolean
+  onClose: () => void
+  onDelete: (trade: PortfolioTrade) => void
+  onReorderDay: (dayTradesInDisplayOrder: PortfolioTrade[]) => void
+  onRetry: () => void
+  onUpdateExecution: (trade: PortfolioTrade, quantity: number, price: number) => void
+}) {
+  const groups = useMemo(() => {
+    const byDate = new Map<string, PortfolioTrade[]>()
+    for (const trade of items) {
+      const group = byDate.get(trade.trade_date)
+      if (group) group.push(trade)
+      else byDate.set(trade.trade_date, [trade])
+    }
+    return [...byDate.entries()].map(([date, dayItems]) => ({ date, items: dayItems }))
+  }, [items])
+  const accountNameById = useMemo(
+    () => ({ [position.account_id]: accountName }),
+    [accountName, position.account_id],
+  )
+
+  return (
+    <Modal
+      onClose={onClose}
+      labelledBy="position-trades-title"
+      panelClassName="flex max-h-[92vh] w-[96vw] max-w-6xl flex-col overflow-hidden rounded-card border border-border bg-surface shadow-2xl"
+      overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-3 backdrop-blur-sm sm:p-4"
+    >
+      <header className="flex items-center gap-3 border-b border-border px-4 py-3.5 sm:px-5">
+        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-btn border border-accent/25 bg-accent/10 text-accent">
+          <History className="h-4 w-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h2 id="position-trades-title" className="truncate text-sm font-semibold text-foreground">
+            {position.name || position.symbol} · 交易明细
+          </h2>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-muted">
+            <span className="font-mono">{position.symbol}</span>
+            <span>{accountName}</span>
+            <span>{items.length} 笔</span>
+          </div>
+        </div>
+        <button onClick={onClose} className="rounded-btn p-1.5 text-muted hover:bg-elevated hover:text-foreground" title="关闭">
+          <X className="h-4 w-4" />
+        </button>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
+        <p className="mb-3 text-[11px] leading-5 text-muted">
+          修改数量、成交价或删除后会重新计算全部历史持仓；同一交易日有多笔交易时，可拖动行首手柄调整成交先后。
+        </p>
+        {loading ? (
+          <div className="grid min-h-40 place-items-center">
+            <Loader2 className="h-4 w-4 animate-spin text-muted" />
+          </div>
+        ) : loadError ? (
+          <div className="grid min-h-40 place-items-center gap-2 rounded-card border border-danger/25 px-4 text-center text-xs text-danger">
+            <span>交易明细加载失败</span>
+            <button
+              type="button"
+              onClick={onRetry}
+              className="rounded-btn border border-border px-3 py-1.5 text-secondary hover:text-foreground"
+            >
+              重试
+            </button>
+          </div>
+        ) : groups.length === 0 ? (
+          <div className="grid min-h-40 place-items-center rounded-card border border-dashed border-border text-xs text-muted">
+            暂无交易明细
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {groups.map(group => (
+              <section key={group.date} className="overflow-hidden rounded-card border border-border">
+                <div className="flex items-center justify-between gap-3 border-b border-border bg-elevated/40 px-3.5 py-2.5">
+                  <div className="font-mono text-xs font-medium text-foreground">{group.date}</div>
+                  <div className="text-[10px] text-muted">
+                    {group.items.length} 笔{group.items.length > 1 ? ' · 可拖动排序' : ''}
+                  </div>
+                </div>
+                <GroupedTradeTable
+                  items={group.items}
+                  mode="byDate"
+                  accountNameById={accountNameById}
+                  onDelete={onDelete}
+                  onReorderDay={group.items.length > 1 ? onReorderDay : undefined}
+                  reorderBusy={reorderBusy}
+                  onUpdateExecution={onUpdateExecution}
+                  tradeEditBusy={tradeEditBusy}
+                />
+              </section>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
+  )
 }
 
 function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDay, reorderBusy, onEditCost, onUpdateExecution, tradeEditBusy }: { items: PortfolioTrade[]; mode: 'byDate' | 'byStock'; accountNameById: Record<string, string>; onDelete: (trade: PortfolioTrade) => void; onReorderDay?: (dayTradesInDisplayOrder: PortfolioTrade[]) => void; reorderBusy?: boolean; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean }) {
