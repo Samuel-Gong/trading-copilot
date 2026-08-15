@@ -156,9 +156,11 @@ class QuoteService:
     }
     DEFAULT_INTERVAL = 6.0
     MAX_INTERVAL = 60.0
+    STOP_JOIN_TIMEOUT = 10.0
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         # 串行化行情拉取: 手动 POST /refresh 与后台轮询线程可能并发调用
         # _fetch_quotes, 两者同时写同一批 parquet/缓存会互相覆盖
         self._fetch_lock = threading.Lock()
@@ -170,6 +172,8 @@ class QuoteService:
         self._paused = False
         self._interval = self.DEFAULT_INTERVAL
         self._thread: threading.Thread | None = None
+        self._stop_event: threading.Event | None = None
+        self._restart_pending = False
         self._repo = None          # 延迟注入, 避免循环导入
         # SSE 订阅者集合: 每个 /stream 连接一个 QuoteSubscriber, 事件广播到所有订阅者
         self._subscribers: set[QuoteSubscriber] = set()
@@ -202,27 +206,18 @@ class QuoteService:
 
     def start(self, interval: float = 0.0) -> None:
         """启动后台行情轮询线程。"""
-        if self._running:
-            return
         if interval <= 0:
             from app.services import preferences
             interval = preferences.get_realtime_quote_interval()
-        self._interval = self._clamp_interval(interval)
-        self._running = True
-        self._enabled = True
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._thread.start()
-        self._save_enabled(True)
-        logger.info("行情服务已启动, 轮询间隔 %.1fs", self._interval)
+        with self._lifecycle_lock:
+            self._start_runtime_locked(interval)
+            self._save_enabled(True)
 
     def stop(self) -> None:
-        """停止后台行情轮询线程。"""
-        self._running = False
-        self._enabled = False
-        if self._thread:
-            self._thread.join(timeout=10)
-            self._thread = None
-        self._save_enabled(False)
+        """停止后台行情轮询线程并保留用户的启用偏好。"""
+        with self._lifecycle_lock:
+            thread = self._request_stop_locked()
+        self._join_stopping_thread(thread)
         logger.info("行情服务已停止")
 
     def enable(self) -> bool:
@@ -234,21 +229,84 @@ class QuoteService:
         if not self.is_realtime_allowed():
             logger.warning("实时行情开启被拒:当前档位(none)无实时行情权限")
             return False
-        self._enabled = True
-        self._save_enabled(True)
-        if not self._running:
-            from app.services import preferences
-            self._interval = self._clamp_interval(preferences.get_realtime_quote_interval())
-            self._running = True
-            self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-            self._thread.start()
+        from app.services import preferences
+        interval = preferences.get_realtime_quote_interval()
+        with self._lifecycle_lock:
+            self._start_runtime_locked(interval)
+            self._save_enabled(True)
         logger.info("行情服务已启用, 轮询间隔 %.1fs", self._interval)
         return True
 
     def disable(self) -> None:
-        """关闭自动行情。"""
-        self.stop()
+        """由用户关闭自动行情并持久化关闭偏好。"""
+        save_error: Exception | None = None
+        with self._lifecycle_lock:
+            try:
+                self._save_enabled(False)
+            except Exception as error:  # noqa: BLE001
+                save_error = error
+            thread = self._request_stop_locked()
+        self._join_stopping_thread(thread)
         logger.info("行情服务已关闭")
+        if save_error is not None:
+            raise save_error
+
+    def _start_runtime_locked(self, interval: float) -> None:
+        """在生命周期锁内启动，或登记旧线程退出后的接续启动。"""
+        thread = self._thread
+        stop_event = self._stop_event
+        if thread is not None and thread.is_alive():
+            self._enabled = True
+            if stop_event is not None and stop_event.is_set():
+                self._restart_pending = True
+                logger.info("旧行情线程仍在退出，已登记退出后自动恢复")
+            else:
+                self._running = True
+            return
+
+        self._restart_pending = False
+        self._interval = self._clamp_interval(interval)
+        stop_event = threading.Event()
+        thread = threading.Thread(target=self._poll_loop, args=(stop_event,), daemon=True)
+        self._stop_event = stop_event
+        self._thread = thread
+        self._running = True
+        self._enabled = True
+        thread.start()
+        logger.info("行情服务已启动, 轮询间隔 %.1fs", self._interval)
+
+    def _request_stop_locked(self) -> threading.Thread | None:
+        """在生命周期锁内请求当前线程退出，并取消尚未执行的接续启动。"""
+        self._running = False
+        self._enabled = False
+        self._restart_pending = False
+        if self._stop_event is not None:
+            self._stop_event.set()
+        return self._thread
+
+    def _join_stopping_thread(self, thread: threading.Thread | None) -> None:
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=self.STOP_JOIN_TIMEOUT)
+        if thread.is_alive():
+            logger.warning("行情线程仍在等待上游请求返回，保留引用并禁止并行重启")
+
+    def _poll_thread_exited(
+        self,
+        thread: threading.Thread,
+        stop_event: threading.Event,
+    ) -> None:
+        """清理已退出线程；若恢复请求在等待，则串行启动下一代线程。"""
+        with self._lifecycle_lock:
+            if self._thread is not thread or self._stop_event is not stop_event:
+                return
+            self._thread = None
+            self._stop_event = None
+            self._running = False
+            restart = self._restart_pending and self._enabled
+            self._restart_pending = False
+            if restart:
+                self._start_runtime_locked(self._interval)
 
     # ================================================================
     # 临时暂停 (盘后管道/数据修正期间, 防止写盘竞态)
@@ -289,19 +347,23 @@ class QuoteService:
             self.resume()
 
     def boot_check(self) -> None:
-        """启动时检查 preferences，若 enabled 则自动启动。
+        """按持久化偏好和当前能力协调实际运行状态。
 
-        none 档无实时行情权限:即使 preferences 标记为 enabled,
-        也不启动,并同步 preferences 为关闭(避免 UI 误显示已开启)。
+        none 档或暂时探测失败时只停止当前运行，不覆盖用户偏好；能力恢复后
+        再次调用本方法即可按原偏好自动恢复。
         """
         from app.services import preferences
-        if not self.is_realtime_allowed():
-            if preferences.get_realtime_quotes_enabled():
-                self._save_enabled(False)
+        allowed = self.is_realtime_allowed()
+        with self._lifecycle_lock:
+            desired = preferences.get_realtime_quotes_enabled()
+            if allowed and desired:
+                self._start_runtime_locked(preferences.get_realtime_quote_interval())
+                thread = None
+            else:
+                thread = self._request_stop_locked()
+        self._join_stopping_thread(thread)
+        if not allowed:
             logger.info("实时行情未启动:当前档位(none)无实时行情权限")
-            return
-        if preferences.get_realtime_quotes_enabled():
-            self.start()
 
     def set_repo(self, repo) -> None:
         """注入 KlineRepository, 用于实时落盘。"""
@@ -508,34 +570,39 @@ class QuoteService:
     # 后台轮询
     # ================================================================
 
-    def _poll_loop(self) -> None:
-        while self._running and self._enabled:
-            try:
-                # 管道/数据修正运行期间临时暂停取数, 防止与管道写同一批 parquet 竞态。
-                # 线程继续存活 + 分片 sleep, resume() 后即时恢复, 无需重启线程。
-                if not self._paused:
-                    phase = self._market_phase()
-                    if self._should_fetch_for_phase(phase):
-                        is_final = phase in {"morning_final", "close_final"}
-                        ok = self._fetch_quotes(final=is_final)
-                        if is_final:
-                            key = self._final_sync_key(phase)
-                            if key and ok:
-                                self._final_sync_done.add(key)
-                                self._final_sync_failed.pop(key, None)
-                                logger.info("%s 最终行情同步完成, 进入休盘态", "午休" if phase == "morning_final" else "收盘")
-                            elif key:
-                                self._final_sync_failed[key] = "fetch_failed"
-                                logger.warning("%s 最终行情同步失败, 将继续重试", "午休" if phase == "morning_final" else "收盘")
-                    else:
-                        logger.debug("非轮询阶段(%s), 跳过行情轮询", phase)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("行情轮询异常: %s", e)
+    def _poll_loop(self, stop_event: threading.Event) -> None:
+        thread = threading.current_thread()
+        try:
+            while not stop_event.is_set():
+                try:
+                    # 管道/数据修正运行期间临时暂停取数, 防止与管道写同一批 parquet 竞态。
+                    # 线程继续存活 + 分片等待, resume() 后即时恢复, 无需重启线程。
+                    if not self._paused:
+                        phase = self._market_phase()
+                        if self._should_fetch_for_phase(phase):
+                            is_final = phase in {"morning_final", "close_final"}
+                            ok = self._fetch_quotes(final=is_final)
+                            if is_final:
+                                key = self._final_sync_key(phase)
+                                if key and ok:
+                                    self._final_sync_done.add(key)
+                                    self._final_sync_failed.pop(key, None)
+                                    logger.info("%s 最终行情同步完成, 进入休盘态", "午休" if phase == "morning_final" else "收盘")
+                                elif key:
+                                    self._final_sync_failed[key] = "fetch_failed"
+                                    logger.warning("%s 最终行情同步失败, 将继续重试", "午休" if phase == "morning_final" else "收盘")
+                        else:
+                            logger.debug("非轮询阶段(%s), 跳过行情轮询", phase)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("行情轮询异常: %s", e)
 
-            waited = 0.0
-            while self._running and self._enabled and waited < self._interval:
-                time.sleep(0.5)
-                waited += 0.5
+                waited = 0.0
+                while not stop_event.is_set() and waited < self._interval:
+                    step = min(0.5, self._interval - waited)
+                    stop_event.wait(step)
+                    waited += step
+        finally:
+            self._poll_thread_exited(thread, stop_event)
 
     def _fetch_quotes(self, *, final: bool = False) -> bool:
         """按当前档位拉取行情。加锁串行化 (后台轮询 vs 手动 refresh)。返回本轮是否成功更新。"""

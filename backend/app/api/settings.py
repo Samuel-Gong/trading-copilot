@@ -156,6 +156,7 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
         capset = detect_capabilities(force=True)
         request.app.state.capabilities = capset
         _sync_financial_scheduler_caps(request.app.state, capset)
+        _reconcile_quote_service(request.app.state)
         return {
             "ok": False,
             "reason": "invalid",
@@ -172,6 +173,7 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
         # 免费档运行时走 free-api 服务器,清除付费端点的自定义配置
         secrets_store.clear("tickflow_base_url")
         tf_client.reset_clients()
+        _reconcile_quote_service(request.app.state)
         return {
             "ok": True,
             "tickflow_api_key_masked": secrets_store.mask(key),
@@ -188,6 +190,7 @@ def save_tickflow_key(req: TickflowKeyIn, request: Request) -> dict:
     if not base:
         secrets_store.save({"tickflow_base_url": DEFAULT_PAID_ENDPOINT})
     tf_client.reset_clients()
+    _reconcile_quote_service(request.app.state)
 
     return {
         "ok": True,
@@ -213,6 +216,7 @@ def clear_tickflow_key(request: Request) -> dict:
     capset = detect_capabilities(force=True)
     request.app.state.capabilities = capset
     _sync_financial_scheduler_caps(request.app.state, capset)
+    _reconcile_quote_service(request.app.state)
 
     return {
         "ok": True,
@@ -221,6 +225,12 @@ def clear_tickflow_key(request: Request) -> dict:
         "current_endpoint": tf_client.current_endpoint(),
         "capabilities_count": len(capset.all()),
     }
+
+
+def _reconcile_quote_service(app_state) -> None:
+    quote_service = getattr(app_state, "quote_service", None)
+    if quote_service:
+        quote_service.boot_check()
 
 
 @router.post("/onboarding/complete")

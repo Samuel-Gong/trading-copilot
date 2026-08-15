@@ -1,7 +1,7 @@
 """API 路由 — Phase 0 仅 /health 与 /api/capabilities。"""
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from app import __version__
 from app.config import settings
@@ -37,9 +37,16 @@ def capabilities() -> dict:
 
 
 @router.post("/api/capabilities/redetect")
-def redetect() -> dict:
+def redetect(request: Request) -> dict:
     """用户在设置页"重新检测"按钮。"""
     capset = detect_capabilities(force=True)
+    request.app.state.capabilities = capset
+    financial_scheduler = getattr(request.app.state, "financial_scheduler", None)
+    if financial_scheduler:
+        financial_scheduler.update_capabilities(capset)
+    quote_service = getattr(request.app.state, "quote_service", None)
+    if quote_service:
+        quote_service.boot_check()
     return {
         "label": tier_label(),
         "capabilities": capset.to_dict(),

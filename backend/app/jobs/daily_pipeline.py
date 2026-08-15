@@ -956,6 +956,9 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
             old_n = len(old.all()) if old else -1
             new_capset = detect_capabilities(force=True)
             app_state.capabilities = new_capset
+            quote_service = getattr(app_state, "quote_service", None)
+            if quote_service:
+                quote_service.boot_check()
             new_n = len(new_capset.all())
             if old_n != new_n:
                 logger.warning(
