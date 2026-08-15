@@ -16,6 +16,10 @@
 
 ## Code Review Rules
 
+### 输出语言
+
+- GitHub Codex Code Review 的总结、行内评论和修改建议统一使用简体中文；代码、标识符、文件路径、命令和专有名词保留原文。
+
 ### Secret 与用户数据
 
 - 发现提交内容、测试夹具、日志、Issue/PR 文案或发布包可能包含真实密码、API Key、Cookie、SSH Key、持仓交易数据或本机绝对路径时，按 P0/P1 阻断；安全路径是使用占位值或脱敏的最小合成数据，并把真实值保留在 GitHub Secret 或本机/服务器忽略文件中。
