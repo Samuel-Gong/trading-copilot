@@ -6,7 +6,7 @@
 
 - `main` 是唯一允许部署到生产环境的分支。
 - 合并到 `main` 只构建发布包，**不会自动上线**。
-- 生产发布必须从 GitHub Actions 手动触发，并经过 GitHub `production` Environment 的人工审批。
+- 生产发布必须从 GitHub Actions 手动触发，并受 GitHub `production` Environment 的 `main` 分支策略约束；当前私有仓库套餐不支持 Required reviewers，手动触发本身即为发布确认。
 - 生产目录禁止直接执行 `git pull`，也禁止在服务器上临时修改源码。
 - 每个发布包由完整 Git SHA 标识；服务器用版本目录保存，不覆盖旧版本。
 - `.env`、API Key、访问密码、用户数据和备份只保存在服务器，不进入发布包和 Git。
@@ -33,10 +33,15 @@
 /var/lib/tickflow/
 ├── data/
 ├── backups/
-└── incoming/
+├── incoming/
+├── deploy-queue/
+└── deploy-results/
 
 /etc/tickflow/
 └── tickflow.env
+
+/home/tickflow-deploy/
+└── incoming/
 ```
 
 职责边界：
@@ -46,7 +51,10 @@
 - `/opt/tickflow/previous`：最近一个可手工回滚的版本。
 - `/var/lib/tickflow/data`：唯一生产数据目录，发布与代码回滚都不会删除。
 - `/var/lib/tickflow/backups`：部署前创建的数据快照，默认保留最近 5 份。
-- `/var/lib/tickflow/incoming`：root 专用的发布包快照目录，避免 Runner 在校验后替换归档。
+- `/var/lib/tickflow/incoming`：root 专用的发布包快照目录，避免上传用户在校验后替换归档。
+- `/var/lib/tickflow/deploy-queue`：SSH 提交器固定下来的 root 发布队列。
+- `/var/lib/tickflow/deploy-results`：服务器托管部署任务的持久状态；目录为 `root:tickflow-deploy 0750`、状态文件为 `root:tickflow-deploy 0640`，供 Actions 使用的低权限账号只读轮询。
+- `/home/tickflow-deploy/incoming`：GitHub-hosted job 使用低权限 SSH 用户上传本次发布包的固定目录。
 - `/etc/tickflow/tickflow.env`：生产密钥与配置，权限必须为 `600`。
 
 不要把本机 macOS 的 `.venv` 复制到 UCloud。虚拟环境不可跨操作系统迁移；部署器会以现有 `ubuntu` 服务用户在每个 Linux release 目录中执行锁定的 `uv sync`。`uv` 使用 `/home/ubuntu` 下该用户的默认全局缓存，不设置单独的 `UV_CACHE_DIR`。
@@ -88,7 +96,13 @@ sudo install -d -o root -g root -m 0755 /etc/tickflow
 ```bash
 sudo install -o root -g root -m 0755 ops/deploy.sh /usr/local/sbin/tickflow-deploy
 sudo install -o root -g root -m 0755 ops/rollback.sh /usr/local/sbin/tickflow-rollback
+sudo install -o root -g root -m 0755 ops/deploy-submit.sh /usr/local/sbin/tickflow-deploy-submit
+sudo install -o root -g root -m 0755 ops/deploy-job.sh /usr/local/sbin/tickflow-deploy-job
+sudo install -o root -g root -m 0755 ops/deploy-ssh.sh /usr/local/sbin/tickflow-deploy-ssh
 sudo install -o root -g root -m 0644 ops/systemd/tickflow.service /etc/systemd/system/tickflow.service
+sudo install -o root -g root -m 0644 ops/ssh/tickflow-deploy.conf /etc/ssh/sshd_config.d/60-tickflow-deploy.conf
+sudo sshd -t
+sudo systemctl reload ssh
 sudo systemctl daemon-reload
 ```
 
@@ -162,10 +176,10 @@ sudo systemctl list-timers --all | grep -E 'certbot|snap.certbot'
 UCloud 安全组只开放必要端口：
 
 - 80/443：公网访问。
-- 22：只允许固定管理 IP，或改用其他受控运维通道。
+- 22：标准 GitHub-hosted runner 没有固定出口地址，无法做窄范围 allowlist；当前需要公网可达，并依靠独立密钥、root 持有的认证文件、`ForceCommand` 白名单和最小 sudo 权限收窄风险。若购买带静态 IP 的 larger runner，应立即把安全组改为静态 allowlist。
 - 3018：不向公网开放。
 
-用户只通过 `https://106.75.247.19/` 访问，不使用 3018 端口或明文 HTTP。若公网 IP 发生变化，必须重新签发证书并同步更新 Nginx 中的 `server_name` 和证书路径。
+用户只通过 `https://106.75.247.19/` 访问，不使用 3018 端口或明文 HTTP。若公网 IP 发生变化，必须重新签发证书，并同步更新 Nginx 的 `server_name`/证书路径、生产 workflow 的 `HostName`、`UCLOUD_SSH_KNOWN_HOSTS` 和 UCloud 安全组。
 
 ### 3.7 一次性迁移现有部署
 
@@ -177,7 +191,7 @@ sudo rsync -a --delete /opt/trading-copilot/data/ /var/lib/tickflow/data/
 sudo chown -R ubuntu:ubuntu /var/lib/tickflow/data
 ```
 
-手动触发 `UCloud 生产发布`，等待 `package` 完成并停在 `production` Environment 审批。批准前进入维护窗口：
+当前私有仓库套餐不提供 Environment 人工暂停点。首次切换时先进入维护窗口并完成最终同步，再手动触发 `UCloud 生产发布`；这会增加一次构建与安装时长的停机，但能保证旧、新进程不会争用端口或数据：
 
 ```bash
 set -Eeuo pipefail
@@ -187,7 +201,7 @@ sudo chown -R ubuntu:ubuntu /var/lib/tickflow/data
 sudo systemctl disable trading-copilot.service
 ```
 
-确认旧服务已经停止后再批准部署。新版本失败时，Actions 会保持失败；部署器会移除指向失败版本的 `current`，并且不会把未带 `.healthy` 标记的版本作为后续回滚基线。第一次发布还没有 `previous` 可自动回滚，应立即恢复旧服务：
+确认旧服务已经停止且最终同步完成后再触发 workflow。新版本失败时，Actions 会保持失败；部署器会移除指向失败版本的 `current`，并且不会把未带 `.healthy` 标记的版本作为后续回滚基线。第一次发布还没有 `previous` 可自动回滚，应立即恢复旧服务：
 
 ```bash
 sudo systemctl disable --now tickflow.service
@@ -208,27 +222,41 @@ curl --noproxy '*' -fsS http://127.0.0.1:3018/health
 
 在 GitHub 仓库设置中创建名为 `production` 的 Environment：
 
-1. 配置至少一名 Required reviewer。
-2. Deployment branches 只允许 `main`。
+1. Deployment branches 只允许 `main`。
+2. 保存 `UCLOUD_SSH_PRIVATE_KEY` 和 `UCLOUD_SSH_KNOWN_HOSTS` 两个 Environment secret。
 3. 不在 Environment 中保存应用 API Key；应用密钥只保存在 UCloud 的 `/etc/tickflow/tickflow.env`。
+4. 当前私有仓库套餐不支持 Required reviewers；若套餐升级，应立即增加至少一名 reviewer，并开启防止自审。
 
-### 4.2 生产自托管 Runner
+### 4.2 GitHub-hosted SSH 部署通道
 
-在 UCloud 上安装仓库级 self-hosted runner，并增加自定义标签：
+UCloud 到 GitHub 的出站 443 不稳定，因此生产机不运行 self-hosted runner。`deploy-production` 使用 GitHub-hosted `ubuntu-latest`，把当前 SHA 的发布包通过 SSH 上传到低权限账号：
 
 ```text
-tickflow-production
+tickflow-deploy@106.75.247.19:/home/tickflow-deploy/incoming/
 ```
 
-workflow 还要求 GitHub 默认标签 `self-hosted`、`Linux` 和 `X64`。Runner 只承担受保护的生产部署 job；PR 检查固定使用 `ubuntu-latest`，禁止让不受信任的 PR 代码运行在生产 Runner 上。
+为该账号创建独立 ED25519 密钥，私钥只保存在 `production` Environment secret。公钥放在 root 管理的 `/etc/ssh/authorized_keys/tickflow-deploy`；`Match User` 配置强制所有连接进入 `/usr/local/sbin/tickflow-deploy-ssh`，不允许普通 shell、端口转发或任意命令。账号没有生产数据读取权限，只能通过白名单协议上传、提交、查状态和清理自己的发布包。
 
-Runner 用户只需要免密执行固定部署器。例如 Runner 安装在 `/opt/actions-runner`、用户为 `actions-runner` 时，可用 `visudo` 配置与实际工作区匹配的命令：
+```bash
+sudo useradd --system --create-home --home-dir /home/tickflow-deploy --shell /bin/bash tickflow-deploy
+sudo install -d -o tickflow-deploy -g tickflow-deploy -m 0700 /home/tickflow-deploy/incoming
+sudo install -d -o root -g root -m 0755 /etc/ssh/authorized_keys
+sudo install -o root -g root -m 0644 \
+  /path/to/tickflow-deploy.pub /etc/ssh/authorized_keys/tickflow-deploy
+sudo passwd -l tickflow-deploy
+```
+
+私钥不得复制到服务器、仓库文件或 Actions 日志。`ops/ssh/tickflow-deploy.conf` 和三个入口脚本必须由 root 持有，修改后先通过 PR 审查再安装。
+
+sudoers 只允许它把固定目录中的发布包交给受控部署器：
 
 ```sudoers
-actions-runner ALL=(root) NOPASSWD: /usr/local/sbin/tickflow-deploy /opt/actions-runner/_work/_temp/server-artifact-*/tickflow-server-*.tar.gz
+tickflow-deploy ALL=(root) NOPASSWD: /usr/local/sbin/tickflow-deploy-submit /home/tickflow-deploy/incoming/tickflow-server-*.tar.gz
 ```
 
-先在 Runner job 中确认实际 `GITHUB_WORKSPACE`，再写死 sudoers 路径；不要授权任意 shell、`systemctl *` 或无边界的 root 命令。
+`UCLOUD_SSH_KNOWN_HOSTS` 不能只靠 `ssh-keyscan` 后直接信任。先通过已有可信管理会话或 UCloud 控制台读取 `/etc/ssh/ssh_host_*_key.pub` 的指纹，再与本机 `ssh-keyscan` 结果逐字核对；只有匹配后才把精确 host key 行写入 Environment secret。
+
+workflow 开启严格主机密钥校验。提交器先把上传文件复制到 root 队列，再用独立 systemd transient unit 执行部署；Actions 的 SSH 断线、取消或超时不会终止服务器事务。workflow 只轮询持久状态，上传账号无法替换队列归档。不要授权任意 shell、`systemctl *` 或无边界的 root 命令。
 
 ## 5. 发布过程
 
@@ -250,22 +278,23 @@ Actions 构建产物保留 30 天；UCloud 默认保留最近 5 个已安装 rel
 1. 确认目标提交已合并到 `main`，CI 全部通过。
 2. 打开 GitHub Actions → `UCloud 生产发布`。
 3. 选择 `main`，点击 `Run workflow`。
-4. `package` 完成后，由审批人核对 Git SHA 并批准 `production`。
-5. 等待 `deploy-production` 完成。
-6. 打开设置页或侧栏，确认显示的短 Git SHA 与目标提交一致。
-7. 检查 `/health`、核心页面、实时行情连接和监控中心，至少观察 10 分钟。
+4. 等待 `package` 和 `deploy-production` 完成。
+5. 打开设置页或侧栏，确认显示的短 Git SHA 与目标提交一致。
+6. 检查 `/health`、核心页面、实时行情连接和监控中心，至少观察 10 分钟。
 
 部署器执行顺序：
 
-1. 校验 SHA256、压缩包路径和 Git SHA。
-2. 解压到 `/opt/tickflow/releases/<git-sha>`。
-3. 使用该版本自己的 `backend/.venv` 安装锁定依赖；默认包含 `backtest` extra。
-4. 在服务仍运行时预同步数据快照。
-5. 停止 systemd 服务，再做一次增量同步，得到一致的数据快照。
-6. 原子切换 `/opt/tickflow/current`。
-7. 启动服务并轮询 `/health`，最长等待约 2 分钟。
-8. 探活必须返回本次发布的完整 Git SHA；失败或仍命中旧进程时自动切回旧版本并重新启动。
-9. 成功后更新 `/opt/tickflow/previous`，清理超出保留数量的旧版本和旧快照。
+1. SSH 白名单入口接收发布包并提交，root 复制到部署队列。
+2. systemd 托管独立部署事务，Actions 轮询 `deploy-results` 状态。
+3. 校验 SHA256、压缩包路径和 Git SHA。
+4. 解压到 `/opt/tickflow/releases/<git-sha>`。
+5. 使用该版本自己的 `backend/.venv` 安装锁定依赖；默认包含 `backtest` extra。
+6. 在服务仍运行时预同步数据快照。
+7. 停止 systemd 服务，再做一次增量同步，得到一致的数据快照。
+8. 原子切换 `/opt/tickflow/current`。
+9. 启动服务并轮询 `/health`，最长等待约 2 分钟。
+10. 探活必须返回本次发布的完整 Git SHA；失败或仍命中旧进程时自动切回旧版本并重新启动。
+11. 成功后更新 `/opt/tickflow/previous`，清理超出保留数量的旧版本和旧快照。
 
 第一次数据快照可能耗时较长；后续快照通过 `rsync --link-dest` 复用未变化文件。仍应结合 UCloud 云盘快照或异机备份做灾备，不能把同盘快照当作唯一备份。
 
@@ -312,7 +341,7 @@ sudo /usr/local/sbin/tickflow-rollback <完整的40位Git SHA>
   → 本地复现并完成代码、测试和前端构建
   → 创建 PR，完成 CI、自审和复审
   → 合并 main，只生成发布包
-  → 非交易时段手动触发生产发布并审批
+  → 非交易时段核对目标 SHA 并手动触发生产发布
   → 核对 Git SHA，验证核心流程并观察至少 10 分钟
   → 关闭 Issue
 ```
@@ -323,7 +352,7 @@ sudo /usr/local/sbin/tickflow-rollback <完整的40位Git SHA>
 
 - `P0`：数据破坏、安全漏洞或严重错误交易结果。立即停用相关入口或停止服务，保留现场；能通过代码回滚解除时先回滚。
 - `P1`：核心流程不可用或广泛回归。优先回滚到已知正常 SHA，再从当前生产基线创建 `hotfix/*`。
-- `P2/P3`：走普通 PR 和非交易时段发布，不跳过审批。
+- `P2/P3`：走普通 PR 和非交易时段发布，不跳过手动发布确认。
 
 紧急修复仍必须执行针对性测试、CI 和生产健康检查。不得在服务器直接改代码，也不得为了抢时间让两个实例同时访问同一数据目录。
 

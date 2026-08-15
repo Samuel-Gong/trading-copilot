@@ -1,7 +1,7 @@
 name: UCloud 生产发布
 
 # push main 只生成发布包，不自动上线。
-# 生产部署必须在 Actions 页面手动触发，并由 production Environment 控制审批。
+# 生产部署必须在 Actions 页面手动触发，并受 production Environment 的 main 分支策略约束。
 on:
   push:
     branches: [main]
@@ -40,7 +40,9 @@ jobs:
             uv run --no-sync python -m pytest -q
 
       - name: 发布包安全校验负例
-        run: bash ops/tests/test_archive_validation.sh
+        run: |
+          bash ops/tests/test_archive_validation.sh
+          bash ops/tests/test_deploy_ssh.sh
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
@@ -98,7 +100,8 @@ jobs:
     name: 部署生产环境
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs: package
-    runs-on: [self-hosted, Linux, X64, tickflow-production]
+    runs-on: ubuntu-latest
+    permissions: {}
     environment:
       name: production
     timeout-minutes: 60
@@ -109,7 +112,35 @@ jobs:
           name: tickflow-server-${{ github.sha }}
           path: ${{ runner.temp }}/server-artifact-${{ github.sha }}
 
-      - name: 执行受控生产部署
+      - name: 准备生产 SSH 凭据
+        env:
+          UCLOUD_SSH_PRIVATE_KEY: ${{ secrets.UCLOUD_SSH_PRIVATE_KEY }}
+          UCLOUD_SSH_KNOWN_HOSTS: ${{ secrets.UCLOUD_SSH_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 "${HOME}/.ssh"
+          install -m 0600 /dev/null "${HOME}/.ssh/tickflow-production"
+          printf '%s\n' "${UCLOUD_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/tickflow-production"
+          printf '%s\n' "${UCLOUD_SSH_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+          test -s "${HOME}/.ssh/tickflow-production"
+          test -s "${HOME}/.ssh/known_hosts"
+          ssh-keygen -y -f "${HOME}/.ssh/tickflow-production" >/dev/null
+
+          cat > "${HOME}/.ssh/config" <<EOF
+          Host tickflow-production
+              HostName 106.75.247.19
+              User tickflow-deploy
+              IdentityFile ${HOME}/.ssh/tickflow-production
+              UserKnownHostsFile ${HOME}/.ssh/known_hosts
+              BatchMode yes
+              IdentitiesOnly yes
+              StrictHostKeyChecking yes
+              RequestTTY no
+          EOF
+          chmod 0600 "${HOME}/.ssh/config"
+
+      - name: 上传本次发布包
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -117,4 +148,48 @@ jobs:
           archive="${artifact_dir}/tickflow-server-${GITHUB_SHA:0:12}.tar.gz"
           test -f "${archive}"
           test -f "${archive}.sha256"
-          sudo -n /usr/local/sbin/tickflow-deploy "${archive}"
+          archive_name="$(basename -- "${archive}")"
+          ssh tickflow-production "upload ${archive_name}" < "${archive}"
+          ssh tickflow-production "upload ${archive_name}.sha256" < "${archive}.sha256"
+
+      - name: 提交并等待服务器托管的生产部署
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive_name="tickflow-server-${GITHUB_SHA:0:12}.tar.gz"
+          job_id="$(ssh tickflow-production "submit ${archive_name}")"
+          [[ "${job_id}" =~ ^deploy-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]]
+
+          for attempt in $(seq 1 720); do
+            status="$(ssh tickflow-production "status ${job_id}")"
+            case "${status}" in
+              success)
+                printf '服务器部署成功: %s\n' "${job_id}"
+                exit 0
+                ;;
+              failed:*)
+                printf '服务器部署失败: %s (%s)\n' "${job_id}" "${status}" >&2
+                exit 1
+                ;;
+              queued|running)
+                sleep 5
+                ;;
+              *)
+                printf '未知服务器部署状态: %s\n' "${status}" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          printf '等待服务器部署超时；远端 systemd 事务不会随 Actions 中断，请检查任务 %s\n' "${job_id}" >&2
+          exit 1
+
+      - name: 清理上传暂存文件
+        if: always()
+        shell: bash
+        run: |
+          if [[ ! -s "${HOME}/.ssh/config" ]]; then
+            exit 0
+          fi
+          archive_name="tickflow-server-${GITHUB_SHA:0:12}.tar.gz"
+          ssh tickflow-production "cleanup ${archive_name}" || true
