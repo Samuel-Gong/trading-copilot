@@ -1,0 +1,35 @@
+[Unit]
+Description=TickFlow Stock Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/tickflow/current/backend
+
+EnvironmentFile=/etc/tickflow/tickflow.env
+EnvironmentFile=-/opt/tickflow/current/.release.env
+Environment=DATA_DIR=/var/lib/tickflow/data
+Environment=STATIC_DIR=/opt/tickflow/current/frontend/dist
+Environment=TIERS_YAML=/opt/tickflow/current/tiers.yaml
+Environment=TZ=Asia/Shanghai
+Environment=HOME=/home/ubuntu
+Environment=AUTH_COOKIE_SECURE=true
+
+# 生产应用直连外网，不继承开发机或服务管理器中的代理设置。
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY
+UnsetEnvironment=http_proxy https_proxy all_proxy
+
+ExecStart=/opt/tickflow/current/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 3018 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -327,6 +327,10 @@ export function Layout() {
   const qc = useQueryClient()
   const navigate = useNavigate()
   const version = versionData?.version
+  const releaseSha = versionData?.git_sha?.slice(0, 7)
+  const releaseTitle = [version, versionData?.git_sha, versionData?.build_time]
+    .filter(Boolean)
+    .join(' · ')
   const realtimeEnabled = prefs?.realtime_quotes_enabled ?? false
   // Free 档监控限制提示: 可手动关闭, 不持久化 (刷新后恢复显示)
   const [dismissFreeHint, setDismissFreeHint] = useState(false)
@@ -659,8 +663,11 @@ export function Layout() {
                 <Settings className="h-4 w-4 shrink-0" />
                 <span>设置</span>
               </span>
-              <span className="font-mono text-[10px] text-muted/50 select-none">
-                {version ?? ''}
+              <span
+                className="font-mono text-[10px] text-muted/50 select-none"
+                title={releaseTitle || undefined}
+              >
+                {version ?? ''}{releaseSha ? ` · ${releaseSha}` : ''}
               </span>
             </NavLink>
           </div>

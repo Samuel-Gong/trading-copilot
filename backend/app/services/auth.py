@@ -41,6 +41,10 @@ _sessions: dict[str, float] = {}
 _configured_cache: bool | None = None
 
 
+class AuthDataError(RuntimeError):
+    """认证文件存在但无法安全读取。"""
+
+
 def _path() -> Path:
     from app.config import settings
     p = settings.data_dir / "user_data" / "auth.json"
@@ -52,9 +56,13 @@ def _load() -> dict:
     p = _path()
     if p.exists():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("auth.json malformed: %s", e)
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("root value must be an object")
+            return data
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as e:
+            logger.error("auth.json unreadable; refusing to overwrite it: %s", e)
+            raise AuthDataError("auth.json 无法读取，已拒绝覆盖") from e
     return {}
 
 
@@ -116,6 +124,7 @@ def set_password(password: str) -> None:
             "password_salt": salt_hex,
             "updated_at": int(time.time()),
             "sessions": {},  # 清空持久化会话
+            "cookie_secure": _cookie_secure(),
         })
     _configured_cache = None  # 失效缓存, 下次 is_configured 重读最新真值
     logger.info("access password set")
@@ -190,13 +199,29 @@ def _persist_sessions_locked() -> None:
     """把当前内存会话写回 auth.json(需持锁调用)。"""
     d = _load()
     d["sessions"] = {t: exp for t, exp in _sessions.items()}
+    d["cookie_secure"] = _cookie_secure()
     _save(d)
+
+
+def _cookie_secure() -> bool:
+    from app.config import settings
+
+    return settings.auth_cookie_secure
 
 
 def _restore_sessions() -> None:
     """启动时从 auth.json 恢复未过期会话(支持进程重启不丢登录态)。"""
     with _lock:
         d = _load()
+        if _cookie_secure() and d.get("cookie_secure") is not True:
+            # 首次切换 HTTPS 时，旧 Cookie 没有 Secure 属性。先让这些 token
+            # 在服务端失效，避免浏览器经 HTTP 跳转时暴露仍然有效的会话。
+            _sessions.clear()
+            d["sessions"] = {}
+            d["cookie_secure"] = True
+            _save(d)
+            logger.info("legacy non-secure sessions invalidated")
+            return
         now = time.time()
         saved = d.get("sessions") or {}
         for token, expire in saved.items():

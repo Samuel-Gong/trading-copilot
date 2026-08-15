@@ -106,6 +106,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 3018
     log_level: str = "INFO"
+    # CI 生成的发布包通过 .release.env 注入,本地开发时保持为空。
+    git_sha: str = ""
+    build_time: str = ""
     backtest_range_guard: bool = False
     backtest_matrix_disk_cache_enabled: bool = True
     backtest_matrix_cache_max_mb: int = 512
@@ -115,6 +118,8 @@ class Settings(BaseSettings):
     # Auth — 首次启动时预置访问密码(明文, 仅用于初始化, 详见 services/auth.bootstrap_from_env)
     # 公网服务器部署时免去 SSH 端口转发设密码的麻烦。写入 auth.json(哈希)后即不再读取。
     auth_password: str = ""
+    # 公网 HTTPS 部署必须开启；本地 HTTP 开发保持默认关闭。
+    auth_cookie_secure: bool = False
 
     # Data — frozen: exe 同级 data/ 子目录; 非 frozen: 项目根 data/
     # (均可被环境变量 DATA_DIR 覆盖, pydantic-settings 自动注入)

@@ -1,0 +1,120 @@
+name: UCloud 生产发布
+
+# push main 只生成发布包，不自动上线。
+# 生产部署必须在 Actions 页面手动触发，并由 production Environment 控制审批。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tickflow-production
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: 构建服务端发布包
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: 安装 Python 3.12
+        run: uv python install 3.12
+
+      - name: 验证后端
+        working-directory: backend
+        run: |
+          uv sync --frozen --no-install-project --extra dev --extra backtest
+          uv run --no-sync ruff check app tests --select E9,F63,F7
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+            -u http_proxy -u https_proxy -u all_proxy \
+            uv run --no-sync python -m pytest -q
+
+      - name: 发布包安全校验负例
+        run: bash ops/tests/test_archive_validation.sh
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.10.0
+
+      - name: 安装 Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 组装不可变发布包
+        id: release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          short_sha="${GITHUB_SHA:0:12}"
+          release_name="tickflow-server-${short_sha}"
+          package_root="${RUNNER_TEMP}/${release_name}"
+
+          mkdir -p "${package_root}/backend" "${package_root}/frontend"
+          cp -a backend/app backend/pyproject.toml backend/uv.lock "${package_root}/backend/"
+          cp -a frontend/dist "${package_root}/frontend/"
+          cp tiers.yaml VERSION README.md LICENSE "${package_root}/"
+
+          build_time="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          {
+            echo "GIT_SHA=${GITHUB_SHA}"
+            echo "BUILD_TIME=${build_time}"
+          } > "${package_root}/.release.env"
+
+          tar -C "${RUNNER_TEMP}" -czf "${release_name}.tar.gz" "${release_name}"
+          sha256sum "${release_name}.tar.gz" > "${release_name}.tar.gz.sha256"
+          echo "release_name=${release_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: 上传发布包
+        uses: actions/upload-artifact@v4
+        with:
+          name: tickflow-server-${{ github.sha }}
+          path: |
+            ${{ steps.release.outputs.release_name }}.tar.gz
+            ${{ steps.release.outputs.release_name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy-production:
+    name: 部署生产环境
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: [self-hosted, Linux, X64, tickflow-production]
+    environment:
+      name: production
+    timeout-minutes: 60
+    steps:
+      - name: 下载本次发布包
+        uses: actions/download-artifact@v4
+        with:
+          name: tickflow-server-${{ github.sha }}
+          path: ${{ runner.temp }}/server-artifact-${{ github.sha }}
+
+      - name: 执行受控生产部署
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          artifact_dir="${RUNNER_TEMP}/server-artifact-${GITHUB_SHA}"
+          archive="${artifact_dir}/tickflow-server-${GITHUB_SHA:0:12}.tar.gz"
+          test -f "${archive}"
+          test -f "${archive}.sha256"
+          sudo -n /usr/local/sbin/tickflow-deploy "${archive}"

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: 后端检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: 安装 Python 3.12
+        run: uv python install 3.12
+
+      - name: 安装锁定依赖
+        working-directory: backend
+        run: uv sync --frozen --no-install-project --extra dev --extra backtest
+
+      # 仓库仍有历史 lint 债务；CI 先阻断语法与无效代码，完整规则按改动范围本地执行。
+      - name: Ruff 阻断级检查
+        working-directory: backend
+        run: uv run --no-sync ruff check app tests --select E9,F63,F7
+
+      - name: Pytest
+        working-directory: backend
+        run: |
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+            -u http_proxy -u https_proxy -u all_proxy \
+            uv run --no-sync python -m pytest -q
+
+      - name: 发布包安全校验负例
+        run: bash ops/tests/test_archive_validation.sh
+
+  frontend:
+    name: 前端构建
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.10.0
+
+      - name: 安装 Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: 安装锁定依赖
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建前端
+        working-directory: frontend
+        run: pnpm build

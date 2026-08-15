@@ -850,10 +850,20 @@ def get_version(request: Request) -> dict:
     """
     from app import __version__
 
+    def _result(version: str) -> dict:
+        from app.config import settings
+
+        payload = {"version": version}
+        if settings.git_sha:
+            payload["git_sha"] = settings.git_sha
+        if settings.build_time:
+            payload["build_time"] = settings.build_time
+        return payload
+
     # 1. 优先用 app.__version__ (唯一权威版本, 打包期由 PyInstaller 注入)
     if __version__:
         v = __version__.strip()
-        return {"version": v if v.startswith("v") else f"v{v}"}
+        return _result(v if v.startswith("v") else f"v{v}")
 
     # 2. 回退到项目根 VERSION 文件
     from app.config import settings
@@ -862,9 +872,9 @@ def get_version(request: Request) -> dict:
     if version_file.exists():
         v = version_file.read_text(encoding="utf-8").strip()
         if v:
-            return {"version": v}
+            return _result(v)
 
-    return {"version": "v0.0.0"}
+    return _result("v0.0.0")
 
 
 @router.post("/refresh-cache")

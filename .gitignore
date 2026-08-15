@@ -56,6 +56,7 @@ data/**
 .env.local
 .env.*.local
 backend/.env
+/.agent-secrets.md
 
 # ===== User-derived prompts =====
 backend/user_prompts/
@@ -88,6 +89,7 @@ frontend/tsconfig*.tsbuildinfo
 # ===== Private deploy / 服务器私有信息(不开源) =====
 DEPLOY.md
 deploy.sh
+!/ops/deploy.sh
 
 # ===== 内部设计文档(不开源) =====
 DESIGN.md

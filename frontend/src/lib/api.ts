@@ -1541,7 +1541,13 @@ export interface StrategyAlertEvent {
 
 // ===== API surface =====
 export const api = {
-  health: () => request<{ status: string; version: string; mode: string }>('/health'),
+  health: () => request<{
+    status: string
+    version: string
+    mode: string
+    git_sha?: string
+    build_time?: string
+  }>('/health'),
 
   // ===== Auth (访问认证) =====
   authStatus: () =>
@@ -1864,7 +1870,7 @@ export const api = {
     }),
 
   capabilities: () => request<CapabilitiesResponse>('/api/capabilities'),
-  version: () => request<{ version: string }>('/api/data/version'),
+  version: () => request<{ version: string; git_sha?: string; build_time?: string }>('/api/data/version'),
   redetectCapabilities: () =>
     request<CapabilitiesResponse>('/api/capabilities/redetect', { method: 'POST' }),
 

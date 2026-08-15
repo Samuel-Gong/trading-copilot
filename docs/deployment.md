@@ -40,7 +40,15 @@ cd frontend && pnpm install && pnpm dev   # http://localhost:3011
 
 ---
 
-## 方式 B:Docker(部署最省心)
+## 方式 B:UCloud 源码发布(当前生产环境)
+
+UCloud 生产环境不使用 Docker，也不在服务器工作目录执行 `git pull`。正式流程使用 GitHub Actions 构建不可变发布包，在服务器按 Git SHA 安装独立 `.venv`，由 systemd 运行并通过 Nginx 暴露服务；部署时自动备份数据、探活并在失败时回滚。
+
+本机只负责开发和验证，UCloud 是唯一长期运行环境；当前不部署 staging。完整的首次初始化、发布、回滚、故障分级和发布策略见 [UCloud 单生产环境发布与运维](./ucloud-production.md)。
+
+---
+
+## 方式 C:Docker(其他用户可选)
 
 ```bash
 cp .env.example .env
