@@ -40,6 +40,9 @@ if [[ "${no_proxy-}" != "127.0.0.1,localhost,::1" ]]; then
   echo "unexpected no_proxy: ${no_proxy-}" >&2
   exit 43
 fi
+if [[ "${0##*/}" == "pnpm" ]]; then
+  echo "frontend backend port:${TICKFLOW_BACKEND_PORT-}"
+fi
 echo "proxy env clean:${0##*/}"
 sleep 0.1
 """
@@ -73,6 +76,7 @@ sleep 0.1
     assert result.returncode == 0, output
     assert "proxy env clean:uv" in output
     assert "proxy env clean:pnpm" in output
+    assert "frontend backend port:49181" in output
     assert "proxy leaked:" not in output
 
 
@@ -87,3 +91,17 @@ def test_dev_powershell_launcher_clears_proxy_in_parent_and_jobs():
     assert script.count("$env:no_proxy = $env:NO_PROXY") == 3
     assert script.count("$proxyEnvironmentVariableNames.Split(',')") == 2
     assert script.count("$ProxyEnvironmentVariableNames") == 3
+    assert '$env:TICKFLOW_BACKEND_PORT = [string]$backendPort' in script
+    assert (
+        '$frontendPidFile, $FrontendDir, $FrontendPort, $BackendPort, '
+        '$ProxyEnvironmentVariableNames'
+    ) in script
+
+
+def test_vite_proxy_uses_launcher_backend_port():
+    root = Path(__file__).resolve().parents[2]
+    config = (root / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
+
+    assert "process.env.TICKFLOW_BACKEND_PORT ?? '3018'" in config
+    assert "target: backendTarget" in config
+    assert "'/health': backendTarget" in config

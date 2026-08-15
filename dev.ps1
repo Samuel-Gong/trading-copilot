@@ -200,7 +200,7 @@ $backendJob = Start-Job -Name 'backend' -ScriptBlock {
 } -ArgumentList $backendPidFile, $BackendDir, $BackendPort, $ProxyEnvironmentVariableNames
 
 $frontendJob = Start-Job -Name 'frontend' -ScriptBlock {
-    param($pidFile, $dir, $port, $proxyEnvironmentVariableNames)
+    param($pidFile, $dir, $port, $backendPort, $proxyEnvironmentVariableNames)
     # 同上: job 子进程默认 GBK, pnpm/前端工具链也是 UTF-8 输出, 需对齐。
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
     $OutputEncoding           = New-Object System.Text.UTF8Encoding $false
@@ -210,9 +210,10 @@ $frontendJob = Start-Job -Name 'frontend' -ScriptBlock {
     }
     $env:NO_PROXY = '127.0.0.1,localhost,::1'
     $env:no_proxy = $env:NO_PROXY
+    $env:TICKFLOW_BACKEND_PORT = [string]$backendPort
     Set-Location $dir
     & pnpm dev --host 0.0.0.0 --port $port 2>&1
-} -ArgumentList $frontendPidFile, $FrontendDir, $FrontendPort, $ProxyEnvironmentVariableNames
+} -ArgumentList $frontendPidFile, $FrontendDir, $FrontendPort, $BackendPort, $ProxyEnvironmentVariableNames
 
 # Wait up to 5 seconds for the PID files to materialise
 function Read-JobPid($file) {

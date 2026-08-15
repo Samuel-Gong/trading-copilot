@@ -243,11 +243,21 @@ git diff --check
 
 ### 9.1 Issue-first 开发与评论闭环
 
-除纯咨询或不产生仓库改动的排查外，每项开发工作先创建一个聚焦的 GitHub Issue，再从最新 `main` 建立 `fix/*`、`feature/*`、`chore/*` 或紧急 `hotfix/*` 分支。Issue 应给出问题、验收标准和明确非目标；生产问题同时记录发生时间、页面和当前 Git SHA。PR 使用 `Closes #<issue>` 关联唯一主 Issue。
+除纯咨询或不产生仓库改动的排查外，每项开发工作先创建一个聚焦的 GitHub Issue，再从最新 `main` 建立独立分支。Codex 创建的分支使用 `codex/<issue>-<slug>`，人工创建的分支使用 `fix/*`、`feature/*`、`chore/*` 或紧急 `hotfix/*`。Issue 应给出问题、验收标准和明确非目标；生产问题同时记录发生时间、页面和当前 Git SHA。PR 使用 `Closes #<issue>` 关联唯一主 Issue。
 
 开始修改前读取 Issue 正文及全部最新评论；Issue 评论改变验收标准时，先在 Issue 中确认新的边界，再调整实现。PR 创建后，每次继续修改前都重新读取 Issue 评论、PR 普通评论、Review summaries 和未解决的 inline review threads，逐项区分已处理、需要澄清和不采纳并说明理由。不能只依赖创建分支时保存的描述或上一次读取结果。
 
 代码作者和最终 Review Agent 必须分离。Review Agent 按第 11 节对 PR 相对 `main` 的完整 diff 做只读复审，并在追加提交后重新检查全部 diff。Codex 原生 GitHub Review 可自动运行，也可用精确评论 `@codex review` 触发；它是额外审查者，不替代 CI、分支保护和人工判断。只有 CI 通过、所有讨论已解决、P0/P1/P2 阻断项完成复审后，才由维护者人工点击 Merge。
+
+### 9.2 并行需求开发
+
+多个可独立验收和合并的需求可以并行开发，隔离单元固定为“一个 Issue、一个 Codex 任务、一个 Git Worktree、一个分支和一个 PR”。同一需求的实现、测试和反馈修改留在同一个 Worktree；不同需求不得共用工作目录或分支。
+
+1. **建立隔离环境**：每个任务从最新且干净的 `main` 创建 Codex Worktree，再按第 9.1 节创建独立分支。不要把某个需求尚未提交的本地改动作为另一个需求的隐式基线。Git 不允许同一分支同时签出到多个 Worktree；需要转到本地检视时使用 Codex Handoff。
+2. **隔离依赖和运行时**：每个 Worktree 分别维护 `backend/.venv` 和 `frontend/node_modules`，由 `uv sync`、`pnpm install` 或 `dev.sh` 初始化，不复制其他 Worktree 的依赖目录。并行启动应用时为每个 Worktree 分配不同的前后端端口，例如 `BACKEND_PORT=3028 FRONTEND_PORT=3021 ./dev.sh`；启动器会让对应前端代理到同一组后端端口。
+3. **隔离数据和凭据**：测试使用当前 Worktree 内的最小合成数据，不共享或复制真实 `data/`、持仓、策略、日志和缓存。`.env`、`.agent-secrets.md` 等忽略文件默认不进入 Worktree；确需复制时，通过本机 Codex `.worktreeinclude` 仅列出完成任务所需的最小文件，继续保持 Git 忽略，且不得写入输出、Issue、PR 或提交。
+4. **处理需求依赖**：多个需求需要修改同一数据契约、数据库迁移、依赖锁文件或核心公共模块时，先把公共改动拆成独立 Issue 和基础 PR。后续需求基于已合并的 `main`；无法拆分时串行开发。禁止通过复制实现或临时兼容层规避合并顺序。
+5. **合并与回收**：每个 PR 独立执行第 9 节验证矩阵和第 11 节复审。PR 逐个合并；任一前置 PR 合并后，其余 Worktree 先同步最新 `main`、解决冲突并重新执行受影响验证。分支已推送或工作已移交后再归档任务和清理 Worktree，未合并改动不得只保留在临时目录中。
 
 ## 10. PR 提交要求
 

@@ -3,8 +3,7 @@
 #
 # 用法:
 #   ./dev.sh                          # 默认 backend:3018  frontend:3011
-#   BACKEND_PORT=8000 ./dev.sh        # 改后端端口
-#   FRONTEND_PORT=5173 ./dev.sh       # 改前端端口
+#   BACKEND_PORT=8000 FRONTEND_PORT=5173 ./dev.sh  # 使用一组独立端口
 #
 # Ctrl-C 同时关闭两端。
 
@@ -153,7 +152,7 @@ PIDS+=("$!")
 
 (
   cd "$FRONTEND_DIR"
-  pnpm dev --host 0.0.0.0 --port "$FRONTEND_PORT" 2>&1 \
+  TICKFLOW_BACKEND_PORT="$BACKEND_PORT" pnpm dev --host 0.0.0.0 --port "$FRONTEND_PORT" 2>&1 \
     | prefix_awk "$(printf "${GREEN}[frontend]${NC} ")"
 ) &
 PIDS+=("$!")

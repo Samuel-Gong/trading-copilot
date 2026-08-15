@@ -9,6 +9,7 @@
 - 不覆盖工作区已有修改，不虚构测试或审查结果。
 - 以实际验证结果作为完成标准。
 - Issue/PR 驱动的开发执行 [`CONTRIBUTING.md` 的 Issue-first 与评论闭环](CONTRIBUTING.md#91-issue-first-开发与评论闭环)：修改前和每轮反馈后都重新读取关联 Issue、PR 评论及未解决 Review threads，作者与最终 Review Agent 分离。
+- 同时开发多个需求时，必须完整读取并执行 [`CONTRIBUTING.md` 的并行需求开发流程](CONTRIBUTING.md#92-并行需求开发)，按其中要求隔离 Worktree、分支、端口、数据、依赖关系与复审。
 - 登录本地 TickFlow 面板（`localhost` / `127.0.0.1`）时，读取根目录的 [`.agent-secrets.md`](.agent-secrets.md)，其中凭据仅限本机登录使用，不得复制到提交内容、日志或对外请求。
 - 启动本项目应用进程时，必须在启动命令中清除大小写的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`，避免应用继承 Codex shell 代理；该例外仅适用于应用进程，其他外部网络请求仍遵循全局代理约定。
 
