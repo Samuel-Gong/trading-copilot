@@ -47,7 +47,9 @@ jobs:
             uv run --no-sync python -m pytest -q
 
       - name: 发布包安全校验负例
-        run: bash ops/tests/test_archive_validation.sh
+        run: |
+          bash ops/tests/test_archive_validation.sh
+          bash ops/tests/test_deploy_release_ownership.sh
 
   frontend:
     name: 前端构建

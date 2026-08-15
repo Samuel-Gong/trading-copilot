@@ -6,7 +6,7 @@
 
 - `main` 是唯一允许部署到生产环境的分支。
 - `main` 受分支保护：改动必须经过 PR、后端/前端 CI 和讨论解决，由维护者人工 Merge。
-- 合并到 `main` 后自动构建不可变发布包并部署生产；人工 Merge 即生产发布批准，因此正常 PR 只在非交易时段合并。
+- 合并到 `main` 后自动构建按 SHA 标识的发布包并部署生产；人工 Merge 即生产发布批准，因此正常 PR 只在非交易时段合并。
 - GitHub `production` Environment 只允许 `main`。`workflow_dispatch` 仅用于重试 `main` 当前 SHA，不允许选择其他分支发布。
 - 生产目录禁止直接执行 `git pull`，也禁止在服务器上临时修改源码。
 - 每个发布包由完整 Git SHA 标识；服务器用版本目录保存，不覆盖旧版本。
@@ -47,7 +47,7 @@
 
 职责边界：
 
-- `/opt/tickflow/releases/<git-sha>`：不可变应用版本和该版本自己的 Python `.venv`。
+- `/opt/tickflow/releases/<git-sha>`：按 Git SHA 安装的应用版本和该版本自己的 Python `.venv`；目录由服务用户持有。
 - `/opt/tickflow/current`：当前运行版本，部署时原子切换软链接。
 - `/opt/tickflow/previous`：最近一个可手工回滚的版本。
 - `/var/lib/tickflow/data`：唯一生产数据目录，发布与代码回滚都不会删除。
@@ -58,7 +58,9 @@
 - `/home/tickflow-deploy/incoming`：GitHub-hosted job 使用低权限 SSH 用户上传本次发布包的固定目录。
 - `/etc/tickflow/tickflow.env`：生产密钥与配置，权限必须为 `600`。
 
-不要把本机 macOS 的 `.venv` 复制到 UCloud。虚拟环境不可跨操作系统迁移；部署器会以现有 `ubuntu` 服务用户在每个 Linux release 目录中执行锁定的 `uv sync`。`uv` 使用 `/home/ubuntu` 下该用户的默认全局缓存，不设置单独的 `UV_CACHE_DIR`。
+不要把本机 macOS 的 `.venv` 复制到 UCloud。虚拟环境不可跨操作系统迁移；部署器会以现有 `ubuntu` 服务用户在每个 Linux release 目录中执行锁定的 `uv sync`。`uv` 使用 `/home/ubuntu` 下该用户的默认全局缓存，不设置单独的 `UV_CACHE_DIR`，也不覆盖默认 link mode。
+
+release 在依赖安装后继续由 `ubuntu` 持有。这样即使 `.venv` 与全局 `uv` cache 共享 inode，部署器也不会通过递归 `chown root:root` 把 cache 文件变成服务用户不可写。当前信任模型把 UCloud 生产机及其 `ubuntu` 管理账号视为可信运维边界，因此不通过 root 所有权、systemd 只读挂载或启动前复验强制已安装 release 不可变。发布包的 SHA256 和完整 Git SHA 探活用于校验发布入口和本次切换的版本，不用于抵御主机管理员事后修改。运维流程仍禁止在服务器直接编辑源码；如果怀疑主机或账号已失信，必须停止发布并重建可信环境，不使用现有 release 回滚。
 
 ## 3. 首次初始化 UCloud
 
@@ -110,6 +112,37 @@ sudo systemctl daemon-reload
 首次发布成功并完成探活后才启用 `tickflow.service` 开机启动，避免迁移失败后它与旧服务在重启时争用端口。
 
 部署器自身发生变更时，必须先审查 diff，再重新执行对应的 `install` 命令。生产 workflow 调用固定安装在 `/usr/local/sbin` 的部署器，不会从发布包中以 root 权限执行脚本。
+
+### 3.3.1 从旧的 root-owned uv cache 一次性迁移
+
+如果服务器曾使用会在安装依赖后递归执行 `chown root:root` 的旧部署器，默认 `uv` cache 可能已经通过共享 inode 混入 root 所有的文件。不要对旧 cache 执行递归 `chown`，否则同一 inode 对应的当前生产 `.venv` 也会被反向改为 `ubuntu` 所有。
+
+先完成 PR 审查并合并，再从该 `main` 提交的可信检出中上传新的 `ops/deploy.sh`。不在服务器编辑脚本，也不执行 `git pull`。先在本机记录该文件的 SHA256：
+
+```bash
+# 本机：上传已合并 main 中的受控部署器
+sha256sum ops/deploy.sh
+scp ops/deploy.sh ubuntu@106.75.247.19:/tmp/tickflow-deploy
+```
+
+在 UCloud 上先把上传内容复制到 root 专用目录，再将下面的占位值替换为本机刚输出的该哈希并核验 root 快照。只有核验通过才安装，避免从服务用户可写路径直接安装 root 部署器：
+
+```bash
+set -Eeuo pipefail
+sudo install -d -o root -g root -m 0700 /var/lib/tickflow/operator-update
+sudo install -o root -g root -m 0600 /tmp/tickflow-deploy /var/lib/tickflow/operator-update/tickflow-deploy
+printf '%s  %s\n' \
+  '<deploy.sh 的 SHA256>' /var/lib/tickflow/operator-update/tickflow-deploy \
+  | sudo sha256sum --check --strict
+
+sudo install -o root -g root -m 0755 /var/lib/tickflow/operator-update/tickflow-deploy /usr/local/sbin/tickflow-deploy
+sudo mv /home/ubuntu/.cache/uv /home/ubuntu/.cache/uv.before-release-owner-fix
+sudo chown root:root /home/ubuntu/.cache/uv.before-release-owner-fix
+sudo chmod 0700 /home/ubuntu/.cache/uv.before-release-owner-fix
+sudo install -d -o ubuntu -g ubuntu -m 0775 /home/ubuntu/.cache/uv
+```
+
+这里仅修改旧 cache 顶层目录的所有权和权限，不递归触碰其中与旧 release 共享的文件 inode。合并触发的第一次自动发布仍可能在旧部署器上失败，这是本次部署器迁移的一次性引导例外。完成上述安装和 cache 隔离后，在 Actions 页面手动重试 `main` 当前 SHA。确认发布、回滚和后续再次发布均正常之前，保留 `uv.before-release-owner-fix`，不要删除。
 
 ### 3.4 创建生产配置
 

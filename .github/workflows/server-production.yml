@@ -1,6 +1,6 @@
 name: UCloud 生产发布
 
-# 受保护的 main 每次更新都会构建不可变发布包并自动上线。
+# 受保护的 main 每次更新都会构建按 SHA 标识的发布包并自动上线。
 # workflow_dispatch 只用于重试 main 当前 SHA；production Environment 仍只允许 main。
 on:
   push:
@@ -43,6 +43,7 @@ jobs:
         run: |
           bash ops/tests/test_archive_validation.sh
           bash ops/tests/test_deploy_ssh.sh
+          bash ops/tests/test_deploy_release_ownership.sh
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v4
@@ -62,7 +63,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
-      - name: 组装不可变发布包
+      - name: 组装 SHA 发布包
         id: release
         shell: bash
         run: |

@@ -276,7 +276,6 @@ else
   created_release_dir=""
 fi
 
-chown -R root:root "$release_dir"
 chmod -R u=rwX,go=rX "$release_dir"
 
 if [[ -L "$CURRENT_LINK" ]]; then
