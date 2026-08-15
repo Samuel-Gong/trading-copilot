@@ -253,11 +253,23 @@ git diff --check
 
 多个可独立验收和合并的需求可以并行开发，隔离单元固定为“一个 Issue、一个 Codex 任务、一个 Git Worktree、一个分支和一个 PR”。同一需求的实现、测试和反馈修改留在同一个 Worktree；不同需求不得共用工作目录或分支。
 
-1. **建立隔离环境**：每个任务从最新且干净的 `main` 创建 Codex Worktree，再按第 9.1 节创建独立分支。不要把某个需求尚未提交的本地改动作为另一个需求的隐式基线。Git 不允许同一分支同时签出到多个 Worktree；需要转到本地检视时使用 Codex Handoff。
-2. **隔离依赖和运行时**：每个 Worktree 分别维护 `backend/.venv` 和 `frontend/node_modules`，由 `uv sync`、`pnpm install` 或 `dev.sh` 初始化，不复制其他 Worktree 的依赖目录。并行启动应用时为每个 Worktree 分配不同的前后端端口，例如 `BACKEND_PORT=3028 FRONTEND_PORT=3021 ./dev.sh`；启动器会让对应前端代理到同一组后端端口。
-3. **隔离数据和凭据**：测试使用当前 Worktree 内的最小合成数据，不共享或复制真实 `data/`、持仓、策略、日志和缓存。`.env`、`.agent-secrets.md` 等忽略文件默认不进入 Worktree；确需复制时，通过本机 Codex `.worktreeinclude` 仅列出完成任务所需的最小文件，继续保持 Git 忽略，且不得写入输出、Issue、PR 或提交。
-4. **处理需求依赖**：多个需求需要修改同一数据契约、数据库迁移、依赖锁文件或核心公共模块时，先把公共改动拆成独立 Issue 和基础 PR。后续需求基于已合并的 `main`；无法拆分时串行开发。禁止通过复制实现或临时兼容层规避合并顺序。
-5. **合并与回收**：每个 PR 独立执行第 9 节验证矩阵和第 11 节复审。PR 逐个合并；任一前置 PR 合并后，其余 Worktree 先同步最新 `main`、解决冲突并重新执行受影响验证。分支已推送或工作已移交后再归档任务和清理 Worktree，未合并改动不得只保留在临时目录中。
+1. **同步并验证 `main`**：创建任何新 Worktree 前，先确认当前本地 checkout 没有未提交改动，再获取远端更新并将本地 `main` 以 fast-forward 方式同步到 `origin/main`：
+
+   ```bash
+   git status --short
+   git fetch origin
+   git switch main
+   git merge --ff-only origin/main
+   git status --short
+   git rev-list --left-right --count main...origin/main
+   ```
+
+   两次 `git status --short` 都必须没有输出，最后一条命令必须输出 `0  0`，才能把本地 `main` 作为新任务基线。`origin/main` 是本地远端跟踪引用，未执行 `git fetch` 时不能代表 GitHub 上的最新提交。如果 `main` 已在另一个 Worktree 中签出，应在那个 Worktree 中完成同步；如果 fast-forward 失败，应停止并检查分支分叉，禁止用 reset、强制更新或携带未提交改动切换分支来绕过检查。
+2. **建立隔离环境**：完成上述同步后，在 Codex 新对话中选择本地 `main` 作为起始分支并创建 Worktree，再按第 9.1 节创建独立分支。Codex Worktree 使用所选本地分支的当前 `HEAD`，不会自动改用 GitHub 上更新的 `main`。不要把某个需求尚未提交的本地改动作为另一个需求的隐式基线。Git 不允许同一分支同时签出到多个 Worktree；需要转到本地检视时使用 Codex Handoff。
+3. **隔离依赖和运行时**：每个 Worktree 分别维护 `backend/.venv` 和 `frontend/node_modules`，由 `uv sync`、`pnpm install` 或 `dev.sh` 初始化，不复制其他 Worktree 的依赖目录。并行启动应用时为每个 Worktree 分配不同的前后端端口，例如 `BACKEND_PORT=3028 FRONTEND_PORT=3021 ./dev.sh`；启动器会让对应前端代理到同一组后端端口。
+4. **隔离数据和凭据**：测试使用当前 Worktree 内的最小合成数据，不共享或复制真实 `data/`、持仓、策略、日志和缓存。`.env`、`.agent-secrets.md` 等忽略文件默认不进入 Worktree；确需复制时，通过本机 Codex `.worktreeinclude` 仅列出完成任务所需的最小文件，继续保持 Git 忽略，且不得写入输出、Issue、PR 或提交。
+5. **处理需求依赖**：多个需求需要修改同一数据契约、数据库迁移、依赖锁文件或核心公共模块时，先把公共改动拆成独立 Issue 和基础 PR。后续需求基于已合并的 `main`；无法拆分时串行开发。禁止通过复制实现或临时兼容层规避合并顺序。
+6. **合并与回收**：每个 PR 独立执行第 9 节验证矩阵和第 11 节复审。PR 逐个合并；任一前置 PR 合并后，其余 Worktree 先同步最新 `main`、解决冲突并重新执行受影响验证。分支已推送或工作已移交后再归档任务和清理 Worktree，未合并改动不得只保留在临时目录中。
 
 ## 10. PR 提交要求
 
