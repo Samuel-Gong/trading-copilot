@@ -1,0 +1,73 @@
+name: 需求建议
+description: 提议一个可验收的功能或流程改进
+title: "[需求] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请描述用户问题和预期结果，不要粘贴密码、API Key 或真实用户数据。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 用户问题
+      description: 谁在什么场景下遇到了什么限制？
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: 当前流程或复现示例
+      description: 按实际操作顺序描述当前如何完成任务，以及限制出现在哪里。
+    validations:
+      required: true
+
+  - type: input
+    id: git_sha
+    attributes:
+      label: 当前 Git SHA
+      description: 若需求来自生产使用，请填写设置页、侧栏或 `/health` 显示的版本；不适用时填写“不适用”。
+      placeholder: 完整或短 Git SHA / 不适用
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 期望结果
+      description: 从用户视角描述完成后的行为，不限定具体实现。
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      placeholder: |
+        - [ ] ……
+        - [ ] ……
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与非目标
+      description: 列出必须包含和明确不包含的内容。
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: 兼容性与数据口径
+      description: 涉及历史数据、金融口径、Provider、API 或部署时填写。
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 安全确认
+      options:
+        - label: 我已确认以上内容不包含密码、API Key、Cookie、SSH Key 或未脱敏用户数据。
+          required: true

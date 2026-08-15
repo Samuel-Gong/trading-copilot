@@ -241,6 +241,14 @@ git diff --check
 - 前端任何 TypeScript、组件、样式或 API 类型改动至少执行一次 `pnpm build`。
 - 提交前必须运行 `git diff --check`，并检查最终 diff 不含调试代码和无关文件。
 
+### 9.1 Issue-first 开发与评论闭环
+
+除纯咨询或不产生仓库改动的排查外，每项开发工作先创建一个聚焦的 GitHub Issue，再从最新 `main` 建立 `fix/*`、`feature/*`、`chore/*` 或紧急 `hotfix/*` 分支。Issue 应给出问题、验收标准和明确非目标；生产问题同时记录发生时间、页面和当前 Git SHA。PR 使用 `Closes #<issue>` 关联唯一主 Issue。
+
+开始修改前读取 Issue 正文及全部最新评论；Issue 评论改变验收标准时，先在 Issue 中确认新的边界，再调整实现。PR 创建后，每次继续修改前都重新读取 Issue 评论、PR 普通评论、Review summaries 和未解决的 inline review threads，逐项区分已处理、需要澄清和不采纳并说明理由。不能只依赖创建分支时保存的描述或上一次读取结果。
+
+代码作者和最终 Review Agent 必须分离。Review Agent 按第 11 节对 PR 相对 `main` 的完整 diff 做只读复审，并在追加提交后重新检查全部 diff。Codex 原生 GitHub Review 可自动运行，也可用精确评论 `@codex review` 触发；它是额外审查者，不替代 CI、分支保护和人工判断。只有 CI 通过、所有讨论已解决、P0/P1/P2 阻断项完成复审后，才由维护者人工点击 Merge。
+
 ## 10. PR 提交要求
 
 一个可审查的 PR 应聚焦一个问题。功能、无关重构、批量格式化和依赖升级不得混在一起。

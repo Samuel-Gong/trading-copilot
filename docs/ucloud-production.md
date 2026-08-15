@@ -5,8 +5,9 @@
 ## 1. 发布原则
 
 - `main` 是唯一允许部署到生产环境的分支。
-- 合并到 `main` 只构建发布包，**不会自动上线**。
-- 生产发布必须从 GitHub Actions 手动触发，并受 GitHub `production` Environment 的 `main` 分支策略约束；当前私有仓库套餐不支持 Required reviewers，手动触发本身即为发布确认。
+- `main` 受分支保护：改动必须经过 PR、后端/前端 CI 和讨论解决，由维护者人工 Merge。
+- 合并到 `main` 后自动构建不可变发布包并部署生产；人工 Merge 即生产发布批准，因此正常 PR 只在非交易时段合并。
+- GitHub `production` Environment 只允许 `main`。`workflow_dispatch` 仅用于重试 `main` 当前 SHA，不允许选择其他分支发布。
 - 生产目录禁止直接执行 `git pull`，也禁止在服务器上临时修改源码。
 - 每个发布包由完整 Git SHA 标识；服务器用版本目录保存，不覆盖旧版本。
 - `.env`、API Key、访问密码、用户数据和备份只保存在服务器，不进入发布包和 Git。
@@ -191,7 +192,7 @@ sudo rsync -a --delete /opt/trading-copilot/data/ /var/lib/tickflow/data/
 sudo chown -R ubuntu:ubuntu /var/lib/tickflow/data
 ```
 
-当前私有仓库套餐不提供 Environment 人工暂停点。首次切换时先进入维护窗口并完成最终同步，再手动触发 `UCloud 生产发布`；这会增加一次构建与安装时长的停机，但能保证旧、新进程不会争用端口或数据：
+首次切换是自动发布流程的引导例外：在配置 `production` Environment secrets 之前先进入维护窗口并完成最终同步；如果 secrets 已经配置，维护窗口内不得合并任何 PR。最终同步完成后再配置 secrets，并手动触发一次 `main` 的 `UCloud 生产发布`。这会增加一次构建与安装时长的停机，但能保证旧、新进程不会争用端口或数据：
 
 ```bash
 set -Eeuo pipefail
@@ -201,7 +202,7 @@ sudo chown -R ubuntu:ubuntu /var/lib/tickflow/data
 sudo systemctl disable trading-copilot.service
 ```
 
-确认旧服务已经停止且最终同步完成后再触发 workflow。新版本失败时，Actions 会保持失败；部署器会移除指向失败版本的 `current`，并且不会把未带 `.healthy` 标记的版本作为后续回滚基线。第一次发布还没有 `previous` 可自动回滚，应立即恢复旧服务：
+确认旧服务已经停止且最终同步完成后再触发 workflow。首次成功后，后续版本全部走合并自动发布。新版本失败时，Actions 会保持失败；部署器会移除指向失败版本的 `current`，并且不会把未带 `.healthy` 标记的版本作为后续回滚基线。第一次发布还没有 `previous` 可自动回滚，应立即恢复旧服务：
 
 ```bash
 sudo systemctl disable --now tickflow.service
@@ -216,7 +217,7 @@ curl --noproxy '*' -fsS http://127.0.0.1:3018/health
 仓库包含两个相关 workflow：
 
 - `.github/workflows/ci.yml`：PR 和 `main` 的后端 Ruff、Pytest 与前端构建。
-- `.github/workflows/server-production.yml`：为 `main` 生成发布包；手动触发时继续部署生产。
+- `.github/workflows/server-production.yml`：为 `main` 生成发布包并自动部署；手动触发只重试 `main` 当前 SHA。
 
 ### 4.1 production Environment
 
@@ -225,9 +226,15 @@ curl --noproxy '*' -fsS http://127.0.0.1:3018/health
 1. Deployment branches 只允许 `main`。
 2. 保存 `UCLOUD_SSH_PRIVATE_KEY` 和 `UCLOUD_SSH_KNOWN_HOSTS` 两个 Environment secret。
 3. 不在 Environment 中保存应用 API Key；应用密钥只保存在 UCloud 的 `/etc/tickflow/tickflow.env`。
-4. 当前私有仓库套餐不支持 Required reviewers；若套餐升级，应立即增加至少一名 reviewer，并开启防止自审。
+4. 不设置 Environment Required reviewers；人工 Merge 已是发布批准，再增加部署等待会破坏“合并后自动发布”的单一闸门。
 
-### 4.2 GitHub-hosted SSH 部署通道
+### 4.2 PR 与 Review 闸门
+
+`main` 分支保护要求所有改动经过 PR、`后端检查` 与 `前端构建`，合并前分支必须与 `main` 保持最新，所有讨论必须解决；管理员同样受规则约束，并禁止强推或删除 `main`。
+
+开发先创建 GitHub Issue，再创建关联 PR。每轮修改前重新读取 Issue 与 PR 的最新评论和未解决 Review threads。Codex 原生 GitHub Code Review 作为独立 Review Agent：在 Codex Code Review 设置中为仓库开启 Automatic reviews，或在 PR 评论中使用 `@codex review`；维护者人工核对 Review、代码和 CI 后点击 Merge。Codex Review 不替代确定性的 CI 与人工判断。
+
+### 4.3 GitHub-hosted SSH 部署通道
 
 UCloud 到 GitHub 的出站 443 不稳定，因此生产机不运行 self-hosted runner。`deploy-production` 使用 GitHub-hosted `ubuntu-latest`，把当前 SHA 的发布包通过 SSH 上传到低权限账号：
 
@@ -273,14 +280,15 @@ tickflow-server-<short-sha>.tar.gz.sha256
 
 Actions 构建产物保留 30 天；UCloud 默认保留最近 5 个已安装 release，因此日常代码回滚不依赖 Actions 产物是否过期。
 
-### 5.2 手动发布生产
+### 5.2 合并后自动发布生产
 
-1. 确认目标提交已合并到 `main`，CI 全部通过。
-2. 打开 GitHub Actions → `UCloud 生产发布`。
-3. 选择 `main`，点击 `Run workflow`。
-4. 等待 `package` 和 `deploy-production` 完成。
-5. 打开设置页或侧栏，确认显示的短 Git SHA 与目标提交一致。
-6. 检查 `/health`、核心页面、实时行情连接和监控中心，至少观察 10 分钟。
+1. 在非交易时段确认 PR 的 CI、Codex Review、人工审查和讨论解决均已完成。
+2. 维护者人工点击 Merge；GitHub 随即触发 `UCloud 生产发布`。
+3. 等待 `package` 和 `deploy-production` 完成。
+4. 打开设置页或侧栏，确认显示的短 Git SHA 与合并后的完整提交一致。
+5. 检查 `/health`、核心页面、实时行情连接和监控中心，至少观察 10 分钟。
+
+若 Actions 或网络瞬时故障导致部署未提交，可在 Actions 页面手动运行 `UCloud 生产发布`，但必须选择 `main`；这只重试当前 `main` SHA，不是发布另一个分支的入口。部署器已经接收任务后，即使 Actions 取消或超时，服务器事务仍会继续，应先查询任务状态，避免盲目重复提交。
 
 部署器执行顺序：
 
@@ -337,11 +345,11 @@ sudo /usr/local/sbin/tickflow-rollback <完整的40位Git SHA>
 ```text
 公网生产环境发现问题
   → 创建 GitHub Issue，记录时间、页面、复现步骤和当前 Git SHA
-  → 本地从最新 main 创建 fix/* 或 feature/* 分支
+  → 本地从最新 main 创建 fix/*、feature/* 或 chore/* 分支
   → 本地复现并完成代码、测试和前端构建
-  → 创建 PR，完成 CI、自审和复审
-  → 合并 main，只生成发布包
-  → 非交易时段核对目标 SHA 并手动触发生产发布
+  → 创建关联 PR，完成 CI、自审、独立 Codex Review 和人工复审
+  → 非交易时段由维护者人工 Merge
+  → main 自动构建并部署该完整 Git SHA
   → 核对 Git SHA，验证核心流程并观察至少 10 分钟
   → 关闭 Issue
 ```
@@ -352,7 +360,7 @@ sudo /usr/local/sbin/tickflow-rollback <完整的40位Git SHA>
 
 - `P0`：数据破坏、安全漏洞或严重错误交易结果。立即停用相关入口或停止服务，保留现场；能通过代码回滚解除时先回滚。
 - `P1`：核心流程不可用或广泛回归。优先回滚到已知正常 SHA，再从当前生产基线创建 `hotfix/*`。
-- `P2/P3`：走普通 PR 和非交易时段发布，不跳过手动发布确认。
+- `P2/P3`：走普通 PR，在非交易时段人工 Merge；不绕过 Review 和分支保护。
 
 紧急修复仍必须执行针对性测试、CI 和生产健康检查。不得在服务器直接改代码，也不得为了抢时间让两个实例同时访问同一数据目录。
 

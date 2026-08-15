@@ -1,0 +1,105 @@
+name: Bug 报告
+description: 报告可复现的功能、数据或部署问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿粘贴密码、API Key、Cookie、SSH Key、用户数据或未经脱敏的日志。
+
+  - type: input
+    id: occurred_at
+    attributes:
+      label: 发生时间
+      description: 请注明时区；生产问题优先填写北京时间。
+      placeholder: "2026-08-15 14:30（北京时间）"
+    validations:
+      required: true
+
+  - type: input
+    id: page
+    attributes:
+      label: 页面或模块
+      placeholder: 持仓页 / 数据页 / 监控中心 / UCloud 发布
+    validations:
+      required: true
+
+  - type: input
+    id: git_sha
+    attributes:
+      label: 当前 Git SHA
+      description: 可从设置页、侧栏版本信息或 `/health` 获取；未知时填写“未知”。
+      placeholder: 完整或短 Git SHA
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 按实际操作顺序填写，包含必要的前置状态。
+      placeholder: |
+        1. 打开……
+        2. 设置……
+        3. 点击……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 描述修复完成后可验证的结果，包含必要的边界或失败场景。
+      placeholder: |
+        - [ ] 原复现步骤不再出现问题
+        - [ ] ……边界场景保持正确
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与非目标
+      description: 说明本 Issue 必须覆盖什么，以及明确不处理什么。
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏后的证据
+      description: 可附截图、错误信息或日志片段；请先移除账号、Token、持仓和交易隐私。
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: 影响级别
+      options:
+        - P0：数据破坏、安全漏洞或严重错误交易结果
+        - P1：核心流程不可用或广泛回归
+        - P2：明确功能错误、兼容性问题或明显性能退化
+        - P3：局部体验、文档或测试补强
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 安全确认
+      options:
+        - label: 我已确认以上内容不包含密码、API Key、Cookie、SSH Key 或未脱敏用户数据。
+          required: true

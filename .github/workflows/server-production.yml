@@ -1,7 +1,7 @@
 name: UCloud 生产发布
 
-# push main 只生成发布包，不自动上线。
-# 生产部署必须在 Actions 页面手动触发，并受 production Environment 的 main 分支策略约束。
+# 受保护的 main 每次更新都会构建不可变发布包并自动上线。
+# workflow_dispatch 只用于重试 main 当前 SHA；production Environment 仍只允许 main。
 on:
   push:
     branches: [main]
@@ -98,7 +98,7 @@ jobs:
 
   deploy-production:
     name: 部署生产环境
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     needs: package
     runs-on: ubuntu-latest
     permissions: {}
