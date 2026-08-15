@@ -1430,6 +1430,87 @@ class KlineRepository:
             return self.get_etf_daily(symbol, start, end, columns)
         return pl.DataFrame()
 
+    def get_daily_close_batch(
+        self,
+        asset_type: str,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
+        """批量读取估值所需收盘价,不触发单标的指标即时计算。"""
+        unique_symbols = list(dict.fromkeys(symbols))
+        if not unique_symbols:
+            return pl.DataFrame()
+        columns = ["symbol", "date", "close"]
+        if asset_type == "stock":
+            from app.indicators.pipeline import filter_halt_days
+
+            stock_columns = ["symbol", "date", "open", "high", "close"]
+            frame = filter_halt_days(
+                self._scan_daily_batch(unique_symbols, start, end, stock_columns)
+            )
+            if set(columns).issubset(frame.columns):
+                frame = frame.select(columns)
+            cached = self._enriched_cache
+            if cached is not None and not cached.is_empty():
+                cached_snapshot = self._filter_cached_batch(
+                    cached, unique_symbols, stock_columns
+                ).filter(
+                    (pl.col("date") >= start) & (pl.col("date") <= end)
+                )
+                if not cached_snapshot.is_empty():
+                    if not frame.is_empty():
+                        frame = frame.join(
+                            cached_snapshot.select(["symbol", "date"]).unique(),
+                            on=["symbol", "date"],
+                            how="anti",
+                        )
+                    cached_part = filter_halt_days(cached_snapshot)
+                    if set(columns).issubset(cached_part.columns):
+                        cached_part = cached_part.select(columns)
+                    if not cached_part.is_empty() and not frame.is_empty():
+                        frame = pl.concat([frame, cached_part], how="diagonal_relaxed")
+                    elif not cached_part.is_empty():
+                        frame = cached_part
+            return frame.sort(["symbol", "date"]) if not frame.is_empty() else frame
+        if asset_type == "index":
+            return self._scan_daily_batch_from_glob(
+                self._index_enriched_glob,
+                unique_symbols,
+                start,
+                end,
+                columns,
+                "指数日K",
+            )
+        if asset_type == "etf":
+            frame = self._scan_daily_batch_from_glob(
+                self._etf_enriched_glob,
+                unique_symbols,
+                start,
+                end,
+                columns,
+                "ETF 日K",
+            )
+            found = set(frame["symbol"].to_list()) if not frame.is_empty() else set()
+            legacy_symbols = [symbol for symbol in unique_symbols if symbol not in found]
+            if legacy_symbols:
+                legacy = self._scan_daily_batch_from_glob(
+                    self._index_enriched_glob,
+                    legacy_symbols,
+                    start,
+                    end,
+                    columns,
+                    "ETF 兼容日K",
+                )
+                if not legacy.is_empty():
+                    frame = (
+                        pl.concat([frame, legacy], how="diagonal_relaxed")
+                        if not frame.is_empty()
+                        else legacy
+                    )
+            return frame.sort(["symbol", "date"]) if not frame.is_empty() else frame
+        return pl.DataFrame()
+
     def _minute_glob_for(self, asset_type: str) -> str:
         """按资产类型选择分钟K parquet glob。ETF 分钟数据独立存储于 kline_etf_minute。"""
         return self._etf_minute_glob if asset_type == "etf" else self._minute_glob
@@ -1614,21 +1695,51 @@ class KlineRepository:
             logger.warning("日K查询失败: %s", e)
             return pl.DataFrame()
 
-    def _scan_daily_batch(self, symbols: list[str], start: date, end: date, columns: list[str] | None) -> pl.DataFrame:
+    def _scan_daily_batch(
+        self,
+        symbols: list[str],
+        start: date,
+        end: date,
+        columns: list[str] | None,
+    ) -> pl.DataFrame:
+        return self._scan_daily_batch_from_glob(
+            self._enriched_glob,
+            symbols,
+            start,
+            end,
+            columns,
+            "日K",
+        )
+
+    def _scan_daily_batch_from_glob(
+        self,
+        parquet_glob: str,
+        symbols: list[str],
+        start: date,
+        end: date,
+        columns: list[str] | None,
+        label: str,
+    ) -> pl.DataFrame:
         try:
-            lf = scan_enriched_parquet(self._enriched_glob,
-                                 cast_options=pl.ScanCastOptions(integer_cast="allow-float")).filter(
-                (pl.col("symbol").is_in(symbols))
-                & (pl.col("date") >= start)
-                & (pl.col("date") <= end)
-            ).sort(["symbol", "date"])
+            lf = (
+                scan_enriched_parquet(
+                    parquet_glob,
+                    cast_options=pl.ScanCastOptions(integer_cast="allow-float"),
+                )
+                .filter(
+                    (pl.col("symbol").is_in(symbols))
+                    & (pl.col("date") >= start)
+                    & (pl.col("date") <= end)
+                )
+                .sort(["symbol", "date"])
+            )
             if columns:
                 schema_names = lf.collect_schema().names()
                 existing = [c for c in columns if c in schema_names]
                 lf = lf.select(existing)
             return lf.collect()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("日K批量查询失败: %s", e)
+        except Exception as e:
+            logger.warning("%s批量查询失败: %s", label, e)
             return pl.DataFrame()
 
     def _scan_index_daily_symbol(self, symbol: str, start: date, end: date, columns: list[str] | None) -> pl.DataFrame:

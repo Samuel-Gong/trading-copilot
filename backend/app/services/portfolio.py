@@ -618,34 +618,45 @@ def reorder_trades(trade_ids: list[str]) -> None:
         _write(document)
 
 
-def _latest_price(
-    repo,
-    item: dict,
-    as_of: date,
-    *,
-    exact_date: bool = False,
-) -> tuple[float | None, date | None]:
-    frame = repo.get_daily_asset(
-        item["asset_type"],
-        item["symbol"],
-        as_of - timedelta(days=365),
-        as_of,
-        columns=["date", "close"],
-    )
-    if frame.is_empty() or "date" not in frame.columns or "close" not in frame.columns:
-        return None, None
-    row = frame.drop_nulls(["date", "close"]).sort("date").tail(1)
-    if row.is_empty():
-        return None, None
-    price = float(row["close"][0])
-    price_date = row["date"][0]
+def _coerce_price_date(value: date | datetime | str) -> date:
+    price_date = value
     if isinstance(price_date, datetime):
         price_date = price_date.date()
     elif isinstance(price_date, str):
         price_date = date.fromisoformat(price_date)
-    if exact_date and price_date != as_of:
-        return None, None
-    return price, price_date
+    return price_date
+
+
+def _latest_prices(
+    repo,
+    positions: list[dict],
+    as_of: date,
+) -> dict[tuple[str, str], tuple[float, date]]:
+    symbols_by_asset: dict[str, set[str]] = {}
+    for item in positions:
+        symbols_by_asset.setdefault(item["asset_type"], set()).add(item["symbol"])
+    prices: dict[tuple[str, str], tuple[float, date]] = {}
+    for asset_type, symbols in sorted(symbols_by_asset.items()):
+        frame = repo.get_daily_close_batch(
+            asset_type,
+            sorted(symbols),
+            as_of - timedelta(days=365),
+            as_of,
+        )
+        required = {"symbol", "date", "close"}
+        if frame.is_empty() or not required.issubset(frame.columns):
+            continue
+        latest = (
+            frame.drop_nulls(["symbol", "date", "close"])
+            .sort(["symbol", "date"])
+            .group_by("symbol", maintain_order=True)
+            .last()
+        )
+        for row in latest.iter_rows(named=True):
+            price_date = _coerce_price_date(row["date"])
+            if price_date <= as_of:
+                prices[(asset_type, row["symbol"])] = (float(row["close"]), price_date)
+    return prices
 
 
 def _round(value: float | None, digits: int = 6) -> float | None:
@@ -653,21 +664,21 @@ def _round(value: float | None, digits: int = 6) -> float | None:
 
 
 def _position_snapshot(
-    repo,
     item: dict,
     as_of: date,
+    latest_prices: dict[tuple[str, str], tuple[float, date]],
     *,
     exact_price_date: bool = False,
 ) -> dict:
     quantity = float(item["quantity"])
     average_cost = float(item["average_cost"])
     total_cost = quantity * average_cost
-    current_price, price_date = _latest_price(
-        repo,
-        item,
-        as_of,
-        exact_date=exact_price_date,
+    current_price, price_date = latest_prices.get(
+        (item["asset_type"], item["symbol"]),
+        (None, None),
     )
+    if exact_price_date and price_date != as_of:
+        current_price, price_date = None, None
     market_value = quantity * current_price if current_price is not None else None
     unrealized_pnl = market_value - total_cost if market_value is not None else None
     ratio = unrealized_pnl / total_cost if unrealized_pnl is not None and total_cost else None
@@ -724,11 +735,12 @@ def get_snapshot(
             if account_id is None or item.get("account_id") == account_id
         ]
     positions, ledger = _replay(trades, as_of)
+    latest_prices = _latest_prices(repo, positions, as_of)
     snapshots = [
         _position_snapshot(
-            repo,
             item,
             as_of,
+            latest_prices,
             exact_price_date=exact_price_date,
         )
         for item in positions

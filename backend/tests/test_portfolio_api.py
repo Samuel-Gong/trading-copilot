@@ -13,6 +13,7 @@ from app.api.portfolio import router
 from app.api.stock_analysis import router as stock_analysis_router
 from app.api.watchlist import router as watchlist_router
 from app.config import settings
+from app.services import portfolio as portfolio_service
 
 
 class FakePortfolioRepo:
@@ -73,6 +74,29 @@ class FakePortfolioRepo:
         if columns:
             frame = frame.select([column for column in columns if column in frame.columns])
         return frame
+
+    def get_daily_close_batch(self, asset_type, symbols, start, end):
+        rows = [
+            {"symbol": symbol, "date": trade_date, "close": close}
+            for symbol in symbols
+            for trade_date, close in self.prices.get(symbol, [])
+            if start <= trade_date <= end
+        ]
+        return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
+class BatchOnlyPortfolioRepo(FakePortfolioRepo):
+    """持仓估值只能走批量价格接口,并记录按资产类型分组的调用。"""
+
+    def __init__(self) -> None:
+        self.batch_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def get_daily_asset(self, asset_type, symbol, start, end, columns=None):
+        raise AssertionError("持仓总览不应逐标的读取日 K")
+
+    def get_daily_close_batch(self, asset_type, symbols, start, end):
+        self.batch_calls.append((asset_type, tuple(symbols)))
+        return super().get_daily_close_batch(asset_type, symbols, start, end)
 
 
 def make_client(tmp_path, monkeypatch) -> TestClient:
@@ -320,6 +344,30 @@ def test_same_symbol_trades_are_isolated_between_accounts(tmp_path, monkeypatch)
     assert [item["name"] for item in accounts] == ["主账户", "备用账户"]
 
 
+def test_snapshot_batches_prices_by_asset_type_and_reuses_cross_account_symbol(
+    tmp_path, monkeypatch
+):
+    client = make_client(tmp_path, monkeypatch)
+    main = create_account(client, "主账户")
+    reserve = create_account(client, "备用账户")
+    upsert_position(client, main["id"], "600519.SH", quantity=100, average_cost=1500)
+    upsert_position(client, reserve["id"], "600519.SH", quantity=20, average_cost=1400)
+    upsert_position(client, main["id"], "510300.SH", quantity=1000, average_cost=4)
+
+    repo = BatchOnlyPortfolioRepo()
+    client.app.state.repo = repo
+    response = client.get("/api/portfolio/snapshot", params={"as_of": "2026-08-01"})
+
+    assert response.status_code == 200
+    assert sorted(repo.batch_calls) == [
+        ("etf", ("510300.SH",)),
+        ("stock", ("600519.SH",)),
+    ]
+    snapshot = response.json()
+    assert snapshot["position_count"] == 3
+    assert snapshot["priced_position_count"] == 3
+
+
 def test_oldest_remaining_buy_date_is_exposed_in_snapshot(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     account = create_account(client, "主账户")
@@ -367,6 +415,25 @@ def test_snapshot_uses_latest_close_on_or_before_business_date(tmp_path, monkeyp
     assert position["price_date"] == "2026-07-31"
     assert position["price_available"] is True
     assert position["price_stale"] is True
+
+
+def test_snapshot_exact_price_date_does_not_fall_back_to_earlier_close(
+    tmp_path, monkeypatch
+):
+    client = make_client(tmp_path, monkeypatch)
+    account = create_account(client, "主账户")
+    upsert_position(client, account["id"], "600519.SH", quantity=100, average_cost=1500)
+
+    snapshot = portfolio_service.get_snapshot(
+        client.app.state.repo,
+        date(2026, 8, 1),
+        exact_price_date=True,
+    )
+    position = snapshot["accounts"][0]["positions"][0]
+
+    assert position["current_price"] is None
+    assert position["price_date"] is None
+    assert position["price_available"] is False
 
 
 def test_missing_price_stays_visible_and_is_excluded_from_valuation(tmp_path, monkeypatch):
@@ -438,7 +505,11 @@ def test_unexpected_repository_error_is_not_exposed(tmp_path, monkeypatch):
     def fail_with_sensitive_detail(*args, **kwargs):
         raise RuntimeError("/private/config/provider-secret.json")
 
-    monkeypatch.setattr(client.app.state.repo, "get_daily_asset", fail_with_sensitive_detail)
+    monkeypatch.setattr(
+        client.app.state.repo,
+        "get_daily_close_batch",
+        fail_with_sensitive_detail,
+    )
     account = create_account(client, "主账户")
     upsert_position(client, account["id"], "600519.SH", quantity=100, average_cost=1500)
 

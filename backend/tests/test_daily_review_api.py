@@ -56,6 +56,26 @@ class FakeDailyReviewRepo:
             "volume": [100_000] * len(dates),
         })
 
+    def get_daily_close_batch(self, asset_type, symbols, start, end):
+        rows = []
+        for symbol in symbols:
+            if symbol not in self.prices:
+                continue
+            dates = getattr(self, "dates_by_symbol", {}).get(
+                symbol,
+                [date(2026, 8, 1) - timedelta(days=offset) for offset in range(29, -1, -1)],
+            )
+            rows.extend(
+                {
+                    "symbol": symbol,
+                    "date": trade_date,
+                    "close": self.prices[symbol],
+                }
+                for trade_date in dates
+                if start <= trade_date <= end
+            )
+        return pl.DataFrame(rows) if rows else pl.DataFrame()
+
     def get_enriched_latest_asset(self, asset_type):
         return pl.DataFrame({
             "date": [date(2026, 8, 1)],

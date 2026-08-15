@@ -46,6 +46,15 @@ class FakeRepo:
         frame = pl.DataFrame(rows)
         return frame.select([name for name in columns or frame.columns if name in frame.columns])
 
+    def get_daily_close_batch(self, asset_type, symbols, start, end):
+        rows = [
+            {"symbol": symbol, "date": trade_date, "close": close}
+            for symbol in symbols
+            for trade_date, close in self.prices.get(symbol, [])
+            if start <= trade_date <= end
+        ]
+        return pl.DataFrame(rows) if rows else pl.DataFrame()
+
 
 def make_client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setattr(settings, "data_dir", tmp_path)
