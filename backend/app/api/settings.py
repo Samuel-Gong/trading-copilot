@@ -438,6 +438,7 @@ def get_preferences() -> dict:
         "index_daily_batch_size": preferences.get_index_daily_batch_size(),
         "watchlist_columns": preferences.get_watchlist_columns(),
         "screener_result_columns": preferences.get_screener_result_columns(),
+        "screener_strategy_pool": preferences.get_screener_strategy_pool(),
         "sse_refresh_pages": preferences.get_sse_refresh_pages(),
         "strategy_monitor_enabled": preferences.get_strategy_monitor_enabled(),
         "strategy_monitor_ids": preferences.get_strategy_monitor_ids(),
@@ -633,6 +634,25 @@ def get_watchlist_columns() -> dict:
     from app.services import preferences
     cols = preferences.get_watchlist_columns()
     return {"columns": cols}
+
+
+class ScreenerStrategyPoolIn(BaseModel):
+    strategy_ids: list[str]
+
+
+@router.get("/preferences/screener-strategy-pool")
+def get_screener_strategy_pool() -> dict:
+    """返回可跨发布恢复的策略页已选策略。"""
+    from app.services import preferences
+    return {"strategy_ids": preferences.get_screener_strategy_pool()}
+
+
+@router.put("/preferences/screener-strategy-pool")
+def update_screener_strategy_pool(req: ScreenerStrategyPoolIn) -> dict:
+    """保存策略页已选策略。"""
+    from app.services import preferences
+    saved = preferences.set_screener_strategy_pool(req.strategy_ids)
+    return {"strategy_ids": saved}
 
 
 class NavOrderIn(BaseModel):

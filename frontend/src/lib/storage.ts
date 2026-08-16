@@ -7,15 +7,21 @@
 
 function kv<T>(key: string) {
   return {
-    get(fallback: T): T {
+    getOptional(): T | undefined {
       try {
         const raw = localStorage.getItem(key)
         if (raw !== null) return JSON.parse(raw) as T
       } catch { /* ignore */ }
-      return fallback
+      return undefined
+    },
+    get(fallback: T): T {
+      return this.getOptional() ?? fallback
     },
     set(val: T) {
       try { localStorage.setItem(key, JSON.stringify(val)) } catch { /* ignore */ }
+    },
+    clear() {
+      try { localStorage.removeItem(key) } catch { /* ignore */ }
     },
   }
 }
@@ -26,6 +32,9 @@ export const storage = {
 
   /** 策略池 (screener) */
   strategyPool:         kv<string[]>('strategy-pool'),
+
+  /** 尚未成功写入服务端的策略池（与普通旧缓存严格分离） */
+  strategyPoolPending:  kv<unknown>('strategy-pool-pending-v1'),
 
   /** 自选列表列配置 */
   watchlistColumns:     kv<unknown[]>('watchlist_columns'),

@@ -422,7 +422,16 @@ export function DailyReview() {
   const [selectedPositionRef, setSelectedPositionRef] = useState('')
   const [historyOpen, setHistoryOpen] = useState(false)
   const [previewStock, setPreviewStock] = useState<{ symbol: string; name: string } | null>(null)
-  const { pool: screenerPool } = useStrategyPool()
+  const {
+    pool: screenerPool,
+    isReady: strategyPoolReady,
+    isSaving: strategyPoolSaving,
+    isError: strategyPoolError,
+    errorKind: strategyPoolErrorKind,
+    retry: retryStrategyPool,
+  } = useStrategyPool()
+  const strategyPoolErrorLabel = strategyPoolErrorKind === 'save' ? '策略池保存失败' : '策略池加载失败'
+  const strategyPoolPendingLabel = strategyPoolSaving ? '正在保存策略池' : '正在恢复策略池'
   const tradingDatesQuery = useTradingDates()
   const tradingDates = tradingDatesQuery.data?.dates ?? []
   const historyQuery = useQuery({
@@ -594,7 +603,9 @@ export function DailyReview() {
         number: '02',
         title: '策略候选',
         description: '运行选股页策略池并冻结历史候选',
-        meta: `将使用策略池中的 ${reviewStrategyIds.length} 个股票日线策略`,
+        meta: strategyPoolReady
+          ? `将使用策略池中的 ${reviewStrategyIds.length} 个股票日线策略`
+          : strategyPoolError ? strategyPoolErrorLabel : strategyPoolPendingLabel,
         status: 'pending',
         icon: Sparkles,
       },
@@ -649,7 +660,7 @@ export function DailyReview() {
         icon: Layers3,
       },
     ]
-  }, [reviewStrategyIds.length, routine])
+  }, [reviewStrategyIds.length, routine, strategyPoolError, strategyPoolErrorLabel, strategyPoolPendingLabel, strategyPoolReady])
   const selectedStep = reviewSteps.find(step => step.id === activeStep) ?? reviewSteps[0]
 
   const retryNode = (
@@ -716,12 +727,24 @@ export function DailyReview() {
               </button>
             )}
             <button
-              onClick={() => runMutation.mutate()}
-              disabled={!businessDate || runMutation.isPending || interruptMutation.isPending || !strategiesQuery.isSuccess}
+              onClick={() => {
+                if (strategyPoolError) {
+                  retryStrategyPool()
+                  return
+                }
+                runMutation.mutate()
+              }}
+              disabled={!strategyPoolError && (!businessDate || runMutation.isPending || interruptMutation.isPending || !strategiesQuery.isSuccess || !strategyPoolReady)}
               className="inline-flex items-center gap-1.5 rounded-btn bg-accent px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50"
-              title={`新建一次独立复盘，并冻结策略池中的 ${reviewStrategyIds.length} 个策略`}
+              title={strategyPoolReady
+                ? `新建一次独立复盘，并冻结策略池中的 ${reviewStrategyIds.length} 个策略`
+                : strategyPoolError ? `${strategyPoolErrorLabel}，点击重试` : strategyPoolPendingLabel}
             >
-              {runMutation.isPending
+              {!strategyPoolReady
+                ? strategyPoolError
+                  ? <><AlertTriangle className="h-3.5 w-3.5" />{strategyPoolErrorLabel}</>
+                  : <><Loader2 className="h-3.5 w-3.5 animate-spin" />{strategyPoolSaving ? '保存策略池' : '加载策略池'}</>
+                : runMutation.isPending
                 ? <><Loader2 className="h-3.5 w-3.5 animate-spin" />正在新建</>
                 : <><Play className="h-3.5 w-3.5" />新建复盘</>}
             </button>

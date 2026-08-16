@@ -77,13 +77,14 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
         warnings.append(f"运行缓存清理失败: {e}")
 
     try:
-        monitored_ids = preferences.get_strategy_monitor_ids()
-        if strategy_id in monitored_ids:
-            preferences.set_realtime_monitor_config({
-                "strategy_monitor_ids": [sid for sid in monitored_ids if sid != strategy_id],
-            })
+        preferences.remove_strategy_from_monitor_ids(strategy_id)
     except Exception as e:
         warnings.append(f"监控偏好清理失败: {e}")
+
+    try:
+        preferences.remove_screener_strategy_from_pool(strategy_id)
+    except Exception as e:
+        warnings.append(f"策略池偏好清理失败: {e}")
 
     try:
         rules_changed = False

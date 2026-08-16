@@ -73,12 +73,17 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
     })
     monitor_rules.save_one(tmp_path, rule)
 
-    preference_updates: list[dict] = []
-    monkeypatch.setattr(preferences, "get_strategy_monitor_ids", lambda: ["target", "other"])
+    monitor_removals: list[str] = []
+    screener_pool_removals: list[str] = []
     monkeypatch.setattr(
         preferences,
-        "set_realtime_monitor_config",
-        lambda config: preference_updates.append(config) or config,
+        "remove_strategy_from_monitor_ids",
+        lambda strategy_id: monitor_removals.append(strategy_id) or ["other"],
+    )
+    monkeypatch.setattr(
+        preferences,
+        "remove_screener_strategy_from_pool",
+        lambda strategy_id: screener_pool_removals.append(strategy_id) or ["other"],
     )
     monitor = _MonitorEngine()
 
@@ -90,7 +95,8 @@ def test_delete_strategy_is_not_blocked_by_another_broken_file(monkeypatch, tmp_
     assert not engine.has("target")
     assert not override_path.exists()
     assert not cache_path.exists()
-    assert preference_updates == [{"strategy_monitor_ids": ["other"]}]
+    assert monitor_removals == ["target"]
+    assert screener_pool_removals == ["target"]
     saved_rule = monitor_rules.load_one(tmp_path, "mr_target")
     assert saved_rule is not None and saved_rule["enabled"] is False
     assert monitor.invalidations == 1

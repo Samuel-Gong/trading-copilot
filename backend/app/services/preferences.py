@@ -1,15 +1,24 @@
 """用户偏好设置持久化。
 
 存储位置: data/user_data/preferences.json
-沿用 secrets_store 的 merge-write 模式,但不做 chmod 0600 (非敏感数据)。
+该文件同时保存 webhook/bot secret: POSIX 替换文件必须保持 0600 权限;
+Windows 替换文件必须使用仅授予当前进程用户的受保护 DACL。
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
+import threading
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# API 请求线程与行情刷新线程会并发更新同一偏好文件；读改写必须整体串行。
+_update_lock = threading.RLock()
 
 
 def _path() -> Path:
@@ -19,8 +28,7 @@ def _path() -> Path:
     return p
 
 
-def load() -> dict:
-    p = _path()
+def _load_unlocked(p: Path) -> dict:
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -29,14 +37,138 @@ def load() -> dict:
     return {}
 
 
-def save(updates: dict) -> dict:
-    """合并写入。返回新内容。"""
-    current = load()
-    current.update(updates)
-    _path().write_text(
-        json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
+def load() -> dict:
+    with _update_lock:
+        return _load_unlocked(_path())
+
+
+def _windows_private_security_attributes():
+    """构造仅当前进程用户可访问、禁止继承的 Windows 安全属性。"""
+    try:
+        import win32api
+        import win32con
+        import win32file
+        import win32security
+    except ImportError as exc:
+        raise RuntimeError("Windows ACL 支持不可用: 拒绝写入敏感偏好") from exc
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(),
+        win32con.TOKEN_QUERY,
     )
-    return current
+    try:
+        user_sid = win32security.GetTokenInformation(
+            token,
+            win32security.TokenUser,
+        )[0]
+        dacl = win32security.ACL()
+        dacl.AddAccessAllowedAce(
+            win32security.ACL_REVISION,
+            win32con.FILE_ALL_ACCESS,
+            user_sid,
+        )
+        security_attributes = win32security.SECURITY_ATTRIBUTES()
+        security_descriptor = security_attributes.SECURITY_DESCRIPTOR
+        security_descriptor.Initialize()
+        security_attributes.bInheritHandle = False
+        security_descriptor.SetSecurityDescriptorDacl(
+            True,
+            dacl,
+            False,
+        )
+        security_descriptor.SetSecurityDescriptorControl(
+            win32security.SE_DACL_PROTECTED,
+            win32security.SE_DACL_PROTECTED,
+        )
+        return win32con, win32file, security_attributes
+    finally:
+        token.Close()
+
+
+def _create_windows_private_temporary_file(p: Path, payload: bytes) -> Path:
+    """创建时即绑定受保护 DACL，写入后返回可用于替换的临时文件。"""
+    win32con, win32file, security_attributes = (
+        _windows_private_security_attributes()
+    )
+    temporary_path = p.parent / f".{p.name}.{uuid.uuid4().hex}.tmp"
+    handle = None
+    completed = False
+    try:
+        handle = win32file.CreateFile(
+            str(temporary_path),
+            win32con.GENERIC_WRITE,
+            0,
+            security_attributes,
+            win32con.CREATE_NEW,
+            win32con.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        error_code, bytes_written = win32file.WriteFile(handle, payload)
+        if error_code != 0 or bytes_written != len(payload):
+            raise OSError("Windows 偏好临时文件写入不完整")
+        win32file.FlushFileBuffers(handle)
+        handle.Close()
+        handle = None
+        completed = True
+        return temporary_path
+    finally:
+        try:
+            if handle is not None:
+                handle.Close()
+        finally:
+            if not completed:
+                temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_write(p: Path, data: dict) -> None:
+    """以受限权限写入临时文件后原子替换。"""
+    fchmod = getattr(os, "fchmod", None)
+    if not callable(fchmod):
+        payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+        temporary_path = _create_windows_private_temporary_file(p, payload)
+        try:
+            os.replace(temporary_path, p)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return
+
+    fd, temporary_name = tempfile.mkstemp(
+        dir=p.parent,
+        prefix=f".{p.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        fchmod(fd, 0o600)
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+        os.replace(temporary_path, p)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary_path.unlink(missing_ok=True)
+
+
+def update_atomically(updater: Callable[[dict], dict | None]) -> dict:
+    """在同一锁内读取、变换并原子写入；返回最终内容。"""
+    with _update_lock:
+        current = load()
+        updated = updater(dict(current))
+        if updated is None:
+            return current
+        _atomic_write(_path(), updated)
+        return updated
+
+
+def save(updates: dict) -> dict:
+    """并发安全地合并写入。返回新内容。"""
+    def merge(current: dict) -> dict:
+        current.update(updates)
+        return current
+
+    return update_atomically(merge)
 
 
 def get_realtime_quotes_enabled() -> bool:
@@ -78,11 +210,7 @@ def set_realtime_watchlist_symbols(symbols: list[str]) -> list[str]:  # noqa: AR
 
 def set_realtime_quote_interval(interval: float) -> float:
     """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。"""
-    current = load()
-    current["realtime_quote_interval"] = interval
-    _path().write_text(
-        json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
+    save({"realtime_quote_interval": interval})
     return interval
 
 
@@ -807,6 +935,65 @@ def set_screener_result_columns(columns: list[dict]) -> list[dict]:
     """保存策略结果列表列配置。"""
     save({"screener_result_columns": columns})
     return columns
+
+
+def get_screener_strategy_pool() -> list[str] | None:
+    """返回策略页已选策略; 未迁移过的用户返回 None。"""
+    stored = load().get("screener_strategy_pool")
+    if not isinstance(stored, list):
+        return None
+    return _normalize_strategy_ids(stored)
+
+
+def set_screener_strategy_pool(strategy_ids: list[str]) -> list[str]:
+    """保存策略页已选策略, 去重并保持用户排序。"""
+    normalized = _normalize_strategy_ids(strategy_ids)
+    save({"screener_strategy_pool": normalized})
+    return normalized
+
+
+def _normalize_strategy_ids(strategy_ids: list) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for raw in strategy_ids:
+        if not isinstance(raw, str):
+            continue
+        strategy_id = raw.strip()
+        if not strategy_id or strategy_id in seen:
+            continue
+        seen.add(strategy_id)
+        normalized.append(strategy_id)
+    return normalized
+
+
+def _remove_strategy_id_from_preference(key: str, strategy_id: str) -> list[str] | None:
+    target = str(strategy_id or "").strip()
+
+    def remove(current: dict) -> dict | None:
+        stored = current.get(key)
+        if not isinstance(stored, list):
+            return None
+        strategy_ids = _normalize_strategy_ids(stored)
+        if target not in strategy_ids:
+            return None
+        current[key] = [sid for sid in strategy_ids if sid != target]
+        return current
+
+    updated = update_atomically(remove)
+    stored = updated.get(key)
+    if not isinstance(stored, list):
+        return None
+    return _normalize_strategy_ids(stored)
+
+
+def remove_strategy_from_monitor_ids(strategy_id: str) -> list[str]:
+    """从实时监控池原子移除策略 ID。"""
+    return _remove_strategy_id_from_preference("strategy_monitor_ids", strategy_id) or []
+
+
+def remove_screener_strategy_from_pool(strategy_id: str) -> list[str] | None:
+    """从策略页策略池原子移除策略 ID；未迁移时返回 None。"""
+    return _remove_strategy_id_from_preference("screener_strategy_pool", strategy_id)
 
 
 # ===== 首次使用引导 =====

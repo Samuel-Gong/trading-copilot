@@ -15,6 +15,11 @@ import { EmptyState } from '@/components/EmptyState'
 import { DatePicker } from '@/components/DatePicker'
 import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { useStrategyPool } from '@/lib/useStrategyPool'
+import {
+  canPruneUnavailableStrategyPool,
+  pruneUnavailableStrategyPool,
+  strategyPoolsEqual,
+} from '@/lib/strategyPoolPersistence'
 import { StrategyCard, CardSize, loadCardSize, cardWrapCls } from '@/components/screener/StrategyCard'
 import { ScreenerTable } from '@/components/screener/ScreenerTable'
 import { ScreenerFilter as ScreenerFilterType, defaultFilter, filterActive, countActiveFilters, applyFilter, FilterPanel } from '@/components/screener/ScreenerFilter'
@@ -50,7 +55,19 @@ export function Screener() {
   const [builderMode, setBuilderMode] = useState<'create' | 'modify'>('create')
   const [showStore, setShowStore] = useState(false)
   const [showComposite, setShowComposite] = useState(false)
-  const { pool, addToPool, removeFromPool, reorderPool, prune } = useStrategyPool()
+  const {
+    pool,
+    isReady: strategyPoolReady,
+    isSaving: strategyPoolSaving,
+    isError: strategyPoolError,
+    errorKind: strategyPoolErrorKind,
+    retry: retryStrategyPool,
+    addToPool,
+    removeFromPool,
+    reorderPool,
+  } = useStrategyPool()
+  const strategyPoolErrorLabel = strategyPoolErrorKind === 'save' ? '策略池保存失败' : '策略池加载失败'
+  const strategyPoolPendingLabel = strategyPoolSaving ? '正在保存策略池' : '正在恢复策略池'
   const [cardSize, setCardSize] = useState<CardSize>(loadCardSize)
   // 日k蜡烛图显示开关（仅当 candle 列可见时才有意义；持久化）
   const [dailyKChartVisible, setDailyKChartVisible] = useState<boolean>(() => storage.screenerCandle.get(true))
@@ -125,6 +142,8 @@ export function Screener() {
   const strategies = useQuery({
     queryKey: QK.screenerStrategies('all'),
     queryFn: () => api.screenerStrategies(),
+    staleTime: 0,
+    refetchOnMount: 'always',
   })
 
   // 卡片首屏只读取轻量摘要；明细在点击策略或“全部”时按需加载。
@@ -192,18 +211,6 @@ export function Screener() {
   )
   const visiblePool = useMemo(() => pool.filter(id => availableStrategyIds.has(id)), [pool, availableStrategyIds])
 
-  // 策略列表加载后,自动清除池中失效的自定义策略(如本地开发残留的、
-  // 当前后端已不存在的策略 ID),避免"策略池"对话框持续显示失效项。
-  // 关键: 仅当本次拉取成功且返回非空列表时才 prune。
-  // 拉取中/失败/返回空(如引擎 reload 瞬时把某策略跳过)时一律不碰池,
-  // 否则会把用户池里仍有效的 ID 永久清空并写入 localStorage,导致卡片全没。
-  useEffect(() => {
-    if (strategies.isError) return        // 拉取失败: 不 prune
-    if (!strategies.isSuccess) return     // 加载中: 不 prune
-    if (allStrategyIds.size === 0) return  // 空列表: 不 prune
-    prune(allStrategyIds)
-  }, [allStrategyIds, prune, strategies.isError, strategies.isSuccess])
-
   // 策略文件加载失败时提示用户(避免"策略静默消失"被误判为正常)
   const loadErrors = strategies.data?.load_errors ?? []
   useEffect(() => {
@@ -211,6 +218,26 @@ export function Screener() {
       toast(`策略「${e.file}」加载失败：${e.error}`, 'error')
     }
   }, [loadErrors])
+
+  const canPruneUnavailable = canPruneUnavailableStrategyPool(
+    strategies.isSuccess,
+    strategies.isFetchedAfterMount,
+    strategies.isFetching,
+    loadErrors.length > 0,
+    allStrategyIds.size,
+  )
+  useEffect(() => {
+    if (!strategyPoolReady || !canPruneUnavailable) return
+    const pruned = pruneUnavailableStrategyPool(pool, allStrategyIds, true)
+    if (strategyPoolsEqual(pool, pruned)) return
+    reorderPool(pruned)
+  }, [
+    allStrategyIds,
+    canPruneUnavailable,
+    pool,
+    reorderPool,
+    strategyPoolReady,
+  ])
 
   // 进入页面自动跑策略池中的策略，获取命中数
   const runAll = useMutation({
@@ -445,7 +472,7 @@ export function Screener() {
   useEffect(() => {
     // ETF 模式无股票盘后缓存/ runAll, 单策略走实时单跑, 不触发 runAll
     if (assetType !== 'stock') return
-    if (!asOf || strategyPresets.length === 0 || !summaryQuery.isSuccess || runAll.isPending || visiblePool.length === 0) return
+    if (!strategyPoolReady || !asOf || strategyPresets.length === 0 || !summaryQuery.isSuccess || runAll.isPending || visiblePool.length === 0) return
     const runKey = `${asOf}|${visiblePool.join(',')}`
     if (runAllDateRef.current === runKey) return
     // 缓存已覆盖当前策略池 → 秒加载, 不触发 runAll
@@ -457,7 +484,7 @@ export function Screener() {
     if (!screenerAutoRun) return
     runAllDateRef.current = runKey
     requestRunAll({ date: asOf, strategyIds: missingStrategyIds })
-  }, [asOf, strategyPresets.length, summaryQuery.isSuccess, visiblePool, cacheCoversPool, missingStrategyIds, screenerAutoRun, assetType, runAll.isPending, requestRunAll])
+  }, [strategyPoolReady, asOf, strategyPresets.length, summaryQuery.isSuccess, visiblePool, cacheCoversPool, missingStrategyIds, screenerAutoRun, assetType, runAll.isPending, requestRunAll])
 
   const run = useMutation({
     mutationFn: ({ id, date }: { id: string; date: string }) =>
@@ -611,8 +638,8 @@ export function Screener() {
             {/* 重新运行策略：重载策略文件并重跑全部策略，更新命中个股 */}
             <button
               onClick={() => reloadStrategies.mutate()}
-              disabled={reloadStrategies.isPending}
-              title="重新加载策略并运行全部策略，刷新当前符合条件的个股"
+              disabled={reloadStrategies.isPending || !strategyPoolReady}
+              title={strategyPoolReady ? '重新加载策略并运行全部策略，刷新当前符合条件的个股' : strategyPoolError ? strategyPoolErrorLabel : strategyPoolPendingLabel}
               className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-btn
                 border border-border bg-surface text-xs font-medium text-muted
                 hover:text-accent hover:border-accent/50 transition-colors cursor-pointer
@@ -661,23 +688,34 @@ export function Screener() {
             </div>
             {/* 策略池按钮 */}
             <button
-              onClick={() => setShowPoolDialog(true)}
+              onClick={() => {
+                if (strategyPoolError) {
+                  retryStrategyPool()
+                  return
+                }
+                setShowPoolDialog(true)
+              }}
+              disabled={!strategyPoolReady && !strategyPoolError}
+              title={strategyPoolReady ? '调整策略池' : strategyPoolError ? `${strategyPoolErrorLabel}，点击重试` : strategyPoolPendingLabel}
               className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
                 border border-border bg-surface text-xs font-medium text-secondary
-                hover:text-accent hover:border-accent/50 transition-colors cursor-pointer"
+                hover:text-accent hover:border-accent/50 transition-colors cursor-pointer
+                disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Layers className="h-3.5 w-3.5" />
               策略池
               <span className="ml-0.5 min-w-[28px] h-4 flex items-center justify-center rounded-full bg-accent/15 text-accent text-[10px] font-bold">
-                {visiblePool.length}/{strategyPresets.length}
+                {strategyPoolReady ? `${visiblePool.length}/${strategyPresets.length}` : '…'}
               </span>
             </button>
             {/* 创建叠加策略 */}
             <button
               onClick={() => setShowComposite(true)}
+              disabled={!strategyPoolReady}
               className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
                 text-xs font-medium text-teal-400 border border-teal-500/20 bg-teal-500/5
-                hover:bg-teal-500/15 transition-colors cursor-pointer"
+                hover:bg-teal-500/15 transition-colors cursor-pointer
+                disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Layers className="h-3.5 w-3.5" />
               叠加策略
@@ -685,9 +723,11 @@ export function Screener() {
             {/* 创建策略 */}
             <button
               onClick={() => { setBuilderMode('create'); setShowBuilder(true) }}
+              disabled={!strategyPoolReady}
               className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
                 text-xs font-medium text-amber-400 border border-amber-400/20 bg-amber-400/5
-                hover:bg-amber-400/15 transition-colors cursor-pointer"
+                hover:bg-amber-400/15 transition-colors cursor-pointer
+                disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Sparkles className="h-3.5 w-3.5" />
               创建策略 · AI
@@ -710,8 +750,22 @@ export function Screener() {
         {/* 策略卡片 */}
         {cardSize !== 'hidden' && (
         <section>
+          {!strategyPoolReady && (
+            <div className="text-sm text-muted py-4 text-center border border-dashed border-border rounded-btn">
+              {strategyPoolError ? (
+                <button
+                  type="button"
+                  onClick={retryStrategyPool}
+                  className="inline-flex items-center gap-1.5 text-danger hover:text-danger/80"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  {strategyPoolErrorLabel}，点击重试
+                </button>
+              ) : `${strategyPoolPendingLabel}…`}
+            </div>
+          )}
           {strategies.isLoading && <div className="text-sm text-muted">加载中…</div>}
-          {!strategies.isLoading && visiblePool.length === 0 && (
+          {strategyPoolReady && !strategies.isLoading && visiblePool.length === 0 && (
             <div className="text-sm text-muted py-4 text-center border border-dashed border-border rounded-btn">
               策略池为空，点击右上角「策略池」按钮添加策略
             </div>

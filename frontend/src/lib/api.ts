@@ -1510,6 +1510,7 @@ export interface Preferences {
   nav_order: string[]
   nav_hidden: string[]
   screener_auto_run: boolean
+  screener_strategy_pool?: string[] | null
   minute_intraday_refresh: boolean
   minute_intraday_refresh_interval: number
   monitor_ext_fields: { concept: MonitorExtFieldItem | null; industry: MonitorExtFieldItem | null }
@@ -1867,6 +1868,15 @@ export const api = {
     request<{ columns: any[] }>('/api/settings/preferences/screener-result-columns', {
       method: 'PUT',
       body: JSON.stringify({ columns }),
+    }),
+
+  // 策略页策略池（服务端持久化，部署后可恢复）
+  screenerStrategyPool: () =>
+    request<{ strategy_ids: string[] | null }>('/api/settings/preferences/screener-strategy-pool'),
+  updateScreenerStrategyPool: (strategyIds: string[]) =>
+    request<{ strategy_ids: string[] }>('/api/settings/preferences/screener-strategy-pool', {
+      method: 'PUT',
+      body: JSON.stringify({ strategy_ids: strategyIds }),
     }),
 
   capabilities: () => request<CapabilitiesResponse>('/api/capabilities'),
