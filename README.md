@@ -184,7 +184,7 @@ CODEX_CLI_VERSION=0.144.3 docker compose up --build
 
 镜像已内置 **stock-sdk** 数据源插件(Node 运行时 + 依赖),开箱即用。
 
-> 📖 Docker 进阶、GitHub Actions 自构建、老 CPU 兼容、访问密码设置等见 [docs/deployment.md](./docs/deployment.md)。
+> 📖 Docker 进阶（镜像仅通过本地 `docker compose` 构建）、UCloud 源码发布、老 CPU 兼容、访问密码设置等见 [docs/deployment.md](./docs/deployment.md)。
 
 ### 跑起来后的第一次使用
 
@@ -241,7 +241,7 @@ PORT=3018                      # 服务端口
 
 | 文档                                                                                               | 内容                                                                 |
 | :------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------- |
-| [docs/deployment.md](./docs/deployment.md)                                                         | 部署方式(Dev / Docker / GH Actions)、老 CPU 兼容、更新代码、访问密码 |
+| [docs/deployment.md](./docs/deployment.md)                                                         | 部署方式(Dev / 本地 Docker Compose / UCloud 源码发布)、老 CPU 兼容、更新代码、访问密码 |
 | [docs/configuration.md](./docs/configuration.md)                                                   | 所有 `.env` 配置项详解(数据源、AI、服务、密码、数据目录)             |
 | [docs/features.md](./docs/features.md)                                                             | 各功能模块详细说明(选股/指标/回测/监控/个股分析/数据扩展)            |
 | [docs/user/portfolio-daily-review.md](./docs/user/portfolio-daily-review.md)                         | 多账户持仓、估值口径、每日复盘、失败恢复与数据备份                    |
