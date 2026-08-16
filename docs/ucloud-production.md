@@ -296,7 +296,7 @@ tickflow-deploy ALL=(root) NOPASSWD: /usr/local/sbin/tickflow-deploy-submit /hom
 
 `UCLOUD_SSH_KNOWN_HOSTS` 不能只靠 `ssh-keyscan` 后直接信任。先通过已有可信管理会话或 UCloud 控制台读取 `/etc/ssh/ssh_host_*_key.pub` 的指纹，再与本机 `ssh-keyscan` 结果逐字核对；只有匹配后才把精确 host key 行写入 Environment secret。
 
-workflow 开启严格主机密钥校验。提交器先把上传文件复制到 root 队列，再用独立 systemd transient unit 执行部署；Actions 的 SSH 断线、取消或超时不会终止服务器事务。workflow 只轮询持久状态，上传账号无法替换队列归档。不要授权任意 shell、`systemctl *` 或无边界的 root 命令。
+workflow 开启严格主机密钥校验，并在单次 job 内复用 SSH 连接，避免上传、提交和状态轮询反复建立握手。提交器先把上传文件复制到 root 队列，再用独立 systemd transient unit 执行部署；Actions 的 SSH 断线、取消或超时不会终止服务器事务。workflow 只轮询持久状态，状态查询遇到瞬时 SSH 断连时会继续有界轮询，但不会自动重试语义不明确的 `submit`；上传账号无法替换队列归档。不要授权任意 shell、`systemctl *` 或无边界的 root 命令。
 
 ## 5. 发布过程
 
