@@ -1,7 +1,9 @@
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { useCallback, useState, useRef, useEffect, useId, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Calendar, ChevronLeft, ChevronRight } from 'lucide-react'
+
+import { useModalPortalContainer } from '@/components/ModalPortalContext'
 
 /** 弹层固定宽度(px) — 与下方 w-[260px] 保持一致,用于水平边界裁剪计算 */
 const POPUP_WIDTH = 260
@@ -57,6 +59,8 @@ export function DatePicker({
   enforceAvailableDatesFrom,
   disabled = false,
 }: DatePickerProps) {
+  const popupId = useId()
+  const modalPortalContainer = useModalPortalContainer()
   const [open, setOpen] = useState(false)
   const [showYearPicker, setShowYearPicker] = useState(false)
   // 触发按钮 ref (外部点击检测 + 计算弹层坐标)
@@ -65,6 +69,12 @@ export function DatePicker({
   const popRef = useRef<HTMLDivElement>(null)
   // 弹层视口坐标 + 展开方向(open 时计算一次,避免滚动时漂移)
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+
+  const closePopup = useCallback((restoreFocus = false) => {
+    setOpen(false)
+    setShowYearPicker(false)
+    if (restoreFocus) requestAnimationFrame(() => btnRef.current?.focus())
+  }, [])
 
   // 当前显示的月份
   const [viewYear, setViewYear] = useState(() => viewDate(value, min, max).year)
@@ -84,7 +94,7 @@ export function DatePicker({
   // 打开弹层: 按钮的视口坐标计算 + 智能方向翻转 + 水平边界裁剪
   const handleOpen = () => {
     if (disabled) return
-    if (open) { setOpen(false); return }
+    if (open) { closePopup(); return }
     if (!btnRef.current) { setOpen(true); return }
     const r = btnRef.current.getBoundingClientRect()
     const spaceBelow = window.innerHeight - r.bottom
@@ -107,16 +117,33 @@ export function DatePicker({
       const t = e.target as Node
       if (btnRef.current?.contains(t)) return
       if (popRef.current?.contains(t)) return
-      setOpen(false)
+      // 点击外部时保留用户点中的新焦点，不抢回触发按钮。
+      closePopup()
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
-  }, [open])
+  }, [closePopup, open])
+
+  // 打开后把焦点移入日历；关闭时由 Escape 或选中动作还给触发按钮。
+  useEffect(() => {
+    if (!open || !pos) return
+    const raf = requestAnimationFrame(() => {
+      const popup = popRef.current
+      const selected = popup?.querySelector<HTMLButtonElement>(`button[data-date="${value}"]:not([disabled])`)
+      const target = showYearPicker
+        ? popup?.querySelector<HTMLButtonElement>('button[data-view-year="true"]')
+        : selected
+          ?? popup?.querySelector<HTMLButtonElement>('button[data-date]:not([disabled])')
+          ?? popup?.querySelector<HTMLButtonElement>('button[data-calendar-month-toggle]')
+      target?.focus()
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [open, pos, showYearPicker, value])
 
   // 滚动 / resize 时关闭弹层 (fixed 定位不跟随滚动,关闭比重算更可靠)
   useEffect(() => {
     if (!open) return
-    const close = () => setOpen(false)
+    const close = () => closePopup(true)
     // capture: true → 捕获到任意祖先滚动容器的 scroll
     window.addEventListener('scroll', close, true)
     window.addEventListener('resize', close)
@@ -124,7 +151,7 @@ export function DatePicker({
       window.removeEventListener('scroll', close, true)
       window.removeEventListener('resize', close)
     }
-  }, [open])
+  }, [closePopup, open])
 
   const prevMonth = () => {
     if (viewMonth === 0) { setViewMonth(11); setViewYear(viewYear - 1) }
@@ -185,6 +212,9 @@ export function DatePicker({
         ref={btnRef}
         type="button"
         disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={open ? popupId : undefined}
         onClick={handleOpen}
         className={`inline-flex items-center gap-1.5 h-7 px-2.5 rounded-input border border-border
           bg-elevated hover:border-accent/50 text-xs text-foreground num
@@ -195,12 +225,21 @@ export function DatePicker({
         <span className={value ? undefined : 'text-muted'}>{displayLabel}</span>
       </button>
 
-      {/* 弹出日历 — Portal 到 body, 逃逸祖先 overflow 裁剪与 framer-motion transform 包含块 */}
+      {/* 弹出日历 — Modal 内挂到专属 Portal 容器，其他场景挂到 body */}
       {createPortal(
         <AnimatePresence>
           {open && pos && (
             <motion.div
+              id={popupId}
               ref={popRef}
+              role="dialog"
+              aria-label="选择日期"
+              onKeyDown={(event) => {
+                if (event.key !== 'Escape') return
+                event.preventDefault()
+                event.stopPropagation()
+                closePopup(true)
+              }}
               initial={{ opacity: 0, y: -4, scale: 0.97 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -4, scale: 0.97 }}
@@ -220,6 +259,7 @@ export function DatePicker({
               </button>
               <button
                 type="button"
+                data-calendar-month-toggle
                 onClick={() => setShowYearPicker(v => !v)}
                 className="text-sm font-medium text-foreground num hover:text-accent transition-colors cursor-pointer"
               >
@@ -247,6 +287,7 @@ export function DatePicker({
                     <button
                       key={y}
                       type="button"
+                      data-view-year={y === viewYear ? 'true' : undefined}
                       onClick={() => {
                         setViewYear(y)
                         setShowYearPicker(false)
@@ -279,34 +320,35 @@ export function DatePicker({
                     return (
                       <button
                         key={i}
-                    type="button"
-                    disabled={c.disabled}
-                    onClick={() => {
-                      if (!c.disabled) {
-                        onChange(c.dateStr)
-                        setOpen(false)
-                      }
-                    }}
-                    className={`
-                      h-7 w-full text-xs rounded-btn transition-colors duration-100
-                      ${c.cur ? 'text-foreground' : 'text-muted/40'}
-                      ${isSelected ? 'bg-accent text-white font-bold' : ''}
-                      ${isToday && !isSelected ? 'border border-accent/40' : ''}
-                      ${!isSelected && !c.disabled ? 'hover:bg-elevated' : ''}
-                      ${c.disabled ? 'opacity-20 cursor-not-allowed' : 'cursor-pointer'}
-                    `}
-                  >
-                    {c.day}
-                  </button>
-                )
-              })}
-            </div>
+                        data-date={c.dateStr}
+                        type="button"
+                        disabled={c.disabled}
+                        onClick={() => {
+                          if (!c.disabled) {
+                            onChange(c.dateStr)
+                            closePopup(true)
+                          }
+                        }}
+                        className={`
+                          h-7 w-full text-xs rounded-btn transition-colors duration-100
+                          ${c.cur ? 'text-foreground' : 'text-muted/40'}
+                          ${isSelected ? 'bg-accent text-white font-bold' : ''}
+                          ${isToday && !isSelected ? 'border border-accent/40' : ''}
+                          ${!isSelected && !c.disabled ? 'hover:bg-elevated' : ''}
+                          ${c.disabled ? 'opacity-20 cursor-not-allowed' : 'cursor-pointer'}
+                        `}
+                      >
+                        {c.day}
+                      </button>
+                    )
+                  })}
+                </div>
               </>
             )}
           </motion.div>
         )}
       </AnimatePresence>
-      , document.body)}
+      , modalPortalContainer?.current ?? document.body)}
     </div>
   )
 }

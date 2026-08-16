@@ -81,7 +81,9 @@ export function InstrumentSearchInput({
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (event.key === 'Escape') {
+    if (event.key === 'Escape' && open && query.length > 0) {
+      event.preventDefault()
+      event.stopPropagation()
       setOpen(false)
       setActiveIndex(-1)
       return

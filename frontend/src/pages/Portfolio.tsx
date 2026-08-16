@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   DndContext, closestCenter, KeyboardSensor, PointerSensor,
@@ -128,6 +128,7 @@ export function Portfolio() {
   const [costEditTrade, setCostEditTrade] = useState<PortfolioTrade | null>(null)
   const [monitorPosition, setMonitorPosition] = useState<PortfolioPosition | null>(null)
   const [tradeDetailPosition, setTradeDetailPosition] = useState<PortfolioPosition | null>(null)
+  const [tradeDetailReturnPosition, setTradeDetailReturnPosition] = useState<PortfolioPosition | null>(null)
   const [draft, setDraft] = useState<TradeDraft | null>(null)
   const [statementOpen, setStatementOpen] = useState(false)
   const [tradesView, setTradesView] = useState<'flat' | 'stock' | 'date'>('flat')
@@ -278,6 +279,7 @@ export function Portfolio() {
   }
 
   function openCreateTrade(side: 'buy' | 'sell' = 'buy', position?: PortfolioPosition) {
+    setTradeDetailReturnPosition(null)
     const tradeDate = asOf || tradingDatesQuery.data?.latest_date || localDateIso()
     setDraft({
       accountId: position?.account_id ?? selectedAccountId ?? accounts[0]?.id ?? '',
@@ -290,6 +292,19 @@ export function Portfolio() {
       tax: '',
       note: '',
     })
+  }
+
+  function openCreateTradeFromDetail(side: 'buy' | 'sell', position: PortfolioPosition) {
+    openCreateTrade(side, position)
+    setTradeDetailReturnPosition(position)
+    setTradeDetailPosition(null)
+  }
+
+  function closeTradeDialog() {
+    if (tradeBusy) return
+    setDraft(null)
+    if (tradeDetailReturnPosition) setTradeDetailPosition(tradeDetailReturnPosition)
+    setTradeDetailReturnPosition(null)
   }
 
   async function saveTrade() {
@@ -321,8 +336,11 @@ export function Portfolio() {
         ...(tax === undefined ? {} : { tax }),
         note: draft.note.trim(),
       })
-      setDraft(null)
+      const returnPosition = tradeDetailReturnPosition
       await invalidatePortfolio()
+      setDraft(null)
+      if (returnPosition) setTradeDetailPosition(returnPosition)
+      setTradeDetailReturnPosition(null)
       toast(draft.side === 'buy' ? '买入交易已记录' : '卖出交易已记录', 'success')
     } finally {
       setTradeBusy(false)
@@ -633,7 +651,7 @@ export function Portfolio() {
           earliestTradingDate={tradingDatesQuery.data?.earliest_date}
           latestTradingDate={tradingDatesQuery.data?.latest_date}
           onChange={setDraft}
-          onClose={() => setDraft(null)}
+          onClose={closeTradeDialog}
           onSave={saveTrade}
         />
       )}
@@ -658,6 +676,7 @@ export function Portfolio() {
           reorderBusy={reorderBusy}
           tradeEditBusy={tradeEditBusy}
           onClose={() => setTradeDetailPosition(null)}
+          onCreateTrade={side => openCreateTradeFromDetail(side, tradeDetailPosition)}
           onDelete={deleteTrade}
           onReorderDay={reorderDayTrades}
           onRetry={() => tradesQuery.refetch()}
@@ -869,6 +888,7 @@ function PositionTradesDialog({
   reorderBusy,
   tradeEditBusy,
   onClose,
+  onCreateTrade,
   onDelete,
   onReorderDay,
   onRetry,
@@ -882,6 +902,7 @@ function PositionTradesDialog({
   reorderBusy: boolean
   tradeEditBusy: boolean
   onClose: () => void
+  onCreateTrade: (side: 'buy' | 'sell') => void
   onDelete: (trade: PortfolioTrade) => void
   onReorderDay: (dayTradesInDisplayOrder: PortfolioTrade[]) => void
   onRetry: () => void
@@ -921,6 +942,22 @@ function PositionTradesDialog({
             <span>{accountName}</span>
             <span>{items.length} 笔</span>
           </div>
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => onCreateTrade('buy')}
+            className="flex h-8 items-center justify-center gap-1.5 rounded-btn border border-bull/20 bg-bull/5 px-3 text-xs font-medium text-bull hover:bg-bull/10"
+          >
+            <ArrowDownLeft className="h-3.5 w-3.5" />买入
+          </button>
+          <button
+            type="button"
+            onClick={() => onCreateTrade('sell')}
+            className="flex h-8 items-center justify-center gap-1.5 rounded-btn border border-bear/20 bg-bear/5 px-3 text-xs font-medium text-bear hover:bg-bear/10"
+          >
+            <ArrowUpRight className="h-3.5 w-3.5" />卖出
+          </button>
         </div>
         <button onClick={onClose} className="rounded-btn p-1.5 text-muted hover:bg-elevated hover:text-foreground" title="关闭">
           <X className="h-4 w-4" />
@@ -1061,14 +1098,22 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
 
 function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate, latestTradingDate, onChange, onClose, onSave }: { accounts: PortfolioAccount[]; draft: TradeDraft; busy: boolean; tradingDates: readonly string[]; earliestTradingDate?: string | null; latestTradingDate?: string | null; onChange: (draft: TradeDraft) => void; onClose: () => void; onSave: () => void }) {
   const [estimateBusy, setEstimateBusy] = useState(false)
+  const mountedRef = useRef(true)
+  const initialFocusRef = useRef<HTMLSelectElement>(null)
   const quantity = Number(draft.quantity)
   const price = Number(draft.price)
   const canEstimate = Boolean(draft.symbol.trim())
     && draft.quantity.trim() !== '' && Number.isFinite(quantity) && quantity > 0
     && draft.price.trim() !== '' && Number.isFinite(price) && price >= 0
+  const closeIfIdle = () => { if (!busy) onClose() }
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   async function estimate() {
-    if (!canEstimate) return
+    if (!canEstimate || busy || estimateBusy) return
     setEstimateBusy(true)
     try {
       const result = await api.portfolioTradeEstimate({
@@ -1077,21 +1122,28 @@ function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate,
         quantity,
         price,
       })
+      if (!mountedRef.current) return
       onChange({ ...draft, fee: result.fee.toFixed(2), tax: result.tax.toFixed(2) })
     } catch {
       // request 内已弹错误 toast
     } finally {
-      setEstimateBusy(false)
+      if (mountedRef.current) setEstimateBusy(false)
     }
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4" onClick={onClose}>
-      <div className="w-full max-w-lg rounded-card border border-border bg-surface shadow-2xl" onClick={event => event.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-border px-4 py-3"><div><h2 className="text-sm font-medium">记录交易</h2><p className="mt-0.5 text-[11px] text-muted">持仓将由全部买卖交易按日期和 FIFO 成本法自动汇总</p></div><button onClick={onClose} className="rounded-btn p-1 text-muted hover:bg-elevated hover:text-foreground"><X className="h-4 w-4" /></button></div>
+    <Modal
+      onClose={closeIfIdle}
+      labelledBy="trade-dialog-title"
+      initialFocusRef={initialFocusRef}
+      panelClassName="w-full max-w-lg rounded-card border border-border bg-surface shadow-2xl"
+      overlayClassName="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
+      closeOnBackdrop={!busy}
+    >
+        <div className="flex items-center justify-between border-b border-border px-4 py-3"><div><h2 id="trade-dialog-title" className="text-sm font-medium">记录交易</h2><p className="mt-0.5 text-[11px] text-muted">持仓将由全部买卖交易按日期和 FIFO 成本法自动汇总</p></div><button onClick={closeIfIdle} disabled={busy} className="rounded-btn p-1 text-muted hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" title={busy ? '保存中，暂不可关闭' : '关闭'}><X className="h-4 w-4" /></button></div>
         <div className="space-y-3 p-4">
           <div className="grid grid-cols-2 gap-3">
-            <Field label="账户" htmlFor="trade-account"><select id="trade-account" value={draft.accountId} onChange={event => onChange({ ...draft, accountId: event.target.value })} className={INPUT_CLASS}>{accounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}</select></Field>
+            <Field label="账户" htmlFor="trade-account"><select ref={initialFocusRef} id="trade-account" value={draft.accountId} onChange={event => onChange({ ...draft, accountId: event.target.value })} className={INPUT_CLASS}>{accounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}</select></Field>
             <Field label="方向" htmlFor="trade-side"><select id="trade-side" value={draft.side} onChange={event => onChange({ ...draft, side: event.target.value as 'buy' | 'sell' })} className={INPUT_CLASS}><option value="buy">买入</option><option value="sell">卖出</option></select></Field>
           </div>
           <Field label="证券代码" hint="支持输入代码或名称联想" htmlFor="trade-symbol">
@@ -1103,7 +1155,7 @@ function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate,
           <div className="grid grid-cols-2 gap-3"><Field label="成交数量" htmlFor="trade-quantity"><input id="trade-quantity" type="number" min="0" step="any" value={draft.quantity} onChange={event => onChange({ ...draft, quantity: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field><Field label="成交价格" htmlFor="trade-price"><input id="trade-price" type="number" min="0" step="any" value={draft.price} onChange={event => onChange({ ...draft, price: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field></div>
           <div className="flex items-center justify-between rounded-btn border border-border bg-elevated/40 px-3 py-2">
             <span className="text-[11px] text-muted">按「设置 → 交易费率」估算本次费用/税费</span>
-            <button onClick={estimate} disabled={!canEstimate || estimateBusy} className="flex h-7 shrink-0 items-center gap-1 rounded-btn border border-accent/25 bg-accent/5 px-2.5 text-[11px] text-accent hover:bg-accent/10 disabled:opacity-40">
+            <button onClick={estimate} disabled={!canEstimate || busy || estimateBusy} className="flex h-7 shrink-0 items-center gap-1 rounded-btn border border-accent/25 bg-accent/5 px-2.5 text-[11px] text-accent hover:bg-accent/10 disabled:opacity-40">
               {estimateBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <CircleDollarSign className="h-3 w-3" />}
               估算
             </button>
@@ -1112,9 +1164,8 @@ function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate,
           <Field label="备注" hint="可选；最近一笔非空备注会展示在持仓上" htmlFor="trade-note"><textarea id="trade-note" value={draft.note} onChange={event => onChange({ ...draft, note: event.target.value })} rows={3} className={`${INPUT_CLASS} resize-none`} /></Field>
           {draft.side === 'sell' && <div className="rounded-btn border border-warning/25 bg-warning/5 px-3 py-2 text-[11px] leading-relaxed text-warning">卖出数量不能超过该交易日的可用持仓；补录历史卖出也会校验它之后的所有交易。</div>}
         </div>
-        <div className="flex justify-end gap-2 border-t border-border px-4 py-3"><button onClick={onClose} className="h-8 rounded-btn px-3 text-xs text-secondary hover:bg-elevated">取消</button><button onClick={onSave} disabled={busy} className="flex h-8 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-medium text-white disabled:opacity-50">{busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}保存交易</button></div>
-      </div>
-    </div>
+        <div className="flex justify-end gap-2 border-t border-border px-4 py-3"><button onClick={closeIfIdle} disabled={busy} className="h-8 rounded-btn px-3 text-xs text-secondary hover:bg-elevated disabled:cursor-not-allowed disabled:opacity-40">取消</button><button onClick={onSave} disabled={busy || estimateBusy} className="flex h-8 items-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-medium text-white disabled:opacity-50">{busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}保存交易</button></div>
+    </Modal>
   )
 }
 

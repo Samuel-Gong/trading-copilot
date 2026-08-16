@@ -1,4 +1,6 @@
-import { useEffect, useRef, type ReactNode } from 'react'
+import { useEffect, useId, useRef, type ReactNode } from 'react'
+
+import { ModalPortalContext } from '@/components/ModalPortalContext'
 
 /**
  * 共享模态对话框原语 — 统一处理可访问性:
@@ -6,6 +8,7 @@ import { useEffect, useRef, type ReactNode } from 'react'
  * - ESC 关闭
  * - 打开时把焦点移入对话框 (initialFocusRef 或首个可聚焦元素)
  * - Tab / Shift+Tab 焦点陷阱 (焦点不会跑出对话框)
+ * - 子组件 Portal 纳入同一焦点作用域
  * - 关闭时把焦点还给打开前的元素
  * - 点击遮罩关闭 (可用 closeOnBackdrop 关闭)
  *
@@ -47,7 +50,10 @@ export function Modal({
   initialFocusRef,
   closeOnBackdrop = true,
 }: ModalProps) {
+  const portalContainerId = useId()
+  const overlayRef = useRef<HTMLDivElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
+  const portalContainerRef = useRef<HTMLDivElement>(null)
   // 记录鼠标按下时是否落在遮罩(而非面板)上。
   // 仅当 mousedown 和 mouseup 都在遮罩时才视为"点击遮罩关闭",
   // 避免在面板内拖选文本时鼠标移出面板边缘导致误关 (拖拽穿透)。
@@ -83,35 +89,36 @@ export function Modal({
         return
       }
       if (e.key !== 'Tab') return
-      const panel = panelRef.current
-      if (!panel) return
-      const nodes = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE))
+      const scope = overlayRef.current
+      if (!scope) return
+      const nodes = Array.from(scope.querySelectorAll<HTMLElement>(FOCUSABLE))
         .filter(el => el.offsetParent !== null || el === document.activeElement)
       if (nodes.length === 0) {
         e.preventDefault()
-        panel.focus()
+        panelRef.current?.focus()
         return
       }
       const first = nodes[0]
       const last = nodes[nodes.length - 1]
       const active = document.activeElement as HTMLElement | null
       if (e.shiftKey) {
-        if (active === first || !panel.contains(active)) {
+        if (active === first || !scope.contains(active)) {
           e.preventDefault()
           last.focus()
         }
       } else {
-        if (active === last || !panel.contains(active)) {
+        if (active === last || !scope.contains(active)) {
           e.preventDefault()
           first.focus()
         }
       }
     }
 
-    document.addEventListener('keydown', onKeyDown, true)
+    // 使用冒泡阶段，让输入框、下拉菜单等内层交互先处理 Escape。
+    document.addEventListener('keydown', onKeyDown)
     return () => {
       cancelAnimationFrame(raf)
-      document.removeEventListener('keydown', onKeyDown, true)
+      document.removeEventListener('keydown', onKeyDown)
       // 还原焦点
       prevActive?.focus?.()
     }
@@ -120,29 +127,34 @@ export function Modal({
   }, [])
 
   return (
-    <div
-      className={overlayClassName}
-      onMouseDown={(e) => {
-        // 仅记录"按下时确实在遮罩上"; 在面板内按下时记 false。
-        mouseDownOnBackdrop.current = e.target === e.currentTarget
-      }}
-      onClick={closeOnBackdrop ? (e) => {
-        // 只有按下和松开都在遮罩上才关闭, 避免拖选文本误关。
-        if (mouseDownOnBackdrop.current && e.target === e.currentTarget) onClose()
-      } : undefined}
-    >
+    <ModalPortalContext.Provider value={portalContainerRef}>
       <div
-        ref={panelRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={labelledBy}
-        aria-label={labelledBy ? undefined : ariaLabel}
-        tabIndex={-1}
-        className={`outline-none ${panelClassName}`}
-        onClick={(e) => e.stopPropagation()}
+        ref={overlayRef}
+        className={overlayClassName}
+        onMouseDown={(e) => {
+          // 仅记录"按下时确实在遮罩上"; 在面板内按下时记 false。
+          mouseDownOnBackdrop.current = e.target === e.currentTarget
+        }}
+        onClick={closeOnBackdrop ? (e) => {
+          // 只有按下和松开都在遮罩上才关闭, 避免拖选文本误关。
+          if (mouseDownOnBackdrop.current && e.target === e.currentTarget) onClose()
+        } : undefined}
       >
-        {children}
+        <div
+          ref={panelRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={labelledBy}
+          aria-label={labelledBy ? undefined : ariaLabel}
+          aria-owns={portalContainerId}
+          tabIndex={-1}
+          className={`outline-none ${panelClassName}`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {children}
+        </div>
+        <div id={portalContainerId} ref={portalContainerRef} className="contents" />
       </div>
-    </div>
+    </ModalPortalContext.Provider>
   )
 }
