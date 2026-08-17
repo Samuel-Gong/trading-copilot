@@ -81,6 +81,7 @@ def record_trade(
     fee: float = 0,
     tax: float = 0,
     note: str = "",
+    insert_before_trade_id: str | None = None,
 ) -> dict:
     response = client.post(
         "/api/portfolio/trades",
@@ -94,10 +95,98 @@ def record_trade(
             "fee": fee,
             "tax": tax,
             "note": note,
+            **(
+                {"insert_before_trade_id": insert_before_trade_id}
+                if insert_before_trade_id
+                else {}
+            ),
         },
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def test_create_trade_inserts_before_same_day_anchor_atomically(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    account = create_account(client)
+    first = record_trade(
+        client, account["id"], trade_date="2026-08-01", side="buy",
+        quantity=100, price=10,
+    )
+    later = record_trade(
+        client, account["id"], trade_date="2026-08-01", side="buy",
+        quantity=100, price=20,
+    )
+
+    inserted = record_trade(
+        client, account["id"], trade_date="2026-08-01", side="buy",
+        quantity=50, price=15, insert_before_trade_id=later["id"],
+    )
+
+    listed = client.get("/api/portfolio/trades").json()["items"]
+    assert [item["id"] for item in listed] == [later["id"], inserted["id"], first["id"]]
+    assert [item["seq"] for item in listed] == [3, 2, 1]
+
+
+def test_create_trade_rejects_mismatched_insert_anchor_without_appending(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    account = create_account(client)
+    anchor = record_trade(
+        client, account["id"], trade_date="2026-08-01", side="buy",
+        quantity=100, price=10,
+    )
+
+    response = client.post(
+        "/api/portfolio/trades",
+        json={
+            "account_id": account["id"],
+            "symbol": "600519.SH",
+            "trade_date": "2026-07-31",
+            "side": "buy",
+            "quantity": 20,
+            "price": 9,
+            "fee": 0,
+            "tax": 0,
+            "insert_before_trade_id": anchor["id"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "同一账户、标的和交易日" in response.json()["detail"]
+    listed = client.get("/api/portfolio/trades").json()["items"]
+    assert [item["id"] for item in listed] == [anchor["id"]]
+
+
+def test_create_trade_rejects_invalid_inserted_execution_order_atomically(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    account = create_account(client)
+    buy = record_trade(
+        client, account["id"], trade_date="2026-08-01", side="buy",
+        quantity=100, price=10,
+    )
+    sell = record_trade(
+        client, account["id"], trade_date="2026-08-01", side="sell",
+        quantity=50, price=12,
+    )
+
+    response = client.post(
+        "/api/portfolio/trades",
+        json={
+            "account_id": account["id"],
+            "symbol": "600519.SH",
+            "trade_date": "2026-08-01",
+            "side": "sell",
+            "quantity": 40,
+            "price": 11,
+            "fee": 0,
+            "tax": 0,
+            "insert_before_trade_id": buy["id"],
+        },
+    )
+
+    assert response.status_code == 409
+    listed = client.get("/api/portfolio/trades").json()["items"]
+    assert [item["id"] for item in listed] == [sell["id"], buy["id"]]
 
 
 def test_snapshot_replays_only_trades_on_or_before_as_of_with_fifo_cost(tmp_path, monkeypatch):

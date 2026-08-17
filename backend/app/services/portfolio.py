@@ -412,6 +412,7 @@ def record_trade(
     fee: float | None = None,
     tax: float | None = None,
     note: str = "",
+    insert_before_trade_id: str | None = None,
 ) -> dict:
     normalized, name, asset_type = _resolve_instrument(repo, symbol)
     cost_source = "manual"
@@ -448,15 +449,58 @@ def record_trade(
             "note": note.strip(),
             "created_at": _now_iso(),
         }
-        same_day = [
-            existing
-            for existing in document["trades"]
-            if str(existing.get("trade_date") or "") == item["trade_date"]
-        ]
-        # 新录入默认排在该交易日最后,与原按 created_at 回放的行为一致;用户可再调整
-        item["seq"] = max([int(existing.get("seq") or 0) for existing in same_day] or [0]) + 1
-        candidate = [*document["trades"], item]
-        _validate_trades(candidate)
+        candidate_existing = document["trades"]
+        if insert_before_trade_id:
+            anchor = next(
+                (
+                    existing
+                    for existing in document["trades"]
+                    if str(existing.get("id") or "") == insert_before_trade_id
+                ),
+                None,
+            )
+            if anchor is None:
+                raise PortfolioNotFoundError("插入位置对应的交易记录不存在")
+            if (
+                anchor.get("account_id") != account_id
+                or anchor.get("symbol") != normalized
+                or anchor.get("trade_date") != item["trade_date"]
+            ):
+                raise ValueError("插入位置必须属于同一账户、标的和交易日")
+            anchor_seq = int(anchor.get("seq") or 0)
+            item["seq"] = anchor_seq
+            candidate_existing = [
+                {
+                    **existing,
+                    "seq": int(existing.get("seq") or 0) + 1,
+                }
+                if (
+                    existing.get("trade_date") == item["trade_date"]
+                    and int(existing.get("seq") or 0) >= anchor_seq
+                )
+                else existing
+                for existing in document["trades"]
+            ]
+        else:
+            same_day = [
+                existing
+                for existing in document["trades"]
+                if str(existing.get("trade_date") or "") == item["trade_date"]
+            ]
+            # 普通录入默认排在该交易日最后,保持既有行为;用户仍可再调整。
+            item["seq"] = (
+                max([int(existing.get("seq") or 0) for existing in same_day] or [0])
+                + 1
+            )
+        candidate = [*candidate_existing, item]
+        try:
+            _validate_trades(candidate)
+        except PortfolioConflictError as exc:
+            if insert_before_trade_id:
+                raise PortfolioConflictError(
+                    "插入后的交易顺序会导致后续卖出超过可用数量"
+                ) from exc
+            raise
         document["trades"] = candidate
         _remove_held_watch_items(document)
         _write(document)

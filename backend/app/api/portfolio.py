@@ -49,6 +49,7 @@ class TradeCreateRequest(BaseModel):
     fee: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     tax: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     note: str = Field(default="", max_length=500)
+    insert_before_trade_id: str | None = Field(default=None, min_length=1)
 
     @field_validator("quantity", "price", "fee", "tax", mode="before")
     @classmethod
@@ -207,6 +208,7 @@ def create_trade(body: TradeCreateRequest, request: Request):
             fee=body.fee,
             tax=body.tax,
             note=body.note,
+            insert_before_trade_id=body.insert_before_trade_id,
         )
     except Exception as exc:
         raise _map_error(exc) from exc

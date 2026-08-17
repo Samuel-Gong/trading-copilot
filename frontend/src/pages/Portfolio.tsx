@@ -46,6 +46,14 @@ import {
 import { StatementImportDialog } from './portfolio/StatementImportDialog'
 import { TradeCostDialog } from './portfolio/TradeCostDialog'
 import { PositionMonitorDialog } from './portfolio/PositionMonitorDialog'
+import {
+  buildTradeInsertionTargets,
+  type TradeInsertionTarget,
+} from './portfolio/tradeInsertion'
+import {
+  mergeTradeEstimateIfCurrent,
+  type TradeEstimateContext,
+} from './portfolio/tradeEstimate'
 import { cn } from '@/lib/cn'
 import { QK } from '@/lib/queryKeys'
 import { startAnalysis } from '@/lib/stockAnalysisStore'
@@ -96,6 +104,7 @@ type TradeDraft = {
   fee: string
   tax: string
   note: string
+  insertBeforeTradeId?: string
 }
 
 type TradeGroupStats = {
@@ -187,7 +196,7 @@ export function Portfolio() {
     return [...symbols].filter(symbol => !monitorBySymbol[symbol]?.stop_loss_enabled).length
   }, [monitorBySymbol, rows])
 
-  // trades 已由后端按 (trade_date, created_at, id) 倒序返回，分组时保持数组顺序即为组内最新在前
+  // trades 已由后端按 (trade_date, seq) 倒序返回，分组时保持数组顺序即为组内最新在前
   const tradesByDate = useMemo<DateTradeGroup[]>(() => {
     const byDate = new Map<string, DateTradeGroup>()
     for (const trade of visibleTrades) {
@@ -278,9 +287,16 @@ export function Portfolio() {
     toast('账户已删除', 'success')
   }
 
-  function openCreateTrade(side: 'buy' | 'sell' = 'buy', position?: PortfolioPosition) {
+  function openCreateTrade(
+    side: 'buy' | 'sell' = 'buy',
+    position?: PortfolioPosition,
+    insertionTarget?: TradeInsertionTarget,
+  ) {
     setTradeDetailReturnPosition(null)
-    const tradeDate = asOf || tradingDatesQuery.data?.latest_date || localDateIso()
+    const tradeDate = insertionTarget?.tradeDate
+      || asOf
+      || tradingDatesQuery.data?.latest_date
+      || localDateIso()
     setDraft({
       accountId: position?.account_id ?? selectedAccountId ?? accounts[0]?.id ?? '',
       symbol: position?.symbol ?? '',
@@ -291,11 +307,15 @@ export function Portfolio() {
       fee: '',
       tax: '',
       note: '',
+      insertBeforeTradeId: insertionTarget?.insertBeforeTradeId,
     })
   }
 
-  function openCreateTradeFromDetail(side: 'buy' | 'sell', position: PortfolioPosition) {
-    openCreateTrade(side, position)
+  function openCreateTradeFromDetail(
+    position: PortfolioPosition,
+    insertionTarget: TradeInsertionTarget,
+  ) {
+    openCreateTrade('buy', position, insertionTarget)
     setTradeDetailReturnPosition(position)
     setTradeDetailPosition(null)
   }
@@ -335,6 +355,9 @@ export function Portfolio() {
         ...(fee === undefined ? {} : { fee }),
         ...(tax === undefined ? {} : { tax }),
         note: draft.note.trim(),
+        ...(draft.insertBeforeTradeId
+          ? { insert_before_trade_id: draft.insertBeforeTradeId }
+          : {}),
       })
       const returnPosition = tradeDetailReturnPosition
       await invalidatePortfolio()
@@ -675,8 +698,9 @@ export function Portfolio() {
           loadError={tradesQuery.isError}
           reorderBusy={reorderBusy}
           tradeEditBusy={tradeEditBusy}
+          defaultTradeDate={asOf || tradingDatesQuery.data?.latest_date || localDateIso()}
           onClose={() => setTradeDetailPosition(null)}
-          onCreateTrade={side => openCreateTradeFromDetail(side, tradeDetailPosition)}
+          onCreateTrade={target => openCreateTradeFromDetail(tradeDetailPosition, target)}
           onDelete={deleteTrade}
           onReorderDay={reorderDayTrades}
           onRetry={() => tradesQuery.refetch()}
@@ -814,7 +838,7 @@ function TradeExecutionCell({
   )
 }
 
-function SortableTradeRow({ id, busy, children }: { id: string; busy: boolean; children: ReactNode }) {
+function SortableTradeRow({ id, busy, children, insertionTarget, onInsertTrade, insertionDisabled }: { id: string; busy: boolean; children: ReactNode; insertionTarget?: TradeInsertionTarget; onInsertTrade?: (target: TradeInsertionTarget) => void; insertionDisabled?: boolean }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id })
   return (
     <tr
@@ -822,7 +846,7 @@ function SortableTradeRow({ id, busy, children }: { id: string; busy: boolean; c
       style={{ transform: CSS.Transform.toString(transform), transition }}
       className={cn('hover:bg-elevated/20', isDragging && 'bg-elevated/30 opacity-50')}
     >
-      <td className="w-7 pl-2 pr-0">
+      <td className="relative w-7 pl-2 pr-0">
         <button
           {...attributes}
           {...listeners}
@@ -832,6 +856,9 @@ function SortableTradeRow({ id, busy, children }: { id: string; busy: boolean; c
         >
           <GripVertical className="h-3.5 w-3.5" />
         </button>
+        {insertionTarget && onInsertTrade && (
+          <TradeInsertionButton target={insertionTarget} onInsert={onInsertTrade} disabled={Boolean(insertionDisabled)} />
+        )}
       </td>
       {children}
     </tr>
@@ -887,6 +914,7 @@ function PositionTradesDialog({
   loadError,
   reorderBusy,
   tradeEditBusy,
+  defaultTradeDate,
   onClose,
   onCreateTrade,
   onDelete,
@@ -901,8 +929,9 @@ function PositionTradesDialog({
   loadError: boolean
   reorderBusy: boolean
   tradeEditBusy: boolean
+  defaultTradeDate: string
   onClose: () => void
-  onCreateTrade: (side: 'buy' | 'sell') => void
+  onCreateTrade: (target: TradeInsertionTarget) => void
   onDelete: (trade: PortfolioTrade) => void
   onReorderDay: (dayTradesInDisplayOrder: PortfolioTrade[]) => void
   onRetry: () => void
@@ -915,7 +944,11 @@ function PositionTradesDialog({
       if (group) group.push(trade)
       else byDate.set(trade.trade_date, [trade])
     }
-    return [...byDate.entries()].map(([date, dayItems]) => ({ date, items: dayItems }))
+    return [...byDate.entries()].map(([date, dayItems]) => ({
+      date,
+      items: dayItems,
+      insertionTargets: buildTradeInsertionTargets(dayItems, date),
+    }))
   }, [items])
   const accountNameById = useMemo(
     () => ({ [position.account_id]: accountName }),
@@ -943,22 +976,6 @@ function PositionTradesDialog({
             <span>{items.length} 笔</span>
           </div>
         </div>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            onClick={() => onCreateTrade('buy')}
-            className="flex h-8 items-center justify-center gap-1.5 rounded-btn border border-bull/20 bg-bull/5 px-3 text-xs font-medium text-bull hover:bg-bull/10"
-          >
-            <ArrowDownLeft className="h-3.5 w-3.5" />买入
-          </button>
-          <button
-            type="button"
-            onClick={() => onCreateTrade('sell')}
-            className="flex h-8 items-center justify-center gap-1.5 rounded-btn border border-bear/20 bg-bear/5 px-3 text-xs font-medium text-bear hover:bg-bear/10"
-          >
-            <ArrowUpRight className="h-3.5 w-3.5" />卖出
-          </button>
-        </div>
         <button onClick={onClose} className="rounded-btn p-1.5 text-muted hover:bg-elevated hover:text-foreground" title="关闭">
           <X className="h-4 w-4" />
         </button>
@@ -966,7 +983,7 @@ function PositionTradesDialog({
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
         <p className="mb-3 text-[11px] leading-5 text-muted">
-          修改数量、成交价或删除后会重新计算全部历史持仓；同一交易日有多笔交易时，可拖动行首手柄调整成交先后。
+          将鼠标移到明细行左侧的分隔线可插入漏记交易；日期会按相邻记录预填。修改或删除后会重新计算全部历史持仓。
         </p>
         {loading ? (
           <div className="grid min-h-40 place-items-center">
@@ -984,8 +1001,17 @@ function PositionTradesDialog({
             </button>
           </div>
         ) : groups.length === 0 ? (
-          <div className="grid min-h-40 place-items-center rounded-card border border-dashed border-border text-xs text-muted">
-            暂无交易明细
+          <div className="grid min-h-40 place-items-center rounded-card border border-dashed border-border text-center text-xs text-muted">
+            <div>
+              <div>暂无交易明细</div>
+              <button
+                type="button"
+                onClick={() => onCreateTrade(buildTradeInsertionTargets([], defaultTradeDate)[0])}
+                className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-btn border border-accent/25 bg-accent/5 px-3 text-xs text-accent hover:bg-accent/10"
+              >
+                <Plus className="h-3.5 w-3.5" />添加第一条明细
+              </button>
+            </div>
           </div>
         ) : (
           <div className="space-y-3">
@@ -1006,6 +1032,8 @@ function PositionTradesDialog({
                   reorderBusy={reorderBusy}
                   onUpdateExecution={onUpdateExecution}
                   tradeEditBusy={tradeEditBusy}
+                  insertionTargets={group.insertionTargets}
+                  onInsertTrade={onCreateTrade}
                 />
               </section>
             ))}
@@ -1016,7 +1044,7 @@ function PositionTradesDialog({
   )
 }
 
-function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDay, reorderBusy, onEditCost, onUpdateExecution, tradeEditBusy }: { items: PortfolioTrade[]; mode: 'byDate' | 'byStock'; accountNameById: Record<string, string>; onDelete: (trade: PortfolioTrade) => void; onReorderDay?: (dayTradesInDisplayOrder: PortfolioTrade[]) => void; reorderBusy?: boolean; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean }) {
+function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDay, reorderBusy, onEditCost, onUpdateExecution, tradeEditBusy, insertionTargets, onInsertTrade }: { items: PortfolioTrade[]; mode: 'byDate' | 'byStock'; accountNameById: Record<string, string>; onDelete: (trade: PortfolioTrade) => void; onReorderDay?: (dayTradesInDisplayOrder: PortfolioTrade[]) => void; reorderBusy?: boolean; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean; insertionTargets?: TradeInsertionTarget[]; onInsertTrade?: (target: TradeInsertionTarget) => void }) {
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -1044,7 +1072,7 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
   )
 
   const table = (
-    <div className="overflow-x-auto">
+    <div className={cn('overflow-x-auto', insertionTargets && onInsertTrade && 'pb-2')}>
       <table className="w-full min-w-[720px] text-left text-xs">
         <thead className="bg-elevated/50 text-muted">
           <tr>
@@ -1065,14 +1093,25 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
           </tr>
         </thead>
         <tbody className="divide-y divide-border/70">
-          {sortable ? items.map(trade => (
-            <SortableTradeRow key={trade.id} id={trade.id} busy={Boolean(reorderBusy)}>
+          {sortable ? items.map((trade, index) => (
+            <SortableTradeRow
+              key={trade.id}
+              id={trade.id}
+              busy={Boolean(reorderBusy)}
+              insertionTarget={insertionTargets?.[index]}
+              onInsertTrade={onInsertTrade}
+              insertionDisabled={Boolean(reorderBusy || tradeEditBusy)}
+            >
               {renderFirstCells(trade)}
               <TradeRowCells trade={trade} onDelete={onDelete} onEditCost={onEditCost} onUpdateExecution={onUpdateExecution} tradeEditBusy={tradeEditBusy} />
             </SortableTradeRow>
-          )) : items.map(trade => (
+          )) : items.map((trade, index) => (
             <tr key={trade.id} className="hover:bg-elevated/20">
-              <td className="w-7 pl-2 pr-0" />
+              <td className="relative w-7 pl-2 pr-0">
+                {insertionTargets?.[index] && onInsertTrade && (
+                  <TradeInsertionButton target={insertionTargets[index]} onInsert={onInsertTrade} disabled={Boolean(reorderBusy || tradeEditBusy)} />
+                )}
+              </td>
               {renderFirstCells(trade)}
               <TradeRowCells trade={trade} onDelete={onDelete} onEditCost={onEditCost} onUpdateExecution={onUpdateExecution} tradeEditBusy={tradeEditBusy} />
             </tr>
@@ -1092,6 +1131,23 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
   )
 }
 
+function TradeInsertionButton({ target, onInsert, disabled }: { target: TradeInsertionTarget; onInsert: (target: TradeInsertionTarget) => void; disabled: boolean }) {
+  return (
+    <span className="group/insert absolute -bottom-2 left-0 z-20 h-4 w-7">
+      <button
+        type="button"
+        onClick={() => onInsert(target)}
+        disabled={disabled}
+        aria-label={`在 ${target.tradeDate} 的此处插入一条交易明细`}
+        title="在此处插入一条明细"
+        className="absolute left-1/2 top-1/2 grid h-5 w-5 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border border-accent/35 bg-surface text-accent opacity-0 shadow-sm transition-opacity group-hover/insert:opacity-100 group-focus-within/insert:opacity-100 hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-0"
+      >
+        <Plus className="h-3 w-3" />
+      </button>
+    </span>
+  )
+}
+
 function EmptyState({ title, detail }: { title: string; detail: string }) {
   return <div className="grid min-h-56 place-items-center px-4 text-center"><div><BriefcaseBusiness className="mx-auto h-7 w-7 text-muted/60" /><div className="mt-3 text-sm font-medium">{title}</div><p className="mt-1 max-w-md text-xs leading-relaxed text-muted">{detail}</p></div></div>
 }
@@ -1099,6 +1155,8 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
 function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate, latestTradingDate, onChange, onClose, onSave }: { accounts: PortfolioAccount[]; draft: TradeDraft; busy: boolean; tradingDates: readonly string[]; earliestTradingDate?: string | null; latestTradingDate?: string | null; onChange: (draft: TradeDraft) => void; onClose: () => void; onSave: () => void }) {
   const [estimateBusy, setEstimateBusy] = useState(false)
   const mountedRef = useRef(true)
+  const latestDraftRef = useRef(draft)
+  latestDraftRef.current = draft
   const initialFocusRef = useRef<HTMLSelectElement>(null)
   const quantity = Number(draft.quantity)
   const price = Number(draft.price)
@@ -1112,18 +1170,34 @@ function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate,
     return () => { mountedRef.current = false }
   }, [])
 
+  function updateDraftContext(next: Partial<Pick<TradeDraft, 'accountId' | 'symbol' | 'tradeDate'>>) {
+    const contextChanged = (
+      (next.accountId !== undefined && next.accountId !== draft.accountId)
+      || (next.symbol !== undefined && next.symbol !== draft.symbol)
+      || (next.tradeDate !== undefined && next.tradeDate !== draft.tradeDate)
+    )
+    onChange({
+      ...draft,
+      ...next,
+      ...(contextChanged ? { insertBeforeTradeId: undefined } : {}),
+    })
+  }
+
   async function estimate() {
     if (!canEstimate || busy || estimateBusy) return
     setEstimateBusy(true)
     try {
-      const result = await api.portfolioTradeEstimate({
+      const requested: TradeEstimateContext = {
         symbol: draft.symbol.trim().toUpperCase(),
         side: draft.side,
         quantity,
         price,
-      })
+      }
+      const result = await api.portfolioTradeEstimate(requested)
       if (!mountedRef.current) return
-      onChange({ ...draft, fee: result.fee.toFixed(2), tax: result.tax.toFixed(2) })
+      const current = latestDraftRef.current
+      const next = mergeTradeEstimateIfCurrent(current, requested, result)
+      if (next !== current) onChange(next)
     } catch {
       // request 内已弹错误 toast
     } finally {
@@ -1143,14 +1217,14 @@ function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate,
         <div className="flex items-center justify-between border-b border-border px-4 py-3"><div><h2 id="trade-dialog-title" className="text-sm font-medium">记录交易</h2><p className="mt-0.5 text-[11px] text-muted">持仓将由全部买卖交易按日期和 FIFO 成本法自动汇总</p></div><button onClick={closeIfIdle} disabled={busy} className="rounded-btn p-1 text-muted hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" title={busy ? '保存中，暂不可关闭' : '关闭'}><X className="h-4 w-4" /></button></div>
         <div className="space-y-3 p-4">
           <div className="grid grid-cols-2 gap-3">
-            <Field label="账户" htmlFor="trade-account"><select ref={initialFocusRef} id="trade-account" value={draft.accountId} onChange={event => onChange({ ...draft, accountId: event.target.value })} className={INPUT_CLASS}>{accounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}</select></Field>
+            <Field label="账户" htmlFor="trade-account"><select ref={initialFocusRef} id="trade-account" value={draft.accountId} onChange={event => updateDraftContext({ accountId: event.target.value })} className={INPUT_CLASS}>{accounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}</select></Field>
             <Field label="方向" htmlFor="trade-side"><select id="trade-side" value={draft.side} onChange={event => onChange({ ...draft, side: event.target.value as 'buy' | 'sell' })} className={INPUT_CLASS}><option value="buy">买入</option><option value="sell">卖出</option></select></Field>
           </div>
           <Field label="证券代码" hint="支持输入代码或名称联想" htmlFor="trade-symbol">
-            <InstrumentSearchInput inputId="trade-symbol" value={draft.symbol} onValueChange={value => onChange({ ...draft, symbol: value.toUpperCase() })} onSelect={result => onChange({ ...draft, symbol: result.symbol })} assetTypes="stock,etf" placeholder="输入代码或名称，如 600519 / 茅台" inputClassName={`${INPUT_CLASS} font-mono`} menuClassName="left-0 right-0" emptyText="未找到匹配的股票或 ETF" />
+            <InstrumentSearchInput inputId="trade-symbol" value={draft.symbol} onValueChange={value => updateDraftContext({ symbol: value.toUpperCase() })} onSelect={result => updateDraftContext({ symbol: result.symbol })} assetTypes="stock,etf" placeholder="输入代码或名称，如 600519 / 茅台" inputClassName={`${INPUT_CLASS} font-mono`} menuClassName="left-0 right-0" emptyText="未找到匹配的股票或 ETF" />
           </Field>
-          <Field label="交易日" hint="仅可选择本地已有行情的交易日" htmlFor="trade-date">
-            <DatePicker buttonId="trade-date" value={draft.tradeDate} onChange={tradeDate => onChange({ ...draft, tradeDate })} min={earliestTradingDate ?? undefined} max={latestTradingDate ?? localDateIso()} availableDates={tradingDates.length > 0 ? tradingDates : undefined} align="left" className="w-full" buttonClassName="h-9 w-full justify-start rounded-btn px-2.5 font-mono" />
+          <Field label="交易日" hint={draft.insertBeforeTradeId ? '已按所选位置预填；改日后追加到当日' : '仅可选择本地已有行情的交易日'} htmlFor="trade-date">
+            <DatePicker buttonId="trade-date" value={draft.tradeDate} onChange={tradeDate => updateDraftContext({ tradeDate })} min={earliestTradingDate ?? undefined} max={latestTradingDate ?? localDateIso()} availableDates={tradingDates.length > 0 ? tradingDates : undefined} align="left" className="w-full" buttonClassName="h-9 w-full justify-start rounded-btn px-2.5 font-mono" />
           </Field>
           <div className="grid grid-cols-2 gap-3"><Field label="成交数量" htmlFor="trade-quantity"><input id="trade-quantity" type="number" min="0" step="any" value={draft.quantity} onChange={event => onChange({ ...draft, quantity: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field><Field label="成交价格" htmlFor="trade-price"><input id="trade-price" type="number" min="0" step="any" value={draft.price} onChange={event => onChange({ ...draft, price: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field></div>
           <div className="flex items-center justify-between rounded-btn border border-border bg-elevated/40 px-3 py-2">

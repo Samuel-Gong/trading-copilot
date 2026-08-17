@@ -2082,6 +2082,7 @@ export const api = {
     fee?: number
     tax?: number
     note?: string
+    insert_before_trade_id?: string
   }) => request<PortfolioTrade>('/api/portfolio/trades', {
     method: 'POST',
     body: JSON.stringify(body),
