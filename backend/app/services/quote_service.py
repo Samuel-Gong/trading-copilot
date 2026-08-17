@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -39,10 +40,58 @@ from app.strategy.intraday_signals import IntradaySignalEvaluator
 logger = logging.getLogger(__name__)
 
 # Webhook(飞书等)投递专用线程池 —— 与行情轮询线程隔离。
-# send_feishu 内置重试(最坏 ~3×5s 超时 + 退避), 若在 _poll_loop 上同步投递,
+# 飞书发送内置重试(最坏 ~3×5s 超时 + 退避), 若在 _poll_loop 上同步投递,
 # webhook 慢/宕机会逐条累加, 拖垮整条实时行情+告警轮询。这里 fire-and-forget,
 # 失败由 webhook_adapter 记 WARNING(可见), 但绝不阻塞热路径。
 _WEBHOOK_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="feishu-webhook")
+
+
+def _format_alert_price(price: object) -> str:
+    """把告警价格格式化为飞书通知中的两位小数。"""
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return ""
+    return f"{value:.2f}" if math.isfinite(value) else ""
+
+
+def _build_feishu_alert_body(events: list[tuple[dict, str]]) -> str:
+    """按标的聚合同一轮飞书告警,并保持事件首次出现顺序。"""
+    groups: dict[tuple[str, str], dict] = {}
+    for event, price_unit in events:
+        symbol = str(event.get("symbol") or "").strip()
+        name = str(event.get("name") or "").strip()
+        key = (symbol, "" if symbol else name)
+        group = groups.setdefault(key, {
+            "symbol": symbol,
+            "name": name,
+            "price": "",
+            "price_unit": price_unit,
+            "signals": [],
+            "seen_signals": set(),
+        })
+        if name and not group["name"]:
+            group["name"] = name
+        if not group["price"]:
+            group["price"] = _format_alert_price(event.get("price"))
+
+        message = str(event.get("message") or "").strip()
+        if message and message not in group["seen_signals"]:
+            group["signals"].append(message)
+            group["seen_signals"].add(message)
+
+    blocks: list[str] = []
+    for group in groups.values():
+        symbol = group["symbol"]
+        name = group["name"]
+        heading = " ".join(part for part in (name if name != symbol else "", symbol) if part)
+        lines = [heading] if heading else []
+        if group["price"]:
+            lines.append(f"• 价格\uff1a{group['price']} {group['price_unit']}")
+        lines.extend(f"• 信号\uff1a{signal}" for signal in group["signals"])
+        if lines:
+            blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 class QuoteSubscriber:
@@ -1402,6 +1451,7 @@ class QuoteService:
 
         - 飞书 / 企业微信任一已配置即生效 (两个都没配才跳过)
         - 仅推送 webhook_channels 非空的规则触发的告警, 且只投递被勾选的渠道
+        - 飞书把同一轮事件按股票聚合成一张卡片; 企业微信维持逐条发送
         - 失败静默, 不阻断主流程
         - 去重: 复用 MonitorRuleEngine 的 cooldown, 此处不重复去重
 
@@ -1426,6 +1476,7 @@ class QuoteService:
             }
             rules = engine.rules if engine is not None else {}
             enqueued = 0
+            feishu_events: list[tuple[dict, str]] = []
             for ev in rule_events:
                 rule = rules.get(ev.get("rule_id"))
                 # webhook_channels 指定命中的渠道 (['feishu'] / ['wecom'] / ['feishu','wecom'] / []).
@@ -1445,13 +1496,26 @@ class QuoteService:
                 # 应用内 alerts.jsonl 记录与 SSE 已在前面完成, 不依赖 webhook 成败,
                 # 失败由 webhook_adapter 记 WARNING(可见)。
                 if feishu_url and "feishu" in channels:
-                    _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_feishu, feishu_url, title, body, feishu_secret)
-                    enqueued += 1
+                    price_unit = "点" if rule.get("asset_type", "stock") == "index" else "元"
+                    feishu_events.append((ev, price_unit))
                 if wecom_url and "wecom" in channels:
                     _WEBHOOK_EXECUTOR.submit(webhook_adapter.send_wecom, wecom_url, title, body)
                     enqueued += 1
+
+            if feishu_events:
+                body = _build_feishu_alert_body(feishu_events)
+                if body:
+                    _WEBHOOK_EXECUTOR.submit(
+                        webhook_adapter.send_feishu_card,
+                        feishu_url,
+                        "监控通知",
+                        "",
+                        body,
+                        feishu_secret,
+                    )
+                    enqueued += 1
             if enqueued:
-                logger.info("Webhook 已提交 %d 条 (异步投递, 按渠道独立投递, 失败记 WARNING)", enqueued)
+                logger.info("Webhook 已提交 %d 个异步投递任务 (失败记 WARNING)", enqueued)
         except Exception as e:  # noqa: BLE001
             logger.warning("Webhook 提交异常 (不影响告警主流程): %s", e)
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import time
 
@@ -25,8 +26,9 @@ logger = logging.getLogger(__name__)
 # 单次推送最长字符 (飞书单条文本消息上限 30KB, 这里保守截断避免刷屏)
 _MAX_LEN = 500
 
-# 卡片消息正文最长字符 (飞书 interactive 卡片上限 30KB, 保守留余量给标题/结构)
-_CARD_MAX_LEN = 28000
+# 飞书 interactive 卡片完整 JSON payload 上限。按 UTF-8 字节数计算,
+# 标题、正文、JSON 转义和可选签名字段都必须包含在内。
+_FEISHU_CARD_MAX_BYTES = 30000
 
 # 企业微信群推送 Webhook markdown 消息上限 4096 字节 (非字符; 中文每字 3 字节),
 # 留余量给标题、格式符及截断提示行。
@@ -64,10 +66,39 @@ def _gen_sign(timestamp: str, secret: str) -> str:
     return base64.b64encode(hmac_code).decode("utf-8")
 
 
-def _truncate_card(text: str) -> str:
-    """截断卡片正文 (留余量给标题与卡片结构)。"""
-    text = (text or "").strip()
-    return text[:_CARD_MAX_LEN] + ("…" if len(text) > _CARD_MAX_LEN else "")
+def _payload_utf8_size(payload: dict) -> int:
+    """按 httpx JSON 编码口径计算 payload 的 UTF-8 字节数。"""
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return len(encoded)
+
+
+def _fit_feishu_card_payload(payload: dict, body_element: dict, body: str) -> bool:
+    """二分截断卡片正文,确保完整 payload 不超过飞书字节上限。"""
+    if _payload_utf8_size(payload) <= _FEISHU_CARD_MAX_BYTES:
+        return True
+
+    suffix = "…"
+    low, high = 0, len(body)
+    while low < high:
+        middle = (low + high + 1) // 2
+        body_element["text"]["content"] = body[:middle] + suffix
+        if _payload_utf8_size(payload) <= _FEISHU_CARD_MAX_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+
+    body_element["text"]["content"] = body[:low] + suffix
+    if _payload_utf8_size(payload) <= _FEISHU_CARD_MAX_BYTES:
+        return True
+
+    # 标题或副标题本身异常超长时,即使清空正文也可能无法满足限制。
+    body_element["text"]["content"] = ""
+    return _payload_utf8_size(payload) <= _FEISHU_CARD_MAX_BYTES
 
 
 def _truncate_to_bytes(text: str, max_bytes: int, suffix: str = "…") -> str:
@@ -187,7 +218,7 @@ def send_feishu_card(webhook_url: str, title: str, subtitle: str, body_md: str, 
     if not is_valid_feishu_url(webhook_url):
         return False
 
-    body = _truncate_card(body_md)
+    body = (body_md or "").strip()
     elements: list[dict] = []
     if subtitle.strip():
         elements.append({
@@ -195,10 +226,11 @@ def send_feishu_card(webhook_url: str, title: str, subtitle: str, body_md: str, 
             "text": {"tag": "lark_md", "content": f"**{subtitle.strip()}**"},
         })
         elements.append({"tag": "hr"})
-    elements.append({
+    body_element = {
         "tag": "div",
         "text": {"tag": "lark_md", "content": body},
-    })
+    }
+    elements.append(body_element)
 
     payload: dict = {
         "msg_type": "interactive",
@@ -211,6 +243,14 @@ def send_feishu_card(webhook_url: str, title: str, subtitle: str, body_md: str, 
             "elements": elements,
         },
     }
+    if secret:
+        # 把签名字段计入完整 payload 大小; _post_feishu 会在每次重试前重新计算。
+        timestamp = str(int(time.time()))
+        payload["timestamp"] = timestamp
+        payload["sign"] = _gen_sign(timestamp, secret)
+    if not _fit_feishu_card_payload(payload, body_element, body):
+        logger.warning("飞书卡片 payload 超过 %d 字节且无法安全截断", _FEISHU_CARD_MAX_BYTES)
+        return False
     return _post_feishu(webhook_url, payload, secret)
 
 
@@ -339,4 +379,3 @@ def send_wecom_markdown(webhook_url: str, title: str, body_md: str) -> bool:
 
     payload: dict = {"msgtype": "markdown", "markdown": {"content": content}}
     return _post_wecom(webhook_url, payload)
-

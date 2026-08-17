@@ -4,11 +4,13 @@
 """
 from __future__ import annotations
 
+import json
+
 import polars as pl
 import pytest
 
 from app.jobs import daily_pipeline
-from app.services import pipeline_jobs, quote_service
+from app.services import pipeline_jobs, quote_service, webhook_adapter
 from app.services.pipeline_jobs import JobStore
 from app.services.quote_service import QuoteService
 from app.strategy import monitor_rules
@@ -127,8 +129,140 @@ def test_ladder_webhook_uses_chinese_title_without_brand(monkeypatch):
         engine,
     )
 
-    assert [args[1] for _, args in calls] == ["连板梯队", "连板梯队"]
+    titles = {fn: args[1] for fn, args in calls}
+    assert titles[webhook_adapter.send_feishu_card] == "监控通知"
+    assert titles[webhook_adapter.send_wecom] == "连板梯队"
     assert all("TickFlow" not in args[1] for _, args in calls)
+
+
+def test_feishu_webhook_aggregates_alerts_by_symbol(monkeypatch):
+    calls = []
+
+    class CaptureExecutor:
+        def submit(self, fn, *args):
+            calls.append((fn, args))
+
+    monkeypatch.setattr(quote_service, "_WEBHOOK_EXECUTOR", CaptureExecutor())
+    monkeypatch.setattr(
+        "app.services.preferences.get_feishu_webhook_url",
+        lambda: "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+    )
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda: "secret")
+    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda: "")
+
+    engine = type("Engine", (), {
+        "rules": {
+            "macd": {"webhook_channels": ["feishu"]},
+            "ma5": {"webhook_channels": ["feishu"]},
+            "ma5_duplicate": {"webhook_channels": ["feishu"]},
+            "other": {"webhook_channels": ["feishu"]},
+            "wecom_only": {"webhook_channels": ["wecom"]},
+        },
+    })()
+    QuoteService._maybe_send_webhook(
+        object.__new__(QuoteService),
+        [
+            {
+                "rule_id": "macd", "source": "signal", "symbol": "600000.SH",
+                "name": "浦发银行", "price": 10.5, "message": "MACD 金叉",
+            },
+            {
+                "rule_id": "ma5", "source": "signal", "symbol": "600000.SH",
+                "name": "浦发银行", "price": 10.5, "message": "当前价>MA5",
+            },
+            {
+                "rule_id": "ma5_duplicate", "source": "signal", "symbol": "600000.SH",
+                "name": "浦发银行", "price": 10.5, "message": "当前价>MA5",
+            },
+            {
+                "rule_id": "other", "source": "signal", "symbol": "600519.SH",
+                "name": "贵州茅台", "price": 1600, "message": "突破 MA20",
+            },
+            {
+                "rule_id": "wecom_only", "source": "signal", "symbol": "000001.SZ",
+                "name": "平安银行", "price": 12.3, "message": "仅企业微信",
+            },
+        ],
+        engine,
+    )
+
+    feishu_calls = [args for fn, args in calls if fn is webhook_adapter.send_feishu_card]
+    assert len(feishu_calls) == 1
+    assert feishu_calls[0] == (
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        "监控通知",
+        "",
+        "浦发银行 600000.SH\n"
+        "• 价格\uff1a10.50 元\n"
+        "• 信号\uff1aMACD 金叉\n"
+        "• 信号\uff1a当前价>MA5\n\n"
+        "贵州茅台 600519.SH\n"
+        "• 价格\uff1a1600.00 元\n"
+        "• 信号\uff1a突破 MA20",
+        "secret",
+    )
+
+
+def test_feishu_webhook_formats_index_price_as_points(monkeypatch):
+    calls = []
+
+    class CaptureExecutor:
+        def submit(self, fn, *args):
+            calls.append((fn, args))
+
+    monkeypatch.setattr(quote_service, "_WEBHOOK_EXECUTOR", CaptureExecutor())
+    monkeypatch.setattr(
+        "app.services.preferences.get_feishu_webhook_url",
+        lambda: "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+    )
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda: "")
+    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda: "")
+
+    engine = type("Engine", (), {
+        "rules": {"index": {"asset_type": "index", "webhook_channels": ["feishu"]}},
+    })()
+    QuoteService._maybe_send_webhook(
+        object.__new__(QuoteService),
+        [{
+            "rule_id": "index", "source": "signal", "symbol": "000001.SH",
+            "name": "上证指数", "price": 3421.25, "message": "突破前高",
+        }],
+        engine,
+    )
+
+    feishu_calls = [args for fn, args in calls if fn is webhook_adapter.send_feishu_card]
+    assert feishu_calls[0][3] == (
+        "上证指数 000001.SH\n"
+        "• 价格\uff1a3421.25 点\n"
+        "• 信号\uff1a突破前高"
+    )
+
+
+def test_feishu_card_limits_complete_payload_by_utf8_bytes(monkeypatch):
+    captured = {}
+
+    def capture_post(webhook_url, payload, secret):
+        captured.update(url=webhook_url, payload=payload, secret=secret)
+        return True
+
+    monkeypatch.setattr(webhook_adapter, "_post_feishu", capture_post)
+
+    assert webhook_adapter.send_feishu_card(
+        "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        "监控通知",
+        "",
+        "监控信号\n" * 10_000,
+        "secret",
+    ) is True
+
+    encoded = json.dumps(
+        captured["payload"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    assert len(encoded) <= 30_000
+    assert captured["payload"]["card"]["elements"][-1]["text"]["content"].endswith("…")
 
 
 def test_review_webhooks_use_title_without_brand(monkeypatch):
