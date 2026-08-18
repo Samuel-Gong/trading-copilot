@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "upstream_repository": "shy3130/tickflow-stock-panel",
+  "tag_pattern": "^v?(\\d+)\\.(\\d+)\\.(\\d+)$",
+  "baseline_commit": "99bdec875d4bbf5c30ddc43534b81ada0f3b0f6b",
+  "merge_base_commit": "99bdec875d4bbf5c30ddc43534b81ada0f3b0f6b",
+  "last_synced_release": {
+    "tag": "v0.1.88",
+    "commit": "8ead30037a8806518e400dc26b67a7e5a1294282"
+  }
+}
