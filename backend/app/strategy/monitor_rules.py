@@ -16,7 +16,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +29,7 @@ from app.strategy.custom_signals import ALLOWED_FIELDS
 from app.strategy.intraday_signals import uses_intraday_signals, uses_price_cross_signals
 
 logger = logging.getLogger(__name__)
+_LOCK = threading.RLock()
 
 # ── 常量 ────────────────────────────────────────────────
 ID_RE = re.compile(r"^[a-z0-9_]{1,40}$")
@@ -57,41 +63,127 @@ def _path(data_dir: Path, rule_id: str) -> Path:
     return _dir(data_dir) / f"{rule_id}.json"
 
 
+@contextmanager
+def locked() -> Iterator[None]:
+    """串行化规则持久化读改写及引擎同步。"""
+    with _LOCK:
+        yield
+
+
 def load_all(data_dir: Path) -> list[dict]:
     """读取全部监控规则。损坏的文件被跳过。"""
-    d = _dir(data_dir)
-    out: list[dict] = []
-    for f in sorted(d.glob("*.json")):
-        try:
-            out.append(normalize(json.loads(f.read_text(encoding="utf-8"))))
-        except Exception as e:
-            logger.warning("monitor rule load failed %s: %s", f.name, e)
-    return out
+    with _LOCK:
+        d = _dir(data_dir)
+        out: list[dict] = []
+        for f in sorted(d.glob("*.json")):
+            try:
+                out.append(normalize(json.loads(f.read_text(encoding="utf-8"))))
+            except Exception as e:
+                logger.warning("monitor rule load failed %s: %s", f.name, e)
+        return out
 
 
 def load_one(data_dir: Path, rule_id: str) -> dict | None:
-    p = _path(data_dir, rule_id)
-    if not p.exists():
-        return None
-    try:
-        return normalize(json.loads(p.read_text(encoding="utf-8")))
-    except Exception as e:
-        logger.warning("monitor rule load failed %s: %s", rule_id, e)
-        return None
+    with _LOCK:
+        p = _path(data_dir, rule_id)
+        if not p.exists():
+            return None
+        try:
+            return normalize(json.loads(p.read_text(encoding="utf-8")))
+        except Exception as e:
+            logger.warning("monitor rule load failed %s: %s", rule_id, e)
+            return None
 
 
 def save_one(data_dir: Path, rule: dict) -> None:
-    p = _path(data_dir, rule["id"])
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(rule, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _LOCK:
+        p = _path(data_dir, rule["id"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                fchmod(fd, 0o600)
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = -1
+            with stream:
+                json.dump(rule, stream, ensure_ascii=False, indent=2)
+            os.replace(temporary, p)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            temporary.unlink(missing_ok=True)
 
 
 def delete_one(data_dir: Path, rule_id: str) -> bool:
-    p = _path(data_dir, rule_id)
-    if p.exists():
-        p.unlink()
-        return True
-    return False
+    with _LOCK:
+        p = _path(data_dir, rule_id)
+        if p.exists():
+            p.unlink()
+            return True
+        return False
+
+
+def delete_for_symbols(data_dir: Path, symbols: set[str]) -> list[str]:
+    """从规则移除指定标的,无剩余目标时删除规则,返回变更的规则 ID。"""
+    targets = {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+    if not targets:
+        return []
+    with _LOCK:
+        changed: list[str] = []
+        for path in sorted(_dir(data_dir).glob("*.json")):
+            try:
+                rule = normalize(json.loads(path.read_text(encoding="utf-8")))
+            except Exception as exc:
+                logger.warning("monitor rule load failed %s: %s", path.name, exc)
+                continue
+            if rule.get("scope") != "symbols":
+                continue
+            symbols_value = rule.get("symbols")
+            if not isinstance(symbols_value, list):
+                logger.warning(
+                    "monitor rule delete skipped invalid symbols: %s", path.name
+                )
+                continue
+            rule_symbols = {
+                str(symbol).strip().upper()
+                for symbol in symbols_value
+                if str(symbol).strip()
+            }
+            if not rule_symbols.intersection(targets):
+                continue
+            rule_id = str(rule.get("id") or "")
+            if not ID_RE.fullmatch(rule_id) or path.name != f"{rule_id}.json":
+                logger.warning("monitor rule delete skipped mismatched id: %s", path.name)
+                continue
+            remaining_symbols = [
+                symbol
+                for symbol in symbols_value
+                if str(symbol).strip().upper() not in targets
+            ]
+            try:
+                if not remaining_symbols:
+                    path.unlink()
+                else:
+                    rule["symbols"] = remaining_symbols
+                    levels = rule.get("intraday_price_levels")
+                    if isinstance(levels, dict):
+                        rule["intraday_price_levels"] = {
+                            symbol: price
+                            for symbol, price in levels.items()
+                            if str(symbol).strip().upper() not in targets
+                        }
+                    save_one(data_dir, rule)
+            except OSError as exc:
+                logger.warning("monitor rule update failed %s: %s", path.name, exc)
+                continue
+            changed.append(rule_id)
+        return changed
 
 
 # ── 校验 ────────────────────────────────────────────────

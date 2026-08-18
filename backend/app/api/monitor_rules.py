@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from app.strategy import monitor_rules
 from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals
 
 router = APIRouter(prefix="/api/monitor-rules", tags=["monitor-rules"])
+logger = logging.getLogger(__name__)
 
 
 def _data_dir(request: Request) -> Path:
@@ -44,12 +46,22 @@ def sync_engine(request: Request) -> None:
     """保存/删除后,把最新规则集 reload 到引擎内存态。"""
     engine = getattr(request.app.state, "monitor_engine", None)
     if engine is not None:
-        repo = request.app.state.repo
-        rules = [
-            _reconcile_index_asset_type(r, repo)
-            for r in monitor_rules.load_all(_data_dir(request))
-        ]
-        engine.set_rules(rules)
+        with monitor_rules.locked():
+            repo = request.app.state.repo
+            rules = []
+            for saved in monitor_rules.load_all(_data_dir(request)):
+                rule = _reconcile_index_asset_type(saved, repo)
+                try:
+                    monitor_rules.validate(rule)
+                except Exception as exc:
+                    logger.warning(
+                        "monitor engine skipped invalid rule %r: %s",
+                        rule.get("id"),
+                        exc,
+                    )
+                    continue
+                rules.append(rule)
+            engine.set_rules(rules)
 
 
 # ── Pydantic 模型 ───────────────────────────────────────
@@ -227,36 +239,43 @@ def save_rule(req: RuleModel, request: Request):
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-    # 编辑现有规则时, 保留原 created_at (避免按时间排序时位置跳动)
-    existing = monitor_rules.load_one(_data_dir(request), rule["id"])
-    if existing and existing.get("created_at"):
-        rule["created_at"] = existing["created_at"]
-    try:
-        monitor_rules.validate(rule)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    if rule.get("enabled", True) and uses_intraday_signals(rule):
-        from app.services.kline_sync import intraday_monitor_support
+    with monitor_rules.locked():
+        # 编辑现有规则时, 保留原 created_at (避免按时间排序时位置跳动)
+        existing = monitor_rules.load_one(_data_dir(request), rule["id"])
+        if existing and existing.get("created_at"):
+            rule["created_at"] = existing["created_at"]
+        try:
+            monitor_rules.validate(rule)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if rule.get("enabled", True) and uses_intraday_signals(rule):
+            from app.services.kline_sync import intraday_monitor_support
 
-        support = intraday_monitor_support(getattr(request.app.state, "capabilities", None))
-        if not support["available"]:
-            raise HTTPException(status_code=403, detail=str(support["reason"]))
-        symbols = set(str(symbol) for symbol in rule.get("symbols", []) if symbol)
-        for saved in monitor_rules.load_all(_data_dir(request)):
-            if (
-                saved.get("id") != rule.get("id")
-                and saved.get("enabled", True)
-                and uses_intraday_signals(saved)
-            ):
-                symbols.update(str(symbol) for symbol in saved.get("symbols", []) if symbol)
-        max_symbols = int(support["max_symbols"])
-        if len(symbols) > max_symbols:
-            raise HTTPException(
-                status_code=400,
-                detail=f"当前分时数据能力最多监听 {max_symbols} 只标的,当前规则合计 {len(symbols)} 只",
+            support = intraday_monitor_support(
+                getattr(request.app.state, "capabilities", None)
             )
-    monitor_rules.save_one(_data_dir(request), rule)
-    sync_engine(request)
+            if not support["available"]:
+                raise HTTPException(status_code=403, detail=str(support["reason"]))
+            symbols = set(str(symbol) for symbol in rule.get("symbols", []) if symbol)
+            for saved in monitor_rules.load_all(_data_dir(request)):
+                if (
+                    saved.get("id") != rule.get("id")
+                    and saved.get("enabled", True)
+                    and uses_intraday_signals(saved)
+                ):
+                    symbols.update(
+                        str(symbol)
+                        for symbol in saved.get("symbols", [])
+                        if symbol
+                    )
+            max_symbols = int(support["max_symbols"])
+            if len(symbols) > max_symbols:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"当前分时数据能力最多监听 {max_symbols} 只标的,当前规则合计 {len(symbols)} 只",
+                )
+        monitor_rules.save_one(_data_dir(request), rule)
+        sync_engine(request)
     return {"ok": True, "rule": rule}
 
 
@@ -265,10 +284,11 @@ def save_rule(req: RuleModel, request: Request):
 def delete_rule(rule_id: str, request: Request):
     if not monitor_rules.ID_RE.match(rule_id):
         raise HTTPException(status_code=400, detail="规则 id 非法")
-    deleted = monitor_rules.delete_one(_data_dir(request), rule_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="规则不存在")
-    sync_engine(request)
+    with monitor_rules.locked():
+        deleted = monitor_rules.delete_one(_data_dir(request), rule_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="规则不存在")
+        sync_engine(request)
     return {"ok": True}
 
 
@@ -334,23 +354,52 @@ def seed_demo_rules(request: Request):
     ts = int(_time.time() * 1000)
     created = []
     i = 0
-    for (name, rtype, scope, symbols, conditions, logic, severity, sev) in _DEMO_RULES_TEMPLATE:
-        rule_id = f"demo_{ts}_{i}"
-        rule = _demo_rule(rule_id, name, rtype, scope, symbols, conditions, logic, 3600, sev)
-        monitor_rules.save_one(_data_dir(request), rule)
-        created.append(rule_id)
-        i += 1
-    # 策略类型规则
-    for sr in _DEMO_STRATEGY_RULES:
-        rule_id = f"demo_{ts}_{i}"
-        rule = _demo_rule(
-            rule_id, sr["name"], "strategy", "all", [], [], "and", 3600, "info",
-            strategy_id=sr["strategy_id"], direction=sr.get("direction", "entry"),
-        )
-        monitor_rules.save_one(_data_dir(request), rule)
-        created.append(rule_id)
-        i += 1
-    sync_engine(request)
+    with monitor_rules.locked():
+        for (
+            name,
+            rtype,
+            scope,
+            symbols,
+            conditions,
+            logic,
+            severity,
+            sev,
+        ) in _DEMO_RULES_TEMPLATE:
+            rule_id = f"demo_{ts}_{i}"
+            rule = _demo_rule(
+                rule_id,
+                name,
+                rtype,
+                scope,
+                symbols,
+                conditions,
+                logic,
+                3600,
+                sev,
+            )
+            monitor_rules.save_one(_data_dir(request), rule)
+            created.append(rule_id)
+            i += 1
+        # 策略类型规则
+        for sr in _DEMO_STRATEGY_RULES:
+            rule_id = f"demo_{ts}_{i}"
+            rule = _demo_rule(
+                rule_id,
+                sr["name"],
+                "strategy",
+                "all",
+                [],
+                [],
+                "and",
+                3600,
+                "info",
+                strategy_id=sr["strategy_id"],
+                direction=sr.get("direction", "entry"),
+            )
+            monitor_rules.save_one(_data_dir(request), rule)
+            created.append(rule_id)
+            i += 1
+        sync_engine(request)
     return {"ok": True, "generated": len(created), "ids": created}
 
 

@@ -87,21 +87,23 @@ def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
         warnings.append(f"策略池偏好清理失败: {e}")
 
     try:
-        rules_changed = False
-        for rule in monitor_rules.load_all(data_dir):
-            if (
-                rule.get("type") == "strategy"
-                and rule.get("strategy_id") == strategy_id
-                and rule.get("enabled", True)
-            ):
-                rule = dict(rule)
-                rule["enabled"] = False
-                monitor_rules.save_one(data_dir, rule)
-                rules_changed = True
+        from app.api.monitor_rules import sync_engine
 
-        monitor_engine = getattr(request.app.state, "monitor_engine", None)
-        if rules_changed and monitor_engine is not None:
-            monitor_engine.set_rules(monitor_rules.load_all(data_dir))
+        with monitor_rules.locked():
+            rules_changed = False
+            for rule in monitor_rules.load_all(data_dir):
+                if (
+                    rule.get("type") == "strategy"
+                    and rule.get("strategy_id") == strategy_id
+                    and rule.get("enabled", True)
+                ):
+                    rule = dict(rule)
+                    rule["enabled"] = False
+                    monitor_rules.save_one(data_dir, rule)
+                    rules_changed = True
+
+            if rules_changed:
+                sync_engine(request)
     except Exception as e:
         warnings.append(f"关联监控清理失败: {e}")
 

@@ -832,17 +832,18 @@ def update_realtime_monitor_config(req: RealtimeMonitorConfigIn, request: Reques
         strategy_engine = getattr(request.app.state, "strategy_engine", None)
         data_dir = request.app.state.repo.store.data_dir
         if monitor_engine is not None and strategy_engine is not None:
+            from app.api.monitor_rules import sync_engine
             from app.strategy import monitor_rules as mr_store
             try:
-                if preferences.get_strategy_monitor_enabled():
-                    ids = preferences.get_strategy_monitor_ids()
-                    names = {s.id: s.name for s in strategy_engine.list_strategies()}
-                    mr_store.migrate_strategy_monitors(data_dir, ids, names)
-                else:
-                    # 关闭策略监控: 停用所有策略规则
-                    mr_store.migrate_strategy_monitors(data_dir, [], {})
-                # reload 规则到引擎
-                monitor_engine.set_rules(mr_store.load_all(data_dir))
+                with mr_store.locked():
+                    if preferences.get_strategy_monitor_enabled():
+                        ids = preferences.get_strategy_monitor_ids()
+                        names = {s.id: s.name for s in strategy_engine.list_strategies()}
+                        mr_store.migrate_strategy_monitors(data_dir, ids, names)
+                    else:
+                        # 关闭策略监控: 停用所有策略规则
+                        mr_store.migrate_strategy_monitors(data_dir, [], {})
+                    sync_engine(request)
             except Exception:
                 pass
 

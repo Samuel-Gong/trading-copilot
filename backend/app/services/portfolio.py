@@ -10,6 +10,8 @@ import os
 import re
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -22,6 +24,13 @@ _SYMBOL_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$")
 _LOCK = threading.RLock()
 _TIMEZONE = ZoneInfo("Asia/Shanghai")
 _EPSILON = 1e-9
+
+
+@contextmanager
+def mutation_guard() -> Iterator[None]:
+    """串行化交易变更及其后续派生状态更新。"""
+    with _LOCK:
+        yield
 
 
 class PortfolioNotFoundError(LookupError):
@@ -525,6 +534,13 @@ def list_trades(
             and (date_to is None or str(item.get("trade_date")) <= date_to.isoformat())
         ]
     return sorted(items, key=_trade_sort_key, reverse=True)
+
+
+def held_symbols(as_of: date | None = None) -> set[str]:
+    """返回指定日期所有账户仍持有的标的。"""
+    with _LOCK:
+        positions, _ = _replay(_read()["trades"], as_of or today())
+    return {str(item["symbol"]) for item in positions}
 
 
 def delete_trade(trade_id: str) -> None:

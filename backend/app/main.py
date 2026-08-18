@@ -34,6 +34,7 @@ async def lifespan(app: FastAPI):
         "TickFlow Stock Panel v%s starting (mode=%s)",
         __version__, tf_client.current_mode(),
     )
+    portfolio.reset_monitor_engine_sync_retry(app)
 
     # 首次启动: 若配置了 AUTH_PASSWORD 环境变量且未设过密码, 用它初始化。
     # 公网部署免 SSH 端口转发; 已设过密码则不覆盖 (改密码走 UI)。
@@ -257,6 +258,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    portfolio.stop_monitor_engine_sync_retry(app)
     if app.state.scheduler:
         app.state.scheduler.shutdown(wait=False)
     ps = getattr(app.state, "pull_scheduler", None)

@@ -259,6 +259,14 @@ export function Portfolio() {
     ])
   }
 
+  async function invalidatePortfolioTradeChanges() {
+    await Promise.all([
+      invalidatePortfolio(),
+      queryClient.invalidateQueries({ queryKey: QK.monitorRules }),
+      queryClient.invalidateQueries({ queryKey: QK.portfolioPriceMonitors }),
+    ])
+  }
+
   async function createAccount() {
     const name = accountName.trim()
     if (!name) return
@@ -363,7 +371,7 @@ export function Portfolio() {
           : {}),
       })
       const returnPosition = tradeDetailReturnPosition
-      await invalidatePortfolio()
+      await invalidatePortfolioTradeChanges()
       setDraft(null)
       if (returnPosition) setTradeDetailPosition(returnPosition)
       setTradeDetailReturnPosition(null)
@@ -382,7 +390,7 @@ export function Portfolio() {
     setTradeBusy(true)
     try {
       await api.portfolioTradeCreate(payload)
-      await invalidatePortfolio()
+      await invalidatePortfolioTradeChanges()
       toast(inlineDraft.side === 'buy' ? '买入交易已记录' : '卖出交易已记录', 'success')
       return true
     } catch {
@@ -395,7 +403,7 @@ export function Portfolio() {
   async function deleteTrade(trade: PortfolioTrade) {
     if (!window.confirm(`删除 ${trade.trade_date} 的${trade.side === 'buy' ? '买入' : '卖出'}交易？持仓会重新计算。`)) return
     await api.portfolioTradeDelete(trade.id)
-    await invalidatePortfolio()
+    await invalidatePortfolioTradeChanges()
     toast('交易已删除，历史持仓已重算', 'success')
   }
 
@@ -424,7 +432,7 @@ export function Portfolio() {
     try {
       await api.portfolioTradeUpdateExecution(trade.id, { quantity, price })
       // 成交数量和价格都会影响 FIFO 批次、净买入与估值，整个快照都要失效
-      await invalidatePortfolio()
+      await invalidatePortfolioTradeChanges()
       toast('成交数量和价格已更新', 'success')
     } catch (error) {
       toast(error instanceof Error ? error.message : '修改交易失败', 'error')
@@ -705,7 +713,7 @@ export function Portfolio() {
           accounts={accounts}
           defaultAccountId={selectedAccountId ?? accounts[0]?.id ?? ''}
           onClose={() => setStatementOpen(false)}
-          onCommitted={invalidatePortfolio}
+          onCommitted={invalidatePortfolioTradeChanges}
         />
       )}
       {tradeDetailPosition && (
