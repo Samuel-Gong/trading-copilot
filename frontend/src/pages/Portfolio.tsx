@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   DndContext, closestCenter, KeyboardSensor, PointerSensor,
@@ -47,7 +47,10 @@ import { StatementImportDialog } from './portfolio/StatementImportDialog'
 import { TradeCostDialog } from './portfolio/TradeCostDialog'
 import { PositionMonitorDialog } from './portfolio/PositionMonitorDialog'
 import {
+  buildInlineTradeCreatePayload,
+  buildInlineTradeDraft,
   buildTradeInsertionTargets,
+  type InlineTradeDraft,
   type TradeInsertionTarget,
 } from './portfolio/tradeInsertion'
 import {
@@ -365,6 +368,25 @@ export function Portfolio() {
       if (returnPosition) setTradeDetailPosition(returnPosition)
       setTradeDetailReturnPosition(null)
       toast(draft.side === 'buy' ? '买入交易已记录' : '卖出交易已记录', 'success')
+    } finally {
+      setTradeBusy(false)
+    }
+  }
+
+  async function saveInlineTrade(inlineDraft: InlineTradeDraft) {
+    const payload = buildInlineTradeCreatePayload(inlineDraft)
+    if (!payload) {
+      toast('请填写正数量及有效的成交价', 'error')
+      return false
+    }
+    setTradeBusy(true)
+    try {
+      await api.portfolioTradeCreate(payload)
+      await invalidatePortfolio()
+      toast(inlineDraft.side === 'buy' ? '买入交易已记录' : '卖出交易已记录', 'success')
+      return true
+    } catch {
+      return false
     } finally {
       setTradeBusy(false)
     }
@@ -698,9 +720,11 @@ export function Portfolio() {
           loadError={tradesQuery.isError}
           reorderBusy={reorderBusy}
           tradeEditBusy={tradeEditBusy}
+          tradeBusy={tradeBusy}
           defaultTradeDate={asOf || tradingDatesQuery.data?.latest_date || localDateIso()}
           onClose={() => setTradeDetailPosition(null)}
           onCreateTrade={target => openCreateTradeFromDetail(tradeDetailPosition, target)}
+          onSaveInlineTrade={saveInlineTrade}
           onDelete={deleteTrade}
           onReorderDay={reorderDayTrades}
           onRetry={() => tradesQuery.refetch()}
@@ -838,13 +862,13 @@ function TradeExecutionCell({
   )
 }
 
-function SortableTradeRow({ id, busy, children, insertionTarget, onInsertTrade, insertionDisabled }: { id: string; busy: boolean; children: ReactNode; insertionTarget?: TradeInsertionTarget; onInsertTrade?: (target: TradeInsertionTarget) => void; insertionDisabled?: boolean }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id })
+function SortableTradeRow({ id, busy, children, trade, insertionTarget, onInsertTrade, insertionDisabled }: { id: string; busy: boolean; children: ReactNode; trade?: PortfolioTrade; insertionTarget?: TradeInsertionTarget; onInsertTrade?: (trade: PortfolioTrade, target: TradeInsertionTarget) => void; insertionDisabled?: boolean }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id, disabled: busy })
   return (
     <tr
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={cn('hover:bg-elevated/20', isDragging && 'bg-elevated/30 opacity-50')}
+      className={cn('group/trade hover:bg-elevated/20', isDragging && 'bg-elevated/30 opacity-50')}
     >
       <td className="relative w-7 pl-2 pr-0">
         <button
@@ -856,8 +880,8 @@ function SortableTradeRow({ id, busy, children, insertionTarget, onInsertTrade, 
         >
           <GripVertical className="h-3.5 w-3.5" />
         </button>
-        {insertionTarget && onInsertTrade && (
-          <TradeInsertionButton target={insertionTarget} onInsert={onInsertTrade} disabled={Boolean(insertionDisabled)} />
+        {trade && insertionTarget && onInsertTrade && (
+          <TradeInsertionButton trade={trade} target={insertionTarget} onInsert={onInsertTrade} disabled={Boolean(insertionDisabled)} />
         )}
       </td>
       {children}
@@ -865,16 +889,17 @@ function SortableTradeRow({ id, busy, children, insertionTarget, onInsertTrade, 
   )
 }
 
-function TradeRowCells({ trade, onDelete, onEditCost, onUpdateExecution, tradeEditBusy }: { trade: PortfolioTrade; onDelete: (trade: PortfolioTrade) => void; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean }) {
+function TradeRowCells({ trade, onDelete, onEditCost, onUpdateExecution, tradeEditBusy, interactionDisabled }: { trade: PortfolioTrade; onDelete: (trade: PortfolioTrade) => void; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean; interactionDisabled?: boolean }) {
+  const editingDisabled = Boolean(tradeEditBusy || interactionDisabled)
   return (
     <>
       <td className="px-3 py-3"><TradeSide side={trade.side} migrated={trade.migration_source === 'legacy_position'} /></td>
-      <td className="px-3 py-3 text-right font-mono">{onUpdateExecution ? <TradeExecutionCell trade={trade} busy={Boolean(tradeEditBusy)} onSave={onUpdateExecution} /> : <>{formatQuantity(trade.quantity)} × ¥ {formatPrice(trade.price)}</>}</td>
-      <td className="px-3 py-3 text-right font-mono">¥ {formatMoney(trade.fee)} / ¥ {formatMoney(trade.tax)}<CostSourceChip source={trade.cost_source} />{onEditCost && <button onClick={() => onEditCost(trade)} className="ml-0.5 rounded-btn p-1 align-middle text-muted hover:bg-elevated hover:text-foreground" title="修改费用/税费"><Edit3 className="h-3 w-3" /></button>}</td>
+      <td className="px-3 py-3 text-right font-mono">{onUpdateExecution ? <TradeExecutionCell trade={trade} busy={editingDisabled} onSave={onUpdateExecution} /> : <>{formatQuantity(trade.quantity)} × ¥ {formatPrice(trade.price)}</>}</td>
+      <td className="px-3 py-3 text-right font-mono">¥ {formatMoney(trade.fee)} / ¥ {formatMoney(trade.tax)}<CostSourceChip source={trade.cost_source} />{onEditCost && <button onClick={() => onEditCost(trade)} disabled={interactionDisabled} className="ml-0.5 rounded-btn p-1 align-middle text-muted hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" title="修改费用/税费"><Edit3 className="h-3 w-3" /></button>}</td>
       <td className="max-w-xs truncate px-3 py-3 text-secondary">{trade.note || '—'}</td>
       <td className="px-4 py-3 text-right">
         <div className="flex items-center justify-end gap-0.5">
-          <button onClick={() => onDelete(trade)} className="rounded-btn p-1.5 text-muted hover:bg-danger/10 hover:text-danger" title="删除交易并重算持仓"><Trash2 className="h-3.5 w-3.5" /></button>
+          <button onClick={() => onDelete(trade)} disabled={interactionDisabled} className="rounded-btn p-1.5 text-muted hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40" title="删除交易并重算持仓"><Trash2 className="h-3.5 w-3.5" /></button>
         </div>
       </td>
     </>
@@ -914,9 +939,11 @@ function PositionTradesDialog({
   loadError,
   reorderBusy,
   tradeEditBusy,
+  tradeBusy,
   defaultTradeDate,
   onClose,
   onCreateTrade,
+  onSaveInlineTrade,
   onDelete,
   onReorderDay,
   onRetry,
@@ -929,14 +956,17 @@ function PositionTradesDialog({
   loadError: boolean
   reorderBusy: boolean
   tradeEditBusy: boolean
+  tradeBusy: boolean
   defaultTradeDate: string
   onClose: () => void
   onCreateTrade: (target: TradeInsertionTarget) => void
+  onSaveInlineTrade: (draft: InlineTradeDraft) => Promise<boolean>
   onDelete: (trade: PortfolioTrade) => void
   onReorderDay: (dayTradesInDisplayOrder: PortfolioTrade[]) => void
   onRetry: () => void
   onUpdateExecution: (trade: PortfolioTrade, quantity: number, price: number) => void
 }) {
+  const [inlineDraft, setInlineDraft] = useState<InlineTradeDraft | null>(null)
   const groups = useMemo(() => {
     const byDate = new Map<string, PortfolioTrade[]>()
     for (const trade of items) {
@@ -954,10 +984,25 @@ function PositionTradesDialog({
     () => ({ [position.account_id]: accountName }),
     [accountName, position.account_id],
   )
+  const interactionDisabled = Boolean(inlineDraft) || tradeBusy || reorderBusy || tradeEditBusy
+
+  function startInlineTrade(trade: PortfolioTrade, target: TradeInsertionTarget) {
+    if (interactionDisabled) return
+    setInlineDraft(buildInlineTradeDraft(trade, target))
+  }
+
+  async function saveInlineDraft() {
+    if (!inlineDraft || tradeBusy) return
+    if (await onSaveInlineTrade(inlineDraft)) setInlineDraft(null)
+  }
+
+  function closeIfIdle() {
+    if (!tradeBusy) onClose()
+  }
 
   return (
     <Modal
-      onClose={onClose}
+      onClose={closeIfIdle}
       labelledBy="position-trades-title"
       panelClassName="flex max-h-[92vh] w-[96vw] max-w-6xl flex-col overflow-hidden rounded-card border border-border bg-surface shadow-2xl"
       overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-3 backdrop-blur-sm sm:p-4"
@@ -976,14 +1021,14 @@ function PositionTradesDialog({
             <span>{items.length} 笔</span>
           </div>
         </div>
-        <button onClick={onClose} className="rounded-btn p-1.5 text-muted hover:bg-elevated hover:text-foreground" title="关闭">
+        <button onClick={closeIfIdle} disabled={tradeBusy} className="rounded-btn p-1.5 text-muted hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" title="关闭">
           <X className="h-4 w-4" />
         </button>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
         <p className="mb-3 text-[11px] leading-5 text-muted">
-          将鼠标移到明细行左侧的分隔线可插入漏记交易；日期会按相邻记录预填。修改或删除后会重新计算全部历史持仓。
+          将鼠标移到任意明细行，行下边界会出现加号；点击后可直接补录，费用在保存时自动计算。修改或删除后会重新计算全部历史持仓。
         </p>
         {loading ? (
           <div className="grid min-h-40 place-items-center">
@@ -1033,7 +1078,12 @@ function PositionTradesDialog({
                   onUpdateExecution={onUpdateExecution}
                   tradeEditBusy={tradeEditBusy}
                   insertionTargets={group.insertionTargets}
-                  onInsertTrade={onCreateTrade}
+                  onInsertTrade={startInlineTrade}
+                  inlineDraft={inlineDraft}
+                  onInlineDraftChange={setInlineDraft}
+                  onSaveInlineDraft={saveInlineDraft}
+                  inlineSaveBusy={tradeBusy}
+                  interactionDisabled={interactionDisabled}
                 />
               </section>
             ))}
@@ -1044,7 +1094,7 @@ function PositionTradesDialog({
   )
 }
 
-function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDay, reorderBusy, onEditCost, onUpdateExecution, tradeEditBusy, insertionTargets, onInsertTrade }: { items: PortfolioTrade[]; mode: 'byDate' | 'byStock'; accountNameById: Record<string, string>; onDelete: (trade: PortfolioTrade) => void; onReorderDay?: (dayTradesInDisplayOrder: PortfolioTrade[]) => void; reorderBusy?: boolean; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean; insertionTargets?: TradeInsertionTarget[]; onInsertTrade?: (target: TradeInsertionTarget) => void }) {
+function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDay, reorderBusy, onEditCost, onUpdateExecution, tradeEditBusy, insertionTargets, onInsertTrade, inlineDraft, onInlineDraftChange, onSaveInlineDraft, inlineSaveBusy, interactionDisabled }: { items: PortfolioTrade[]; mode: 'byDate' | 'byStock'; accountNameById: Record<string, string>; onDelete: (trade: PortfolioTrade) => void; onReorderDay?: (dayTradesInDisplayOrder: PortfolioTrade[]) => void; reorderBusy?: boolean; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean; insertionTargets?: TradeInsertionTarget[]; onInsertTrade?: (trade: PortfolioTrade, target: TradeInsertionTarget) => void; inlineDraft?: InlineTradeDraft | null; onInlineDraftChange?: (draft: InlineTradeDraft | null) => void; onSaveInlineDraft?: () => void; inlineSaveBusy?: boolean; interactionDisabled?: boolean }) {
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -1053,7 +1103,7 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
   const sortable = mode === 'byDate' && Boolean(onReorderDay)
 
   function handleDragEnd(event: DragEndEvent) {
-    if (!onReorderDay) return
+    if (!onReorderDay || interactionDisabled) return
     const { active, over } = event
     if (!over || active.id === over.id) return
     const oldIndex = items.findIndex(item => item.id === active.id)
@@ -1071,8 +1121,24 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
     </>
   )
 
+  const renderInlineDraft = (trade: PortfolioTrade) => (
+    inlineDraft?.sourceTradeId === trade.id && onInlineDraftChange && onSaveInlineDraft
+      ? (
+        <InlineTradeDraftRow
+          draft={inlineDraft}
+          mode={mode}
+          accountName={accountNameById[inlineDraft.accountId] || '未知账户'}
+          busy={Boolean(inlineSaveBusy)}
+          onChange={onInlineDraftChange}
+          onSave={onSaveInlineDraft}
+          onCancel={() => onInlineDraftChange(null)}
+        />
+      )
+      : null
+  )
+
   const table = (
-    <div className={cn('overflow-x-auto', insertionTargets && onInsertTrade && 'pb-2')}>
+    <div className={cn('overflow-x-auto', insertionTargets && onInsertTrade && 'pb-3')}>
       <table className="w-full min-w-[720px] text-left text-xs">
         <thead className="bg-elevated/50 text-muted">
           <tr>
@@ -1094,27 +1160,33 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
         </thead>
         <tbody className="divide-y divide-border/70">
           {sortable ? items.map((trade, index) => (
-            <SortableTradeRow
-              key={trade.id}
-              id={trade.id}
-              busy={Boolean(reorderBusy)}
-              insertionTarget={insertionTargets?.[index]}
-              onInsertTrade={onInsertTrade}
-              insertionDisabled={Boolean(reorderBusy || tradeEditBusy)}
-            >
-              {renderFirstCells(trade)}
-              <TradeRowCells trade={trade} onDelete={onDelete} onEditCost={onEditCost} onUpdateExecution={onUpdateExecution} tradeEditBusy={tradeEditBusy} />
-            </SortableTradeRow>
+            <Fragment key={trade.id}>
+              <SortableTradeRow
+                id={trade.id}
+                busy={Boolean(reorderBusy || interactionDisabled)}
+                trade={trade}
+                insertionTarget={insertionTargets?.[index]}
+                onInsertTrade={onInsertTrade}
+                insertionDisabled={Boolean(reorderBusy || tradeEditBusy || interactionDisabled)}
+              >
+                {renderFirstCells(trade)}
+                <TradeRowCells trade={trade} onDelete={onDelete} onEditCost={onEditCost} onUpdateExecution={onUpdateExecution} tradeEditBusy={tradeEditBusy} interactionDisabled={interactionDisabled} />
+              </SortableTradeRow>
+              {renderInlineDraft(trade)}
+            </Fragment>
           )) : items.map((trade, index) => (
-            <tr key={trade.id} className="hover:bg-elevated/20">
-              <td className="relative w-7 pl-2 pr-0">
-                {insertionTargets?.[index] && onInsertTrade && (
-                  <TradeInsertionButton target={insertionTargets[index]} onInsert={onInsertTrade} disabled={Boolean(reorderBusy || tradeEditBusy)} />
-                )}
-              </td>
-              {renderFirstCells(trade)}
-              <TradeRowCells trade={trade} onDelete={onDelete} onEditCost={onEditCost} onUpdateExecution={onUpdateExecution} tradeEditBusy={tradeEditBusy} />
-            </tr>
+            <Fragment key={trade.id}>
+              <tr className="group/trade hover:bg-elevated/20">
+                <td className="relative w-7 pl-2 pr-0">
+                  {insertionTargets?.[index] && onInsertTrade && (
+                    <TradeInsertionButton trade={trade} target={insertionTargets[index]} onInsert={onInsertTrade} disabled={Boolean(reorderBusy || tradeEditBusy || interactionDisabled)} />
+                  )}
+                </td>
+                {renderFirstCells(trade)}
+                <TradeRowCells trade={trade} onDelete={onDelete} onEditCost={onEditCost} onUpdateExecution={onUpdateExecution} tradeEditBusy={tradeEditBusy} interactionDisabled={interactionDisabled} />
+              </tr>
+              {renderInlineDraft(trade)}
+            </Fragment>
           ))}
         </tbody>
       </table>
@@ -1131,18 +1203,111 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
   )
 }
 
-function TradeInsertionButton({ target, onInsert, disabled }: { target: TradeInsertionTarget; onInsert: (target: TradeInsertionTarget) => void; disabled: boolean }) {
+function InlineTradeDraftRow({ draft, mode, accountName, busy, onChange, onSave, onCancel }: { draft: InlineTradeDraft; mode: 'byDate' | 'byStock'; accountName: string; busy: boolean; onChange: (draft: InlineTradeDraft) => void; onSave: () => void; onCancel: () => void }) {
+  const canSave = buildInlineTradeCreatePayload(draft) !== null
+  const saveOnEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter' && canSave && !busy) onSave()
+  }
+  const cancelOnEscape = (event: React.KeyboardEvent<HTMLTableRowElement>) => {
+    if (event.key !== 'Escape' || busy) return
+    event.stopPropagation()
+    onCancel()
+  }
+  const firstCells = mode === 'byDate' ? (
+    <td className="px-4 py-2.5">
+      <div>{draft.symbol}</div>
+      <div className="font-mono text-[10px] text-muted">{draft.symbol} · {accountName}</div>
+    </td>
+  ) : (
+    <>
+      <td className="px-4 py-2.5 font-mono">{draft.tradeDate}</td>
+      <td className="px-3 py-2.5 text-muted">{accountName}</td>
+    </>
+  )
+
   return (
-    <span className="group/insert absolute -bottom-2 left-0 z-20 h-4 w-7">
+    <tr data-inline-trade-draft="true" onKeyDown={cancelOnEscape} className="bg-accent/[0.07]">
+      <td className="w-7 border-l-[3px] border-l-accent px-0" />
+      {firstCells}
+      <td className="px-3 py-2.5">
+        <select
+          aria-label="新交易方向"
+          value={draft.side}
+          disabled={busy}
+          onChange={event => onChange({ ...draft, side: event.target.value as 'buy' | 'sell' })}
+          className={`${INPUT_CLASS} !w-[76px] !py-1.5`}
+        >
+          <option value="buy">买入</option>
+          <option value="sell">卖出</option>
+        </select>
+      </td>
+      <td className="px-3 py-2.5">
+        <div className="flex items-center justify-end gap-1 font-mono">
+          <input
+            aria-label="新交易数量"
+            type="number"
+            step="any"
+            min="0"
+            value={draft.quantity}
+            autoFocus
+            disabled={busy}
+            onChange={event => onChange({ ...draft, quantity: event.target.value })}
+            onKeyDown={saveOnEnter}
+            className={`${INPUT_CLASS} !w-20 !py-1.5 text-right font-mono`}
+          />
+          <span className="text-muted">× ¥</span>
+          <input
+            aria-label="新交易成交价"
+            type="number"
+            step="0.001"
+            min="0"
+            value={draft.price}
+            disabled={busy}
+            onChange={event => onChange({ ...draft, price: event.target.value })}
+            onKeyDown={saveOnEnter}
+            className={`${INPUT_CLASS} !w-24 !py-1.5 text-right font-mono`}
+          />
+        </div>
+      </td>
+      <td className="whitespace-nowrap px-3 py-2.5 text-right text-[11px] text-muted">保存时自动计算</td>
+      <td className="px-3 py-2.5 text-secondary">未保存</td>
+      <td className="px-4 py-2.5 text-right">
+        <div className="flex items-center justify-end gap-1.5">
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={busy || !canSave}
+            className="inline-flex h-7 items-center gap-1 rounded-btn bg-accent px-2.5 text-[11px] font-medium text-white hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-40"
+            title={canSave ? '保存新增明细' : '请填写正数量及有效成交价'}
+          >
+            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}保存
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="h-7 rounded-btn px-2 text-[11px] text-muted hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            取消
+          </button>
+        </div>
+      </td>
+    </tr>
+  )
+}
+
+function TradeInsertionButton({ trade, target, onInsert, disabled }: { trade: PortfolioTrade; target: TradeInsertionTarget; onInsert: (trade: PortfolioTrade, target: TradeInsertionTarget) => void; disabled: boolean }) {
+  return (
+    <span className="pointer-events-none absolute -bottom-3 left-0 z-20 h-6 w-7">
       <button
         type="button"
-        onClick={() => onInsert(target)}
+        onClick={() => onInsert(trade, target)}
         disabled={disabled}
         aria-label={`在 ${target.tradeDate} 的此处插入一条交易明细`}
         title="在此处插入一条明细"
-        className="absolute left-1/2 top-1/2 grid h-5 w-5 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full border border-accent/35 bg-surface text-accent opacity-0 shadow-sm transition-opacity group-hover/insert:opacity-100 group-focus-within/insert:opacity-100 hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-0"
+        className="pointer-events-auto absolute left-1/2 top-1/2 grid h-7 w-7 -translate-x-1/2 -translate-y-1/2 scale-75 place-items-center rounded-full border-2 border-surface bg-accent text-white opacity-0 shadow-lg shadow-accent/25 transition-all group-hover/trade:scale-100 group-hover/trade:opacity-100 group-focus-within/trade:scale-100 group-focus-within/trade:opacity-100 focus:scale-100 focus:opacity-100 hover:bg-accent/90 disabled:pointer-events-none disabled:opacity-0"
       >
-        <Plus className="h-3 w-3" />
+        <Plus className="h-4 w-4" strokeWidth={2.5} />
       </button>
     </span>
   )
