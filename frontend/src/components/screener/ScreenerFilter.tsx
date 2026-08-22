@@ -1,9 +1,11 @@
-import { X, RotateCcw, Filter } from 'lucide-react'
+import { X, RotateCcw, Filter, Search } from 'lucide-react'
 import { BOARDS, getBoardType } from '@/lib/board'
+import { matchesScreenerKeyword } from '@/lib/screenerKeywordFilter'
 
 // ===== 筛选类型 =====
 
 export interface ScreenerFilter {
+  keyword: string
   priceMin: string
   priceMax: string
   changePctMin: string
@@ -23,6 +25,7 @@ export interface ScreenerFilter {
 }
 
 export const defaultFilter: ScreenerFilter = {
+  keyword: '',
   priceMin: '', priceMax: '',
   changePctMin: '', changePctMax: '',
   momentum5dMin: '', momentum5dMax: '',
@@ -36,15 +39,17 @@ export const defaultFilter: ScreenerFilter = {
 }
 
 export function filterActive(f: ScreenerFilter): boolean {
+  if (f.keyword.trim()) return true
   if (f.boards.length > 0) return true
   if (f.excludeST) return true
   return Object.entries(f).some(([k, v]) =>
-    k !== 'boards' && k !== 'excludeST' && v !== '' && v !== false,
+    k !== 'keyword' && k !== 'boards' && k !== 'excludeST' && v !== '' && v !== false,
   )
 }
 
 export function countActiveFilters(f: ScreenerFilter): number {
   let n = 0
+  if (f.keyword.trim()) n++
   if (f.priceMin || f.priceMax) n++
   if (f.changePctMin || f.changePctMax) n++
   if (f.momentum5dMin || f.momentum5dMax) n++
@@ -62,6 +67,7 @@ export function applyFilter(rows: any[], f: ScreenerFilter): any[] {
   if (!filterActive(f)) return rows
   const num = (v: string) => v === '' ? null : Number(v)
   return rows.filter((r) => {
+    if (!matchesScreenerKeyword(r, f.keyword)) return false
     // 板块: 用 symbol 判定板块, 必须在选中列表里
     // 全选 5 个板块 = 不过滤 (等价于 boards:[]), 避免 getBoardType 返回 null 的边缘品种被误删
     if (f.boards.length > 0 && f.boards.length < BOARDS.length) {
@@ -173,6 +179,18 @@ export function FilterPanel({ value, onChange, onClose, onReset }: {
         </div>
       </div>
 
+      <div className="flex items-center gap-2">
+        <Search className="h-3.5 w-3.5 text-muted shrink-0" />
+        <input
+          type="search"
+          aria-label="股票代码或名称"
+          placeholder="输入股票代码或名称，例如 688169.SH、石头科技"
+          value={value.keyword}
+          onChange={(e) => set('keyword', e.target.value)}
+          className="w-full px-2.5 py-1.5 rounded-btn bg-base border border-border text-xs text-foreground placeholder:text-muted focus:outline-none focus:border-accent/50"
+        />
+      </div>
+
       {/* 板块 + ST 快速筛选 (按钮组) */}
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="text-[11px] text-secondary shrink-0 w-10">市场</span>
@@ -237,7 +255,7 @@ export function FilterPanel({ value, onChange, onClose, onReset }: {
           )
         })}
       </div>
-      <div className="text-[10px] text-muted/70 pl-1">输入即生效 · 点击市场/ST 按钮切换</div>
+      <div className="text-[10px] text-muted/70 pl-1">代码、名称和数值输入即生效 · 点击市场/ST 按钮切换</div>
     </div>
   )
 }

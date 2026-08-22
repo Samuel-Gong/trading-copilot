@@ -40,6 +40,15 @@ fail() {
   return 1
 }
 
+validate_runtime_env_file() {
+  local env_file="$1"
+
+  [[ -f "$env_file" ]] || fail "生产配置不存在: ${env_file}"
+  if grep -Eiq '^[[:space:]]*(DATA_DIR|STATIC_DIR|TIERS_YAML)[[:space:]]*=' "$env_file"; then
+    fail "生产配置不得声明 DATA_DIR、STATIC_DIR 或 TIERS_YAML；这些路径由 systemd 固定管理"
+  fi
+}
+
 validate_archive_members() {
   local archive_path="$1"
   local entry mode
@@ -192,6 +201,12 @@ if [[ ${1:-} == "--validate-only" ]]; then
   exit 0
 fi
 
+if [[ ${1:-} == "--validate-env-only" ]]; then
+  [[ $# -eq 2 ]] || fail "用法: tickflow-deploy --validate-env-only <tickflow.env>"
+  validate_runtime_env_file "$2"
+  exit 0
+fi
+
 [[ ${EUID} -eq 0 ]] || fail "必须以 root 运行"
 [[ $# -eq 1 ]] || fail "用法: tickflow-deploy <tickflow-server-*.tar.gz>"
 
@@ -202,9 +217,10 @@ checksum_file="${archive}.sha256"
 [[ -f "$checksum_file" ]] || fail "缺少校验文件: ${checksum_file}"
 [[ -f "$ENV_FILE" ]] || fail "缺少生产配置: ${ENV_FILE}"
 
-for command_name in awk curl cut find flock install realpath rsync runuser sha256sum tar; do
+for command_name in awk curl cut find flock grep install realpath rsync runuser sha256sum tar; do
   command -v "$command_name" >/dev/null || fail "缺少命令: ${command_name}"
 done
+validate_runtime_env_file "$ENV_FILE"
 id "$SERVICE_USER" >/dev/null 2>&1 || fail "缺少系统用户: ${SERVICE_USER}"
 runuser -u "$SERVICE_USER" -- test -x "$UV_BIN" \
   || fail "${SERVICE_USER} 用户无法执行 uv: ${UV_BIN}"

@@ -31,3 +31,18 @@ if "${repo_root}/ops/deploy.sh" --validate-only "${tmp_dir}/wrong-target.tar.gz"
   printf '指向其他路径的校验文件不应通过校验\n' >&2
   exit 1
 fi
+
+printf '%s\n' \
+  'LOG_LEVEL=INFO' \
+  'BACKEND_EXTRAS=backtest' \
+  '# DATA_DIR=/legacy/data' \
+  > "${tmp_dir}/valid.env"
+"${repo_root}/ops/deploy.sh" --validate-env-only "${tmp_dir}/valid.env"
+
+for reserved_key in DATA_DIR data_dir Data_Dir STATIC_DIR static_dir TIERS_YAML tiers_yaml; do
+  printf '%s = /unexpected/path\n' "$reserved_key" > "${tmp_dir}/invalid.env"
+  if "${repo_root}/ops/deploy.sh" --validate-env-only "${tmp_dir}/invalid.env"; then
+    printf '生产私有环境文件不应允许保留变量: %s\n' "$reserved_key" >&2
+    exit 1
+  fi
+done

@@ -168,6 +168,8 @@ BACKEND_EXTRAS=backtest
 
 `DATA_DIR`、`STATIC_DIR` 和 `TIERS_YAML` 已由 systemd 固定为生产绝对路径，不需要写入此文件。systemd 还会显式清除大小写形式的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`，确保应用启动后不经过开发代理。
 
+部署器会拒绝包含 `DATA_DIR`、`STATIC_DIR` 或 `TIERS_YAML` 的生产配置，防止私有环境文件覆盖 systemd 中的固定路径。旧部署若遗留这些变量，应先在维护窗口完成数据同步并删除对应配置，再重新发布；不能通过在两处填写相同值来维持双重配置。
+
 ### 3.5 为公网 IP 申请 TLS 证书
 
 公网登录不能使用明文 HTTP。Let's Encrypt 的 IP 地址证书是约 6 天有效期的短期证书，必须启用自动续期。先确认 UCloud 安全组已开放 80 和 443，并安装 Certbot 5.4 或更高版本，然后首次签发：

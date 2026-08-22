@@ -384,8 +384,9 @@ export function Screener() {
 
     // 追加当前策略的失效行 (灰色)
     if (!showAll && activeStrategy) {
-      if (expiredRows.length > 0) {
-        return [...mainRows, ...expiredRows]
+      const filteredExpiredRows = applyFilter(expiredRows, filter)
+      if (filteredExpiredRows.length > 0) {
+        return [...mainRows, ...filteredExpiredRows]
       }
     }
     return mainRows
