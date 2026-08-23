@@ -137,6 +137,10 @@ class TradeExecutionUpdateRequest(BaseModel):
     price: float = Field(gt=0, allow_inf_nan=False)
 
 
+class TradeDateUpdateRequest(BaseModel):
+    trade_date: date
+
+
 class TradeCostUpdateRequest(BaseModel):
     fee: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     tax: float | None = Field(default=None, ge=0, allow_inf_nan=False)
@@ -517,6 +521,20 @@ def update_trade_execution(
 def update_trade_price(trade_id: str, body: TradePriceUpdateRequest):
     try:
         return portfolio.update_trade_price(trade_id, body.price)
+    except Exception as exc:
+        raise _map_error(exc) from exc
+
+
+@router.patch("/trades/{trade_id}/date")
+def update_trade_date(
+    trade_id: str, body: TradeDateUpdateRequest, request: Request
+):
+    try:
+        with portfolio.mutation_guard():
+            held_before = portfolio.held_symbols()
+            result = portfolio.update_trade_date(trade_id, body.trade_date)
+            _cleanup_closed_position_rules(request, held_before)
+            return result
     except Exception as exc:
         raise _map_error(exc) from exc
 
