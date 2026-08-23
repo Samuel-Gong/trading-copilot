@@ -441,6 +441,20 @@ export function Portfolio() {
     }
   }
 
+  async function updateTradeDate(trade: PortfolioTrade, tradeDate: string) {
+    setTradeEditBusy(true)
+    try {
+      await api.portfolioTradeUpdateDate(trade.id, tradeDate)
+      // 日期会改变回放顺序、历史持仓和交易分组，整个快照与流水都要失效
+      await invalidatePortfolioTradeChanges()
+      toast('交易日期已更新', 'success')
+    } catch (error) {
+      toast(error instanceof Error ? error.message : '修改交易日期失败', 'error')
+    } finally {
+      setTradeEditBusy(false)
+    }
+  }
+
   async function analyzePosition(position: PortfolioPosition) {
     const result = await startAnalysis(position.symbol, position.name, '', {
       accountId: position.account_id,
@@ -651,7 +665,7 @@ export function Portfolio() {
                       {group.items.length} 笔 · 买 {group.buyCount} / 卖 {group.sellCount} · 净买入 <SignedNetAmount value={group.netAmount} />（含费用税）
                     </div>
                   </div>
-                  <GroupedTradeTable items={group.items} mode="byDate" accountNameById={accountNameById} onDelete={deleteTrade} onReorderDay={reorderDayTrades} reorderBusy={reorderBusy} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} tradeEditBusy={tradeEditBusy} />
+                  <GroupedTradeTable items={group.items} mode="byDate" accountNameById={accountNameById} onDelete={deleteTrade} onReorderDay={reorderDayTrades} reorderBusy={reorderBusy} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} onUpdateDate={updateTradeDate} tradeEditBusy={tradeEditBusy} tradingDates={tradingDates} earliestTradingDate={tradingDatesQuery.data?.earliest_date} latestTradingDate={tradingDatesQuery.data?.latest_date} />
                 </div>
               ))}
             </div>
@@ -668,7 +682,7 @@ export function Portfolio() {
                       买 {group.buyCount} / 卖 {group.sellCount} · 净买入 <SignedNetAmount value={group.netAmount} />（含费用税） · 净股数 <span className={`font-mono ${group.netQuantity > 0 ? 'text-foreground' : group.netQuantity < 0 ? 'text-bear' : 'text-muted'}`}>{formatQuantity(group.netQuantity)}</span>
                     </div>
                   </div>
-                  <GroupedTradeTable items={group.items} mode="byStock" accountNameById={accountNameById} onDelete={deleteTrade} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} tradeEditBusy={tradeEditBusy} />
+                  <GroupedTradeTable items={group.items} mode="byStock" accountNameById={accountNameById} onDelete={deleteTrade} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} onUpdateDate={updateTradeDate} tradeEditBusy={tradeEditBusy} tradingDates={tradingDates} earliestTradingDate={tradingDatesQuery.data?.earliest_date} latestTradingDate={tradingDatesQuery.data?.latest_date} />
                 </div>
               ))}
             </div>
@@ -681,7 +695,7 @@ export function Portfolio() {
                     <tbody className="divide-y divide-border/70">
                       {visibleTrades.map(trade => (
                         <SortableTradeRow key={trade.id} id={trade.id} busy={reorderBusy}>
-                          <td className="px-4 py-3 font-mono">{trade.trade_date}</td>
+                          <td className="px-4 py-3 font-mono"><TradeDateCell trade={trade} busy={tradeEditBusy} tradingDates={tradingDates} earliestTradingDate={tradingDatesQuery.data?.earliest_date} latestTradingDate={tradingDatesQuery.data?.latest_date} onSave={updateTradeDate} /></td>
                           <td className="px-3 py-3"><div>{trade.name || trade.symbol}</div><div className="font-mono text-[10px] text-muted">{trade.symbol} · {accountNameById[trade.account_id] || '未知账户'}</div></td>
                           <TradeRowCells trade={trade} onDelete={deleteTrade} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} tradeEditBusy={tradeEditBusy} />
                         </SortableTradeRow>
@@ -730,6 +744,9 @@ export function Portfolio() {
           tradeEditBusy={tradeEditBusy}
           tradeBusy={tradeBusy}
           defaultTradeDate={asOf || tradingDatesQuery.data?.latest_date || localDateIso()}
+          tradingDates={tradingDates}
+          earliestTradingDate={tradingDatesQuery.data?.earliest_date}
+          latestTradingDate={tradingDatesQuery.data?.latest_date}
           onClose={() => setTradeDetailPosition(null)}
           onCreateTrade={target => openCreateTradeFromDetail(tradeDetailPosition, target)}
           onSaveInlineTrade={saveInlineTrade}
@@ -737,6 +754,7 @@ export function Portfolio() {
           onReorderDay={reorderDayTrades}
           onRetry={() => tradesQuery.refetch()}
           onUpdateExecution={updateTradeExecution}
+          onUpdateDate={updateTradeDate}
         />
       )}
       {costEditTrade && (
@@ -788,6 +806,52 @@ function PositionMonitorCell({ monitor, loading, onOpen }: { monitor?: Portfolio
       <span className="flex items-center gap-1.5 text-[11px] text-foreground"><BellRing className="h-3 w-3 text-danger" />止损 ¥ {formatPrice(monitor.stop_loss_price)}</span>
       <span className="mt-0.5 block pl-4 text-[10px] text-muted">{monitor.add_position_enabled && monitor.add_position_price != null ? `加仓 ¥ ${formatPrice(monitor.add_position_price)}` : '未设置加仓价'} · <span className="group-hover:text-accent">编辑</span></span>
     </button>
+  )
+}
+
+function TradeDateCell({
+  trade,
+  busy,
+  tradingDates,
+  earliestTradingDate,
+  latestTradingDate,
+  onSave,
+}: {
+  trade: PortfolioTrade
+  busy: boolean
+  tradingDates: readonly string[]
+  earliestTradingDate?: string | null
+  latestTradingDate?: string | null
+  onSave: (trade: PortfolioTrade, tradeDate: string) => void
+}) {
+  const [editing, setEditing] = useState(false)
+
+  if (editing) {
+    return (
+      <span className="inline-flex items-center gap-1">
+        <DatePicker
+          value={trade.trade_date}
+          onChange={tradeDate => {
+            setEditing(false)
+            if (tradeDate !== trade.trade_date) onSave(trade, tradeDate)
+          }}
+          min={earliestTradingDate ?? undefined}
+          max={latestTradingDate ?? localDateIso()}
+          availableDates={tradingDates.length > 0 ? tradingDates : undefined}
+          disabled={busy}
+          align="left"
+          buttonClassName="!h-7 !px-1.5 font-mono"
+        />
+        <button type="button" onClick={() => setEditing(false)} disabled={busy} className="rounded-btn p-0.5 text-muted hover:bg-elevated hover:text-foreground" title="取消修改"><X className="h-3 w-3" /></button>
+      </span>
+    )
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span>{trade.trade_date}</span>
+      <button type="button" onClick={() => setEditing(true)} disabled={busy} className="rounded-btn p-0.5 text-muted hover:text-foreground" title="修改交易日期"><Pencil className="h-3 w-3" /></button>
+    </span>
   )
 }
 
@@ -949,6 +1013,9 @@ function PositionTradesDialog({
   tradeEditBusy,
   tradeBusy,
   defaultTradeDate,
+  tradingDates,
+  earliestTradingDate,
+  latestTradingDate,
   onClose,
   onCreateTrade,
   onSaveInlineTrade,
@@ -956,6 +1023,7 @@ function PositionTradesDialog({
   onReorderDay,
   onRetry,
   onUpdateExecution,
+  onUpdateDate,
 }: {
   position: PortfolioPosition
   accountName: string
@@ -966,6 +1034,9 @@ function PositionTradesDialog({
   tradeEditBusy: boolean
   tradeBusy: boolean
   defaultTradeDate: string
+  tradingDates: readonly string[]
+  earliestTradingDate?: string | null
+  latestTradingDate?: string | null
   onClose: () => void
   onCreateTrade: (target: TradeInsertionTarget) => void
   onSaveInlineTrade: (draft: InlineTradeDraft) => Promise<boolean>
@@ -973,6 +1044,7 @@ function PositionTradesDialog({
   onReorderDay: (dayTradesInDisplayOrder: PortfolioTrade[]) => void
   onRetry: () => void
   onUpdateExecution: (trade: PortfolioTrade, quantity: number, price: number) => void
+  onUpdateDate: (trade: PortfolioTrade, tradeDate: string) => void
 }) {
   const [inlineDraft, setInlineDraft] = useState<InlineTradeDraft | null>(null)
   const groups = useMemo(() => {
@@ -1084,7 +1156,11 @@ function PositionTradesDialog({
                   onReorderDay={group.items.length > 1 ? onReorderDay : undefined}
                   reorderBusy={reorderBusy}
                   onUpdateExecution={onUpdateExecution}
+                  onUpdateDate={onUpdateDate}
                   tradeEditBusy={tradeEditBusy}
+                  tradingDates={tradingDates}
+                  earliestTradingDate={earliestTradingDate}
+                  latestTradingDate={latestTradingDate}
                   insertionTargets={group.insertionTargets}
                   onInsertTrade={startInlineTrade}
                   inlineDraft={inlineDraft}
@@ -1102,7 +1178,7 @@ function PositionTradesDialog({
   )
 }
 
-function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDay, reorderBusy, onEditCost, onUpdateExecution, tradeEditBusy, insertionTargets, onInsertTrade, inlineDraft, onInlineDraftChange, onSaveInlineDraft, inlineSaveBusy, interactionDisabled }: { items: PortfolioTrade[]; mode: 'byDate' | 'byStock'; accountNameById: Record<string, string>; onDelete: (trade: PortfolioTrade) => void; onReorderDay?: (dayTradesInDisplayOrder: PortfolioTrade[]) => void; reorderBusy?: boolean; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; tradeEditBusy?: boolean; insertionTargets?: TradeInsertionTarget[]; onInsertTrade?: (trade: PortfolioTrade, target: TradeInsertionTarget) => void; inlineDraft?: InlineTradeDraft | null; onInlineDraftChange?: (draft: InlineTradeDraft | null) => void; onSaveInlineDraft?: () => void; inlineSaveBusy?: boolean; interactionDisabled?: boolean }) {
+function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDay, reorderBusy, onEditCost, onUpdateExecution, onUpdateDate, tradeEditBusy, tradingDates, earliestTradingDate, latestTradingDate, insertionTargets, onInsertTrade, inlineDraft, onInlineDraftChange, onSaveInlineDraft, inlineSaveBusy, interactionDisabled }: { items: PortfolioTrade[]; mode: 'byDate' | 'byStock'; accountNameById: Record<string, string>; onDelete: (trade: PortfolioTrade) => void; onReorderDay?: (dayTradesInDisplayOrder: PortfolioTrade[]) => void; reorderBusy?: boolean; onEditCost?: (trade: PortfolioTrade) => void; onUpdateExecution?: (trade: PortfolioTrade, quantity: number, price: number) => void; onUpdateDate: (trade: PortfolioTrade, tradeDate: string) => void; tradeEditBusy?: boolean; tradingDates: readonly string[]; earliestTradingDate?: string | null; latestTradingDate?: string | null; insertionTargets?: TradeInsertionTarget[]; onInsertTrade?: (trade: PortfolioTrade, target: TradeInsertionTarget) => void; inlineDraft?: InlineTradeDraft | null; onInlineDraftChange?: (draft: InlineTradeDraft | null) => void; onSaveInlineDraft?: () => void; inlineSaveBusy?: boolean; interactionDisabled?: boolean }) {
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -1120,12 +1196,23 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
     onReorderDay(arrayMove(items, oldIndex, newIndex))
   }
 
-  const renderFirstCells = (trade: PortfolioTrade) => mode === 'byDate' ? (
-    <td className="px-4 py-3"><div>{trade.name || trade.symbol}</div><div className="font-mono text-[10px] text-muted">{trade.symbol} · {accountNameById[trade.account_id] || '未知账户'}</div></td>
-  ) : (
+  const renderFirstCells = (trade: PortfolioTrade) => (
     <>
-      <td className="px-4 py-3 font-mono">{trade.trade_date}</td>
-      <td className="px-3 py-3 text-muted">{accountNameById[trade.account_id] || '未知账户'}</td>
+      <td className="px-4 py-3 font-mono">
+        <TradeDateCell
+          trade={trade}
+          busy={Boolean(tradeEditBusy || interactionDisabled)}
+          tradingDates={tradingDates}
+          earliestTradingDate={earliestTradingDate}
+          latestTradingDate={latestTradingDate}
+          onSave={onUpdateDate}
+        />
+      </td>
+      {mode === 'byDate' ? (
+        <td className="px-3 py-3"><div>{trade.name || trade.symbol}</div><div className="font-mono text-[10px] text-muted">{trade.symbol} · {accountNameById[trade.account_id] || '未知账户'}</div></td>
+      ) : (
+        <td className="px-3 py-3 text-muted">{accountNameById[trade.account_id] || '未知账户'}</td>
+      )}
     </>
   )
 
@@ -1147,17 +1234,15 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
 
   const table = (
     <div className={cn('overflow-x-auto', insertionTargets && onInsertTrade && 'pb-3')}>
-      <table className="w-full min-w-[720px] text-left text-xs">
+      <table className="w-full min-w-[840px] text-left text-xs">
         <thead className="bg-elevated/50 text-muted">
           <tr>
             <th className="w-7" />
+            <th className="px-4 py-2 font-medium">交易日</th>
             {mode === 'byDate' ? (
               <th className="px-4 py-2 font-medium">标的 / 账户</th>
             ) : (
-              <>
-                <th className="px-4 py-2 font-medium">交易日</th>
-                <th className="px-3 py-2 font-medium">账户</th>
-              </>
+              <th className="px-3 py-2 font-medium">账户</th>
             )}
             <th className="px-3 py-2 font-medium">方向</th>
             <th className="px-3 py-2 text-right font-medium">数量 × 成交价</th>
@@ -1221,15 +1306,17 @@ function InlineTradeDraftRow({ draft, mode, accountName, busy, onChange, onSave,
     event.stopPropagation()
     onCancel()
   }
-  const firstCells = mode === 'byDate' ? (
-    <td className="px-4 py-2.5">
-      <div>{draft.symbol}</div>
-      <div className="font-mono text-[10px] text-muted">{draft.symbol} · {accountName}</div>
-    </td>
-  ) : (
+  const firstCells = (
     <>
       <td className="px-4 py-2.5 font-mono">{draft.tradeDate}</td>
-      <td className="px-3 py-2.5 text-muted">{accountName}</td>
+      {mode === 'byDate' ? (
+        <td className="px-3 py-2.5">
+          <div>{draft.symbol}</div>
+          <div className="font-mono text-[10px] text-muted">{draft.symbol} · {accountName}</div>
+        </td>
+      ) : (
+        <td className="px-3 py-2.5 text-muted">{accountName}</td>
+      )}
     </>
   )
 

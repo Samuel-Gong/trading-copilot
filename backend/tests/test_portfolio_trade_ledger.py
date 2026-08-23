@@ -752,6 +752,79 @@ def test_trade_execution_update_rejects_unknown_id_and_invalid_values(
     assert zero_price.status_code == 422
 
 
+def test_trade_date_can_be_corrected_and_moves_to_end_of_target_day(
+    tmp_path, monkeypatch
+):
+    client = make_client(tmp_path, monkeypatch)
+    account = create_account(client)
+    existing = record_trade(
+        client, account["id"], trade_date="2026-07-29", side="buy",
+        quantity=50, price=9,
+    )
+    wrong = record_trade(
+        client, account["id"], trade_date="2026-07-30", side="buy",
+        quantity=100, price=10,
+    )
+
+    response = client.patch(
+        f"/api/portfolio/trades/{wrong['id']}/date",
+        json={"trade_date": "2026-07-29"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["trade_date"] == "2026-07-29"
+    listed = client.get("/api/portfolio/trades").json()["items"]
+    assert [item["id"] for item in listed] == [wrong["id"], existing["id"]]
+    assert [item["seq"] for item in listed] == [2, 1]
+    snapshot = client.get(
+        "/api/portfolio/snapshot", params={"as_of": "2026-07-29"}
+    ).json()
+    position = snapshot["accounts"][0]["positions"][0]
+    assert position["quantity"] == 150
+    assert position["purchase_date"] == "2026-07-29"
+
+
+def test_trade_date_update_rejects_invalid_change_without_partial_write(
+    tmp_path, monkeypatch
+):
+    client = make_client(tmp_path, monkeypatch)
+    account = create_account(client)
+    buy = record_trade(
+        client, account["id"], trade_date="2026-07-30", side="buy",
+        quantity=100, price=10,
+    )
+    record_trade(
+        client, account["id"], trade_date="2026-07-31", side="sell",
+        quantity=80, price=15,
+    )
+
+    conflict = client.patch(
+        f"/api/portfolio/trades/{buy['id']}/date",
+        json={"trade_date": "2026-08-01"},
+    )
+    assert conflict.status_code == 409
+    assert "卖出超过可用数量" in conflict.json()["detail"]
+    persisted = client.get("/api/portfolio/trades").json()["items"][-1]
+    assert persisted["trade_date"] == "2026-07-30"
+
+    future = client.patch(
+        f"/api/portfolio/trades/{buy['id']}/date",
+        json={"trade_date": "9999-12-31"},
+    )
+    assert future.status_code == 400
+    assert future.json()["detail"] == "交易日期不能晚于今天"
+    invalid = client.patch(
+        f"/api/portfolio/trades/{buy['id']}/date",
+        json={"trade_date": "2026-02-30"},
+    )
+    assert invalid.status_code == 422
+    unknown = client.patch(
+        "/api/portfolio/trades/not-exist/date",
+        json={"trade_date": "2026-07-30"},
+    )
+    assert unknown.status_code == 404
+
+
 def test_trade_execution_update_reestimates_only_system_estimated_costs(
     tmp_path, monkeypatch
 ):

@@ -2115,6 +2115,13 @@ export const api = {
       quiet: true,
     }),
   // quiet: 错误由调用方 catch 后自行 toast，避免与 request 内置 toast 重复
+  portfolioTradeUpdateDate: (tradeId: string, tradeDate: string) =>
+    request<PortfolioTrade>(`/api/portfolio/trades/${encodeURIComponent(tradeId)}/date`, {
+      method: 'PATCH',
+      body: JSON.stringify({ trade_date: tradeDate }),
+      quiet: true,
+    }),
+  // quiet: 错误由调用方 catch 后自行 toast，避免与 request 内置 toast 重复
   portfolioTradeUpdateCost: (tradeId: string, body: { fee?: number | null; tax?: number | null }) =>
     request<PortfolioTrade>(`/api/portfolio/trades/${encodeURIComponent(tradeId)}/cost`, {
       method: 'PATCH',
