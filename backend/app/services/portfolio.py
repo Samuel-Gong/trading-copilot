@@ -611,6 +611,51 @@ def update_trade_price(trade_id: str, price: float) -> dict:
     return update_trade_execution(trade_id, price=price)
 
 
+def update_trade_date(trade_id: str, trade_date: date) -> dict:
+    """原子修改交易日期,移到目标日末尾并拒绝破坏卖出约束的变更。"""
+    if trade_date > today():
+        raise ValueError("交易日期不能晚于今天")
+    next_trade_date = trade_date.isoformat()
+    with _LOCK:
+        document = _read()
+        target = next(
+            (item for item in document["trades"] if item.get("id") == trade_id),
+            None,
+        )
+        if target is None:
+            raise PortfolioNotFoundError("交易记录不存在")
+        if target.get("trade_date") == next_trade_date:
+            return dict(target)
+        destination_trades = [
+            item
+            for item in document["trades"]
+            if item.get("id") != trade_id
+            and str(item.get("trade_date") or "") == next_trade_date
+        ]
+        replacement = {
+            **target,
+            "trade_date": next_trade_date,
+            "seq": max(
+                [int(item.get("seq") or 0) for item in destination_trades] or [0]
+            )
+            + 1,
+        }
+        candidate = [
+            replacement if item.get("id") == trade_id else item
+            for item in document["trades"]
+        ]
+        try:
+            _validate_trades(candidate)
+        except PortfolioConflictError as exc:
+            raise PortfolioConflictError(
+                "修改后的交易日期会导致某笔卖出超过可用数量"
+            ) from exc
+        document["trades"] = candidate
+        _remove_held_watch_items(document)
+        _write(document)
+        return dict(replacement)
+
+
 def update_trade_cost(trade_id: str, fee: float | None, tax: float | None) -> dict:
     """修改费用/税费;传入 None 的字段按费率配置重新估算。费用不影响卖出可行性回放,无需重校验。"""
     with _LOCK:
