@@ -90,6 +90,35 @@ def test_clear_data_bumps_enriched_generations_and_invalidates_panel_cache(
     assert repo.calls == ["clear_cache", "refresh_cache", "rebuild_views"]
 
 
+def test_clear_data_removes_regime_mainline_history_and_invalidates_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_clear_side_effects(monkeypatch)
+    from app.api import regime
+
+    invalidations: list[None] = []
+    monkeypatch.setattr(
+        regime,
+        "invalidate_regime_cache",
+        lambda: invalidations.append(None),
+    )
+    repo = _RepoStub(tmp_path)
+    targets = [
+        tmp_path / "regime_history" / "part.parquet",
+        tmp_path / "mainline_history" / "part.parquet",
+        tmp_path / "mainline_history" / "coverage.parquet",
+    ]
+    for target in targets:
+        _write_parquet_placeholder(target)
+
+    result = data_api.clear_data(_request(repo))
+
+    assert result == {"deleted_files": 3}
+    assert all(not target.exists() for target in targets)
+    assert invalidations == [None]
+
+
 def test_clear_data_restores_ready_generation_when_first_delete_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

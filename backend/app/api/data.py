@@ -655,7 +655,7 @@ def clear_data(request: Request):
         "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
         "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
         "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
-        "backtest_results", "screener_results", "ai_cache",
+        "backtest_results", "screener_results", "ai_cache", "regime_history", "mainline_history",
     ):
         d = data_dir / sub
         if not d.exists():
@@ -711,6 +711,10 @@ def clear_data(request: Request):
     # 清除 Screener 进程级 _history_cache (TTL 缓存)
     from app.services.screener import ScreenerService
     ScreenerService.clear_history_cache()
+
+    # 清除市场阶段/主线 API 的进程级查询缓存。
+    from app.api.regime import invalidate_regime_cache
+    invalidate_regime_cache()
 
     # 清除 Overview 总览聚合结果缓存 (5s TTL)
     from app.api.overview import invalidate_overview_cache

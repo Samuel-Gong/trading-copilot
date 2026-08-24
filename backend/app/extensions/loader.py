@@ -103,12 +103,7 @@ def _route_paths_overlap(left: APIRoute, right: APIRoute) -> bool:
     )
     if samples_overlap:
         return True
-    if any(
-        type(convertor).__name__ == "PathConvertor"
-        for convertor in (*left.param_convertors.values(), *right.param_convertors.values())
-    ):
-        return _complex_path_templates_may_overlap(left.path, right.path)
-    return False
+    return _complex_templates_may_overlap(left.path, right.path)
 
 
 _FULL_PATH_PARAMETER = re.compile(r"^\{([^}:]+)(?::([^}]+))?\}$")
@@ -173,7 +168,7 @@ def _segment_transitions(
         return ()
     segment = segments[index]
     if type(segment).__name__ == "PathConvertor":
-        # `path` 可吞掉当前及后续 URL 段，但模板中的这一段本身不能消失。
+        # `path` 可吞掉当前及后续 URL 段；空值对应尾斜杠产生的空 URL 段。
         return ((index, segment), (index + 1, segment))
     return ((index + 1, segment),)
 
@@ -202,8 +197,8 @@ def _simple_segments_overlap(left: str | object, right: str | object) -> bool:
     return True
 
 
-def _complex_path_templates_may_overlap(left: str, right: str) -> bool:
-    """段内混合 path 模板只有在字面前后缀可证明冲突时才放行。"""
+def _complex_templates_may_overlap(left: str, right: str) -> bool:
+    """段内混合模板只有在字面前后缀可证明冲突时才放行。"""
     left_prefix = left.split("{", 1)[0]
     right_prefix = right.split("{", 1)[0]
     if not (left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)):

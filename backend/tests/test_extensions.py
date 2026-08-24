@@ -310,3 +310,62 @@ def test_extension_path_converter_route_allowed_when_prefixes_are_disjoint() -> 
     registrar.include_router(router)
 
     _validate_router_conflicts(app, registrar)
+
+
+def test_extension_mixed_segment_route_rejected_when_values_overlap() -> None:
+    app = FastAPI()
+
+    @app.get("/a/x{value:int}y")
+    def get_core_value(value: int) -> dict:
+        return {"value": value}
+
+    registrar = _registrar()
+    router = APIRouter()
+
+    @router.get("/a/{value:str}2y")
+    def get_extension_value(value: str) -> dict:
+        return {"value": value}
+
+    registrar.include_router(router)
+
+    with pytest.raises(ValueError, match=r"GET /a/\{value:str\}2y"):
+        _validate_router_conflicts(app, registrar)
+
+
+def test_extension_mixed_segment_route_allowed_when_prefixes_are_disjoint() -> None:
+    app = FastAPI()
+
+    @app.get("/a/x{value:int}y")
+    def get_core_value(value: int) -> dict:
+        return {"value": value}
+
+    registrar = _registrar()
+    router = APIRouter()
+
+    @router.get("/b/{value:str}2y")
+    def get_extension_value(value: str) -> dict:
+        return {"value": value}
+
+    registrar.include_router(router)
+
+    _validate_router_conflicts(app, registrar)
+
+
+def test_extension_path_converter_rejects_trailing_slash_empty_value() -> None:
+    app = FastAPI()
+
+    @app.get("/a/{value:path}")
+    def get_core_path(value: str) -> dict:
+        return {"value": value}
+
+    registrar = _registrar()
+    router = APIRouter()
+
+    @router.get("/a/")
+    def get_extension_path() -> dict:
+        return {"ok": True}
+
+    registrar.include_router(router)
+
+    with pytest.raises(ValueError, match=r"GET /a/"):
+        _validate_router_conflicts(app, registrar)
