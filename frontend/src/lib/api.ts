@@ -2817,17 +2817,19 @@ export const api = {
     const qs = params.toString()
     return request<{ ok: boolean; computed: number; phase_days?: number; mainline_rows?: number }>(`/api/regime/recompute${qs ? `?${qs}` : ''}`, { method: 'POST' })
   },
-  regimePhases: (start?: string, end?: string) => {
+  regimePhases: (start?: string, end?: string, limit?: number) => {
     const params = new URLSearchParams()
     if (start) params.set('start', start)
     if (end) params.set('end', end)
+    if (limit) params.set('limit', String(limit))
     const qs = params.toString()
     return request<PhaseSegments>(`/api/regime/phases${qs ? `?${qs}` : ''}`)
   },
-  regimeMainline: (start?: string, end?: string, top = 10, kind: 'concept' | 'industry' = 'concept') => {
+  regimeMainline: (start?: string, end?: string, top = 10, kind: 'concept' | 'industry' = 'concept', limit?: number) => {
     const params = new URLSearchParams({ top: String(top), kind })
     if (start) params.set('start', start)
     if (end) params.set('end', end)
+    if (limit) params.set('limit', String(limit))
     return request<MainlineResult>(`/api/regime/mainline?${params.toString()}`)
   },
   regimeMainlineRecompute: () =>

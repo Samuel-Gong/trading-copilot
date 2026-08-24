@@ -39,6 +39,24 @@ def _mock_minute_df(symbol: str = "600519.SH") -> pl.DataFrame:
     })
 
 
+def test_tickflow_epoch_minute_normalizes_to_beijing_wall_clock():
+    """Provider 分钟 canonical 统一使用无时区的北京时间墙钟。"""
+    out = kline_sync._normalize_minute(
+        pl.DataFrame({
+            "timestamp": [1779327300000],  # 2026-05-21 01:35 UTC / 09:35 Asia/Shanghai
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.5],
+            "close": [100.5],
+            "volume": [1000.0],
+            "amount": [100500.0],
+        }),
+        default_symbol="600519.SH",
+    )
+
+    assert out["datetime"][0] == datetime(2026, 5, 21, 9, 35)
+
+
 def _setup_custom_provider(monkeypatch, provider: object, has_dataset: bool = True) -> None:
     """统一 mock 自定义分钟源路由前置: preferences + provider_has_dataset + get_provider。
 

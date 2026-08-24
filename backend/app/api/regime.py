@@ -94,6 +94,24 @@ def pl_col_date(df, op: str, value: date):
     return col >= value if op == ">=" else col <= value
 
 
+def _filter_history_window(
+    df: pl.DataFrame,
+    *,
+    start: date | None,
+    end: date | None,
+    limit: int | None,
+) -> pl.DataFrame:
+    """按日期范围或最近 N 个不同交易日裁剪时序数据。"""
+    if start:
+        df = df.filter(pl_col_date(df, ">=", start))
+    if end:
+        df = df.filter(pl_col_date(df, "<=", end))
+    if start is None and end is None and limit is not None:
+        recent_dates = df.select("date").unique().sort("date", descending=True).head(limit)
+        df = df.join(recent_dates, on="date", how="semi")
+    return df
+
+
 @router.get("/latest")
 def regime_latest(request: Request):
     """最新一日环境(轻量)。"""
@@ -189,6 +207,7 @@ def regime_phases(
     request: Request,
     start: date | None = None,
     end: date | None = None,
+    limit: Annotated[int | None, Query(ge=1, le=1000)] = None,
 ):
     """情绪周期阶段段列表: 连续同阶段合段, 附段内均值指标与主导主线。
 
@@ -202,11 +221,7 @@ def regime_phases(
     df = regime_builder.load_regime_history(data_dir)
     if df.is_empty() or "phase" not in df.columns:
         return {"segments": [], "total": 0}
-    if start:
-        df = df.filter(pl_col_date(df, ">=", start))
-    if end:
-        df = df.filter(pl_col_date(df, "<=", end))
-    df = df.sort("date")
+    df = _filter_history_window(df, start=start, end=end, limit=limit).sort("date")
     if df.is_empty():
         return {"segments": [], "total": 0}
 
@@ -328,6 +343,7 @@ def regime_mainline(
     end: date | None = None,
     top: Annotated[int, Query(ge=1, le=30)] = 10,
     kind: Annotated[str, Query(pattern="^(concept|industry)$")] = "concept",
+    limit: Annotated[int | None, Query(ge=1, le=1000)] = None,
 ):
     """每日主线排行(截 rank<=top) + 窗口内持续性汇总。
 
@@ -344,11 +360,7 @@ def regime_mainline(
     df = load_mainline_history(_data_dir(request), kind)
     if df.is_empty():
         return {"rows": [], "leaders": [], "membership_note": MEMBERSHIP_NOTE, "filter": filter_cfg}
-    if start:
-        df = df.filter(pl_col_date(df, ">=", start))
-    if end:
-        df = df.filter(pl_col_date(df, "<=", end))
-    df = df.sort(["date", "rank"])
+    df = _filter_history_window(df, start=start, end=end, limit=limit).sort(["date", "rank"])
     rows_df = df.filter(pl.col("rank") <= top)
     leaders = (
         df.filter(pl.col("rank") == 1)

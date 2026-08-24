@@ -171,18 +171,18 @@ export function Regime() {
   })
   // 情绪周期阶段段 + 主线排行(与 history 同一时间范围)
   const phases = useQuery({
-    queryKey: QK.regimePhases(histRange.start, histRange.end),
-    queryFn: () => api.regimePhases(histRange.start, histRange.end),
+    queryKey: QK.regimePhases(histRange.start, histRange.end, histRange.limit),
+    queryFn: () => api.regimePhases(histRange.start, histRange.end, histRange.limit),
     staleTime: 5 * 60 * 1000,
   })
   const [mainlineKind, setMainlineKind] = useState<'concept' | 'industry'>('concept')
   const [filterOpen, setFilterOpen] = useState(false)
   // 时间轴点击选中的交易日 (当日快照联动); null = 未选。窗口切换后失效。
   const [selDate, setSelDate] = useState<string | null>(null)
-  useEffect(() => { setSelDate(null) }, [histRange.start, histRange.end])
+  useEffect(() => { setSelDate(null) }, [histRange.start, histRange.end, histRange.limit])
   const mainline = useQuery({
-    queryKey: QK.regimeMainline(mainlineKind, histRange.start, histRange.end),
-    queryFn: () => api.regimeMainline(histRange.start, histRange.end, 10, mainlineKind),
+    queryKey: QK.regimeMainline(mainlineKind, histRange.start, histRange.end, histRange.limit),
+    queryFn: () => api.regimeMainline(histRange.start, histRange.end, 10, mainlineKind, histRange.limit),
     staleTime: 5 * 60 * 1000,
   })
   const [recomputing, setRecomputing] = useState(false)

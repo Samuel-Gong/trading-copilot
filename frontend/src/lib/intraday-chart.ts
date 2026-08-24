@@ -3,8 +3,8 @@ import type { MinuteKlineRow } from '@/lib/api'
 export function formatMinuteTime(datetime: string): string {
   const match = datetime.match(/(\d{2}):(\d{2})/)
   if (!match) return datetime.slice(11, 16)
-  const hour = (parseInt(match[1]) + 8) % 24
-  return `${String(hour).padStart(2, '0')}:${match[2]}`
+  // 后端分钟 canonical 已统一为无时区的 Asia/Shanghai 墙钟时间。
+  return `${match[1]}:${match[2]}`
 }
 
 export function computeIntradayAverage(data: MinuteKlineRow[]): number[] {
