@@ -1093,14 +1093,11 @@ def load_benchmark_momentum(data_dir: Path) -> pl.DataFrame | None:
         )
         if not df_idx.is_empty():
             available = set(df_idx["symbol"].to_list())
-            picked = [s for s in wanted if s in available]
-            # 每个交易所取优先级最高的可用基准; 全缺时回退到任一可用基准。
-            # 同一基准可服务多个交易所 (如北证50 缺失时北交所回退上证指数)。
+            # 每个交易所仅在声明的候选内取优先级最高者；全缺时保持不可计算。
+            # 同一基准仍可被多个交易所显式声明（如北交所回退上证指数）。
             pairs: list[tuple[str, str]] = []
             for exchange, candidates in _BENCHMARK_PREFERENCE.items():
                 hit = next((s for s in candidates if s in available), None)
-                if hit is None and picked:
-                    hit = picked[0]
                 if hit is not None:
                     pairs.append((hit, exchange))
             df_bench = df_idx.filter(pl.col("symbol").is_in([p[0] for p in pairs]))
@@ -1175,26 +1172,32 @@ def attach_deviation_columns(df: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
     return out
 
 
-def _bench_rt_pct_of(index_quotes: pl.DataFrame | None, candidates: list[str]) -> float:
-    """从实时指数行情取某交易所首选基准的今日涨跌, 缺数据时 0。"""
+def _bench_rt_pct_of(
+    index_quotes: pl.DataFrame | None,
+    candidates: list[str],
+) -> float | None:
+    """读取首选实时指数的小数收益率；缺数据时保持不可用。"""
     if index_quotes is None or index_quotes.is_empty():
-        return 0.0
+        return None
     df = index_quotes.filter(pl.col("symbol").is_in(candidates))
     if df.is_empty():
-        return 0.0
+        return None
     # 候选按优先级排序, 取第一个有有效涨跌的
     by_sym = {r["symbol"]: r for r in df.iter_rows(named=True)}
     for sym in candidates:
         row = by_sym.get(sym)
         if row is None:
             continue
+        close = row.get("close")
+        prev_close = row.get("prev_close")
+        if close is not None and prev_close not in (None, 0):
+            return float(close / prev_close - 1)
         for col in ("change_pct", "pct", "pct_change"):
             v = row.get(col)
             if v is not None:
-                return float(v)
-        if row.get("close") is not None and row.get("prev_close") is not None and row["prev_close"]:
-            return float(row["close"] / row["prev_close"] - 1)
-    return 0.0
+                # QuoteService 的指数缓存使用百分数值（1.0 = 1%）。
+                return float(v) / 100.0
+    return None
 
 
 def benchmark_momentum_today(
@@ -1226,6 +1229,8 @@ def benchmark_momentum_today(
             continue
         yesterday_close = closes[-1]
         rt = _bench_rt_pct_of(index_quotes, _BENCHMARK_PREFERENCE.get(ex, []))
+        if rt is None:
+            continue
         row: dict[str, float | str] = {
             "bench_exchange": ex,
         }

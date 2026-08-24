@@ -88,20 +88,19 @@ def _write_sh_bench(tmp_path) -> None:
 
 def test_benchmark_momentum_today_math(tmp_path) -> None:
     _write_sh_bench(tmp_path)
-    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [0.10]})
+    # QuoteService 指数缓存使用百分数值: 1.0 = 1%。
+    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [1.0]})
 
     out = benchmark_momentum_today(tmp_path, quotes)
     row = out.row(0, named=True)
-    # 今收 = 15 x 1.10 = 16.5; 3 个交易日前的收盘 = 13 (与全量路径 shift(3) 同口径)
-    # mom3d = 16.5/13 - 1
-    assert abs(row["bench_mom3d"] - (16.5 / 13 - 1)) < 1e-9
+    # 今收 = 15 x 1.01 = 15.15; 3 个交易日前的收盘 = 13。
+    assert abs(row["bench_mom3d"] - (15.15 / 13 - 1)) < 1e-9
     # 10/30 日窗口收盘数不足 → null
     assert row["bench_mom10d"] is None
     assert row["bench_mom30d"] is None
 
-    # 无实时行情 → rt 按 0 处理: mom3d = 15/13 - 1
-    out0 = benchmark_momentum_today(tmp_path, None)
-    assert abs(out0.row(0, named=True)["bench_mom3d"] - (15.0 / 13 - 1)) < 1e-9
+    # 无实时行情必须 fail-closed，不能静默假设指数平盘。
+    assert benchmark_momentum_today(tmp_path, None) is None
 
 
 def test_benchmark_momentum_today_excludes_today_rows(tmp_path) -> None:
@@ -111,13 +110,30 @@ def test_benchmark_momentum_today_excludes_today_rows(tmp_path) -> None:
     rows.append(("000001.SH", today, 99.0))  # 今日脏行
     _write_index_daily(tmp_path, rows)
 
-    out = benchmark_momentum_today(tmp_path, None)
+    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [0.0]})
+    out = benchmark_momentum_today(tmp_path, quotes)
     assert abs(out.row(0, named=True)["bench_mom3d"] - (15.0 / 13 - 1)) < 1e-9
+
+
+def test_benchmark_momentum_today_prefers_price_ratio(tmp_path) -> None:
+    _write_sh_bench(tmp_path)
+    quotes = pl.DataFrame(
+        {
+            "symbol": ["000001.SH"],
+            "close": [101.0],
+            "prev_close": [100.0],
+            "change_pct": [99.0],
+        }
+    )
+
+    out = benchmark_momentum_today(tmp_path, quotes)
+
+    assert abs(out.row(0, named=True)["bench_mom3d"] - (15.15 / 13 - 1)) < 1e-9
 
 
 def test_attach_deviation_columns_today(tmp_path) -> None:
     _write_sh_bench(tmp_path)
-    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [0.10]})
+    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [1.0]})
     # 单日帧: 增量路径产出的 momentum 列 (无 date 历史, 无法 shift 补算)
     today_df = pl.DataFrame(
         {
@@ -128,10 +144,10 @@ def test_attach_deviation_columns_today(tmp_path) -> None:
         }
     )
     out = attach_deviation_columns_today(today_df, tmp_path, quotes)
-    # SH: 0.5 - (16.5/13 - 1)
-    assert abs(out["deviate_3d"][0] - (0.5 - (16.5 / 13 - 1))) < 1e-9
-    # SZ 无深证基准 → 按选基设计回退上证基准 (rt=0): 0.2 - (15/13 - 1)
-    assert abs(out["deviate_3d"][1] - (0.2 - (15.0 / 13 - 1))) < 1e-9
+    # SH: 0.5 - (15.15/13 - 1)
+    assert abs(out["deviate_3d"][0] - (0.5 - (15.15 / 13 - 1))) < 1e-9
+    # SZ 没有声明候选基准时保持不可计算，不得跨交易所回填沪指。
+    assert out["deviate_3d"][1] is None
     assert "bench_close" not in out.columns
 
 
@@ -146,7 +162,8 @@ def test_attach_deviation_columns_today_missing_momentum(tmp_path) -> None:
             "momentum_30d": [1.0],
         }
     )
-    out = attach_deviation_columns_today(df, tmp_path, None)
+    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [0.0]})
+    out = attach_deviation_columns_today(df, tmp_path, quotes)
     assert out["deviate_3d"][0] is None
     assert out["deviate_10d"][0] is not None
     assert out["deviate_30d"][0] is not None
@@ -166,6 +183,14 @@ def test_attach_deviation_columns_no_bench_close_leak(tmp_path) -> None:
     assert "bench_close" not in out.columns
     frame = load_benchmark_momentum(tmp_path)
     assert "bench_close" in frame.columns
+
+
+def test_load_benchmark_momentum_does_not_crossfill_missing_sz(tmp_path) -> None:
+    _write_sh_bench(tmp_path)
+
+    frame = load_benchmark_momentum(tmp_path)
+
+    assert "SZ" not in set(frame["bench_exchange"].to_list())
 
 
 def test_board_and_st_rules() -> None:
