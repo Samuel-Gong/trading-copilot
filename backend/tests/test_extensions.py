@@ -271,3 +271,42 @@ def test_extension_dynamic_route_allowed_when_converters_are_disjoint() -> None:
     registrar.include_router(router)
 
     _validate_router_conflicts(app, registrar)
+
+
+def test_extension_path_converter_route_rejected_when_globs_overlap() -> None:
+    app = FastAPI()
+
+    @app.get("/a/{value:path}/foo")
+    def get_core_path(value: str) -> dict:
+        return {"value": value}
+
+    registrar = _registrar()
+    router = APIRouter()
+
+    @router.get("/a/bar/{value:path}")
+    def get_extension_path(value: str) -> dict:
+        return {"value": value}
+
+    registrar.include_router(router)
+
+    with pytest.raises(ValueError, match=r"GET /a/bar/\{value:path\}"):
+        _validate_router_conflicts(app, registrar)
+
+
+def test_extension_path_converter_route_allowed_when_prefixes_are_disjoint() -> None:
+    app = FastAPI()
+
+    @app.get("/api/files/{value:path}")
+    def get_core_path(value: str) -> dict:
+        return {"value": value}
+
+    registrar = _registrar()
+    router = APIRouter()
+
+    @router.get("/api/users/{value:path}")
+    def get_extension_path(value: str) -> dict:
+        return {"value": value}
+
+    registrar.include_router(router)
+
+    _validate_router_conflicts(app, registrar)

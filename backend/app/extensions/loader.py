@@ -94,18 +94,21 @@ def _route_paths_overlap(left: APIRoute, right: APIRoute) -> bool:
     left_segments = _simple_route_segments(left)
     right_segments = _simple_route_segments(right)
     if left_segments is not None and right_segments is not None:
-        if len(left_segments) != len(right_segments):
-            return False
-        return all(
-            _simple_segments_overlap(left_segment, right_segment)
-            for left_segment, right_segment in zip(left_segments, right_segments, strict=True)
-        )
+        return _route_segment_patterns_overlap(left_segments, right_segments)
     left_sample = _route_sample_path(left)
     right_sample = _route_sample_path(right)
-    return bool(
+    samples_overlap = bool(
         left.path_regex.fullmatch(right_sample)
         or right.path_regex.fullmatch(left_sample)
     )
+    if samples_overlap:
+        return True
+    if any(
+        type(convertor).__name__ == "PathConvertor"
+        for convertor in (*left.param_convertors.values(), *right.param_convertors.values())
+    ):
+        return _complex_path_templates_may_overlap(left.path, right.path)
+    return False
 
 
 _FULL_PATH_PARAMETER = re.compile(r"^\{([^}:]+)(?::([^}]+))?\}$")
@@ -124,7 +127,7 @@ _CONVERTER_WITNESSES = (
 
 
 def _simple_route_segments(route: APIRoute) -> list[str | object] | None:
-    """解析不跨斜杠的静态段或单转换器段；复杂模板交给正则样例回退。"""
+    """解析静态段或单转换器段；段内混合模板交给保守回退。"""
     segments: list[str | object] = []
     for segment in route.path.split("/"):
         match = _FULL_PATH_PARAMETER.fullmatch(segment)
@@ -134,10 +137,45 @@ def _simple_route_segments(route: APIRoute) -> list[str | object] | None:
             segments.append(segment)
             continue
         convertor = route.param_convertors.get(match.group(1))
-        if convertor is None or type(convertor).__name__ == "PathConvertor":
+        if convertor is None:
             return None
         segments.append(convertor)
     return segments
+
+
+def _route_segment_patterns_overlap(
+    left: list[str | object],
+    right: list[str | object],
+) -> bool:
+    """用有限状态乘积判断两个分段路径模板是否存在共同请求路径。"""
+    pending = [(0, 0)]
+    visited: set[tuple[int, int]] = set()
+    while pending:
+        state = pending.pop()
+        if state in visited:
+            continue
+        visited.add(state)
+        left_index, right_index = state
+        if left_index == len(left) and right_index == len(right):
+            return True
+        for left_next, left_segment in _segment_transitions(left, left_index):
+            for right_next, right_segment in _segment_transitions(right, right_index):
+                if _simple_segments_overlap(left_segment, right_segment):
+                    pending.append((left_next, right_next))
+    return False
+
+
+def _segment_transitions(
+    segments: list[str | object],
+    index: int,
+) -> tuple[tuple[int, str | object], ...]:
+    if index >= len(segments):
+        return ()
+    segment = segments[index]
+    if type(segment).__name__ == "PathConvertor":
+        # `path` 可吞掉当前及后续 URL 段，但模板中的这一段本身不能消失。
+        return ((index, segment), (index + 1, segment))
+    return ((index + 1, segment),)
 
 
 def _simple_segments_overlap(left: str | object, right: str | object) -> bool:
@@ -162,6 +200,17 @@ def _simple_segments_overlap(left: str | object, right: str | object) -> bool:
         return False
     # 自定义转换器没有可证明的交集算法时 fail-closed，避免注册不可达路由。
     return True
+
+
+def _complex_path_templates_may_overlap(left: str, right: str) -> bool:
+    """段内混合 path 模板只有在字面前后缀可证明冲突时才放行。"""
+    left_prefix = left.split("{", 1)[0]
+    right_prefix = right.split("{", 1)[0]
+    if not (left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)):
+        return False
+    left_suffix = left.rsplit("}", 1)[-1]
+    right_suffix = right.rsplit("}", 1)[-1]
+    return left_suffix.endswith(right_suffix) or right_suffix.endswith(left_suffix)
 
 
 def _route_sample_path(route: APIRoute) -> str:
