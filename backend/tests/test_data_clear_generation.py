@@ -152,3 +152,27 @@ def test_clear_data_keeps_generation_publishing_after_partial_delete(
     assert marker["state"] == "publishing"
     with pytest.raises(EnrichedGenerationUnavailableError, match="being published"):
         get_enriched_generation(tmp_path, "stock")
+
+
+def test_clear_data_recovers_stale_etf_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_clear_side_effects(monkeypatch)
+    repo = _RepoStub(tmp_path)
+    target = tmp_path / "kline_etf_enriched" / "date=2026-08-14" / "part.parquet"
+    _write_parquet_placeholder(target)
+    marker = {
+        "state": "publishing",
+        "generation": "stale-generation",
+        "publication_id": "stale-publication",
+        "owner_pid": -1,
+        "updated_at_ns": 0,
+    }
+    (tmp_path / ".matrix_generation_etf.json").write_text(
+        json.dumps(marker), encoding="utf-8"
+    )
+
+    assert data_api.clear_data(_request(repo)) == {"deleted_files": 1}
+    assert not target.exists()
+    assert get_enriched_generation(tmp_path, "etf") != "stale-generation"

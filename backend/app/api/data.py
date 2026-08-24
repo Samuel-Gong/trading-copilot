@@ -647,8 +647,8 @@ def clear_data(request: Request):
     data_dir = repo.store.data_dir
     deleted = 0
     publications = {
-        "kline_daily_enriched": EnrichedPublication(data_dir, "stock"),
-        "kline_etf_enriched": EnrichedPublication(data_dir, "etf"),
+        "kline_daily_enriched": EnrichedPublication(data_dir, "stock", recover=True),
+        "kline_etf_enriched": EnrichedPublication(data_dir, "etf", recover=True),
     }
 
     for sub in (

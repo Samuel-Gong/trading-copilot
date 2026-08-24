@@ -55,6 +55,8 @@ def test_minute_range_returns_latest_sessions_with_previous_closes():
             date(2026, 8, 7),
         ],
         "close": [9.9, 10.1, 11.1, 12.1],
+        # 模拟除权后价格减半；分时昨收必须保持未复权口径。
+        "raw_close": [19.8, 20.2, 22.2, 24.2],
     })
 
     result = kline_api.get_minute_range(_request(repo), "600000.SH", 2)
@@ -67,10 +69,26 @@ def test_minute_range_returns_latest_sessions_with_previous_closes():
         "2026-08-07",
     ]
     assert [session["prev_close"] for session in result["sessions"]] == [
-        10.1,
-        11.1,
+        20.2,
+        22.2,
     ]
     assert result["sessions"][0]["rows"][0]["close"] == 11.1
+    assert repo.get_daily_asset.call_args.kwargs["columns"] == ["date", "raw_close"]
+
+
+def test_previous_closes_fail_closed_without_raw_close():
+    repo = MagicMock()
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 8, 5)],
+        "close": [10.1],
+    })
+
+    assert kline_api._get_previous_closes(
+        repo,
+        "600000.SH",
+        [date(2026, 8, 6)],
+        "stock",
+    ) == {date(2026, 8, 6): None}
 
 
 def test_minute_range_does_not_read_stock_store_for_index():

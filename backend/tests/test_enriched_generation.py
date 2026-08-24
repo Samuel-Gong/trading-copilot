@@ -121,6 +121,34 @@ def test_recovery_takes_over_when_owner_pid_is_dead_on_windows(tmp_path, monkeyp
     assert pl.read_parquet(out)["close"].item() == pytest.approx(10.0)
 
 
+def test_repository_etf_full_batch_recovers_incomplete_publication(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repo = KlineRepository(DataStore(tmp_path))
+    first = _frame(10.0).with_columns(pl.lit(date(2026, 8, 13)).alias("date"))
+    second = _frame(11.0)
+    full_batch = pl.concat([first, second])
+    original_write = pl.DataFrame.write_parquet
+
+    def fail_second(self, path, *args, **kwargs):
+        if "2026-08-14" in str(path):
+            raise OSError("injected ETF write failure")
+        return original_write(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", fail_second)
+    with pytest.raises(OSError, match="injected ETF"):
+        repo.append_etf_enriched(full_batch)
+
+    monkeypatch.setattr(pl.DataFrame, "write_parquet", original_write)
+    repo.append_etf_enriched(full_batch)
+
+    assert get_enriched_generation(tmp_path, "etf")
+    for trade_date, expected in (("2026-08-13", 10.0), ("2026-08-14", 11.0)):
+        out = tmp_path / "kline_etf_enriched" / f"date={trade_date}" / "part.parquet"
+        assert pl.read_parquet(out)["close"].item() == pytest.approx(expected)
+
+
 def test_panel_cache_generation_change_forces_recompute() -> None:
     cache = PanelCache()
     calls: list[int] = []

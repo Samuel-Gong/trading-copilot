@@ -2219,7 +2219,11 @@ class KlineRepository:
             "kline_etf_enriched": "etf",
         }.get(table)
         publication = (
-            EnrichedPublication(self.store.data_dir, generation_asset)
+            EnrichedPublication(
+                self.store.data_dir,
+                generation_asset,
+                recover=generation_asset == "etf",
+            )
             if generation_asset is not None
             else None
         )
