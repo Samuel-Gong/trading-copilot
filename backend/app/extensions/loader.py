@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import logging
 import pkgutil
+import re
 from dataclasses import dataclass
 
 from fastapi import FastAPI
@@ -65,25 +66,54 @@ def configure_backend_extensions(
 
 
 def _validate_router_conflicts(app: FastAPI, registrar: BackendExtensionRegistrar) -> None:
-    existing = {
-        (route.path, method)
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        for method in route.methods
-    }
-    staged: set[tuple[str, str]] = set()
+    existing: dict[str, list[APIRoute]] = {}
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for method in route.methods:
+            existing.setdefault(method, []).append(route)
+    staged: dict[str, list[APIRoute]] = {}
     for router in registrar.routers:
         for route in router.routes:
             if not isinstance(route, APIRoute):
                 continue
             for method in route.methods:
-                key = (route.path, method)
-                if key in existing or key in staged:
+                candidates = existing.get(method, []) + staged.get(method, [])
+                if any(_route_paths_overlap(route, candidate) for candidate in candidates):
                     raise ValueError(
                         f"extension {registrar.extension_id!r} route conflicts: "
                         f"{method} {route.path}"
                     )
-                staged.add(key)
+                staged.setdefault(method, []).append(route)
+
+
+def _route_paths_overlap(left: APIRoute, right: APIRoute) -> bool:
+    """判断两个 FastAPI 路径模板是否可能匹配同一请求路径。"""
+    if left.path == right.path:
+        return True
+    left_sample = _route_sample_path(left)
+    right_sample = _route_sample_path(right)
+    return bool(
+        left.path_regex.fullmatch(right_sample)
+        or right.path_regex.fullmatch(left_sample)
+    )
+
+
+def _route_sample_path(route: APIRoute) -> str:
+    """为 Starlette 内置路径转换器生成一个可匹配的代表路径。"""
+    samples = {
+        "str": "sample",
+        "path": "sample/path",
+        "int": "1",
+        "float": "1.0",
+        "uuid": "00000000-0000-0000-0000-000000000001",
+    }
+
+    def replace(match: re.Match[str]) -> str:
+        converter = match.group(2) or "str"
+        return samples.get(converter, "sample")
+
+    return re.sub(r"\{([^}:]+)(?::([^}]+))?\}", replace, route.path)
 
 
 def start_backend_extensions(

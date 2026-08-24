@@ -251,6 +251,7 @@ def build_fundamental_matrices(
         for column, target in raw_columns.items():
             value = events[column][row_index]
             if value is None or not np.isfinite(float(value)):
+                target[start:, column_index] = np.nan
                 continue
             target[start:, column_index] = float(value)
 

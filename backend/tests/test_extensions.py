@@ -10,7 +10,7 @@ from app.extensions.contracts import (
     NotificationFormatContext,
     NotificationFormatter,
 )
-from app.extensions.loader import configure_backend_extensions
+from app.extensions.loader import _validate_router_conflicts, configure_backend_extensions
 from app.extensions.registry import BackendExtensionRegistrar, BackendExtensionRegistry
 from app.services.quote_service import QuoteService
 
@@ -152,3 +152,42 @@ def test_loader_isolates_failed_setup_and_registers_valid_route(
     assert len(errors) == 1
     assert errors[0].module == broken.__name__
     assert any(getattr(route, "path", None) == "/api/custom/valid/status" for route in app.routes)
+
+
+def test_extension_static_route_rejected_when_core_dynamic_route_matches() -> None:
+    app = FastAPI()
+
+    @app.delete("/api/watchlist/{symbol}")
+    def delete_watchlist(symbol: str) -> dict:
+        return {"symbol": symbol}
+
+    registrar = _registrar()
+    router = APIRouter(prefix="/api/watchlist")
+
+    @router.delete("/special")
+    def delete_special() -> dict:
+        return {"ok": True}
+
+    registrar.include_router(router)
+
+    with pytest.raises(ValueError, match=r"DELETE /api/watchlist/special"):
+        _validate_router_conflicts(app, registrar)
+
+
+def test_extension_static_route_allowed_when_core_converter_cannot_match() -> None:
+    app = FastAPI()
+
+    @app.delete("/api/items/{item_id:int}")
+    def delete_item(item_id: int) -> dict:
+        return {"item_id": item_id}
+
+    registrar = _registrar()
+    router = APIRouter(prefix="/api/items")
+
+    @router.delete("/special")
+    def delete_special() -> dict:
+        return {"ok": True}
+
+    registrar.include_router(router)
+
+    _validate_router_conflicts(app, registrar)

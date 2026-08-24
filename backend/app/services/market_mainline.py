@@ -75,6 +75,48 @@ def mainline_path(data_dir: Path) -> Path:
     return data_dir / MAINLINE_DIR / "part.parquet"
 
 
+def mainline_coverage_path(data_dir: Path) -> Path:
+    """增量计算完成水位；与有无主线结果解耦。"""
+    return data_dir / MAINLINE_DIR / "coverage.parquet"
+
+
+def _processed_mainline_dates(data_dir: Path, kind: str) -> set[date]:
+    path = mainline_coverage_path(data_dir)
+    if not path.exists():
+        return set()
+    try:
+        frame = pl.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("load mainline coverage failed: %s", exc)
+        return set()
+    if not {"date", "kind"}.issubset(frame.columns):
+        return set()
+    return set(
+        frame.filter(pl.col("kind") == kind)["date"].cast(pl.Date).to_list()
+    )
+
+
+def _mark_mainline_dates_processed(
+    data_dir: Path,
+    kind: str,
+    dates: set[date],
+) -> None:
+    if not dates:
+        return
+    path = mainline_coverage_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    incoming = pl.DataFrame({
+        "date": sorted(dates),
+        "kind": [kind] * len(dates),
+    })
+    old = pl.read_parquet(path) if path.exists() else pl.DataFrame()
+    combined = incoming if old.is_empty() else pl.concat(
+        [old.select(["date", "kind"]), incoming],
+        how="vertical_relaxed",
+    )
+    combined.unique(subset=["date", "kind"]).sort(["date", "kind"]).write_parquet(path)
+
+
 _ST_SYMBOLS_CACHE: tuple[float, frozenset[str]] | None = None
 
 
@@ -422,11 +464,14 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
     enriched_dates = enriched_date_set(repo)
     existing = load_mainline_history(data_dir, kind)
     existing_dates = set(existing["date"].to_list()) if not existing.is_empty() else set()
-    missing = sorted(d for d in enriched_dates if d not in existing_dates and d <= today)
+    processed_dates = _processed_mainline_dates(data_dir, kind)
+    completed_dates = existing_dates | processed_dates
+    missing = sorted(d for d in enriched_dates if d not in completed_dates and d <= today)
     if not missing:
         return pl.DataFrame()
     logger.info("mainline incremental(%s): compute %d days", kind, len(missing))
     new_rows = compute_mainline_range(repo, data_dir, missing[0], missing[-1], kind=kind)
     if not new_rows.is_empty():
         upsert_mainline_history(data_dir, new_rows)
+    _mark_mainline_dates_processed(data_dir, kind, set(missing))
     return new_rows

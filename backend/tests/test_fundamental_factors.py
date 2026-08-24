@@ -93,6 +93,33 @@ def test_attach_replaces_with_newer_announcement():
     assert roe[15] == 33.0           # 4-16 起新公告生效
 
 
+def test_matrix_newer_null_metric_clears_older_forward_fill():
+    """新报告的空指标生效后，矩阵路径必须清除旧报告值。"""
+    panel = _daily_panel(date(2026, 4, 1), 16, ("600000.SH",))
+    snapshot = _snapshot_frame([
+        {
+            "symbol": "600000.SH",
+            "period_end": "2025-12-31",
+            "announce": "2026-04-02",
+            "roe": 20.0,
+        },
+        {
+            "symbol": "600000.SH",
+            "period_end": "2026-03-31",
+            "announce": "2026-04-10",
+            "roe": None,
+        },
+    ])
+
+    attached = attach_fundamental_factors(panel, snapshot, ["roe_latest"]).sort("date")
+    matrix = build_fundamental_matrices(
+        build_market_data_matrix(panel), snapshot, ["roe_latest"],
+    )["roe_latest"]
+
+    assert attached.filter(pl.col("date") == date(2026, 4, 11))["roe_latest"].item() is None
+    assert np.isnan(matrix[10:, 0]).all()
+
+
 def test_attach_without_snapshot_keeps_null_columns():
     panel = _daily_panel(date(2026, 4, 1), 5, ("600000.SH",))
     attached = attach_fundamental_factors(panel, None, ["roe_latest", "pb_latest"])
