@@ -177,25 +177,25 @@ def _bench_rt_pcts(quote_service: Any) -> dict[str, float | None]:
     return result
 
 
-def _today_stock_pcts(quote_service: Any) -> dict[str, float]:
-    """读取当日标准化个股行情; 日期或字段不可信时返回空映射。"""
+def _today_stock_rows(quote_service: Any) -> dict[str, dict[str, Any]]:
+    """读取当日标准化个股行情与滚动偏离值。"""
     try:
         frame, quote_date = quote_service.get_enriched_today()
     except Exception:
         return {}
     if quote_date != cn_today() or frame is None or frame.is_empty() or "symbol" not in frame.columns:
         return {}
-    rows: dict[str, float] = {}
+    rows: dict[str, dict[str, Any]] = {}
     for row in frame.iter_rows(named=True):
-        value = _row_change_pct(row, percent_value=False)
-        if value is not None:
-            rows[str(row["symbol"])] = value
+        rows[str(row["symbol"])] = {
+            "close": row.get("close"),
+            "rt_pct": _row_change_pct(row, percent_value=False),
+            **{
+                f"deviate_{window}d": row.get(f"deviate_{window}d")
+                for window in DEVIATION_WINDOWS
+            },
+        }
     return rows
-
-
-def _symbol_exchange(symbol: str) -> str | None:
-    exchange = symbol.rsplit(".", 1)[-1].upper() if "." in symbol else ""
-    return exchange if exchange in _BENCHMARK_PREFERENCE else None
 
 
 def build_overview(
@@ -217,8 +217,8 @@ def build_overview(
         if quote_service is not None
         else {exchange: None for exchange in _BENCHMARK_PREFERENCE}
     )
-    today_stock_pcts = (
-        _today_stock_pcts(quote_service)
+    today_stock_rows = (
+        _today_stock_rows(quote_service)
         if quote_service is not None and not includes_today
         else {}
     )
@@ -228,26 +228,22 @@ def build_overview(
         rule = rule_for(symbol, base.get("name"))
         if includes_today:
             rt_pct = base.get("rt_pct")
-            rt_delta = 0.0
+            current = base
+            close = base.get("close")
         else:
-            rt_pct = today_stock_pcts.get(symbol)
-            if rt_pct is None:
-                # 历史分区的 change_pct 属于旧交易日, 不能冒充当日行情。
+            current = today_stock_rows.get(symbol)
+            if current is None:
+                # 历史分区的指标属于旧交易日, 不能冒充当日滚动窗口。
                 continue
-            exchange = _symbol_exchange(symbol)
-            bench_rt = bench_rt_by_exchange.get(exchange)
-            if bench_rt is None:
-                # 无对应实时基准时无法按交易所口径续算, 避免产生错误通知。
-                continue
-            rt_delta = rt_pct - bench_rt
+            rt_pct = current.get("rt_pct")
+            close = current.get("close") or base.get("close")
 
         windows: dict[str, dict[str, Any]] = {}
         max_closeness = 0.0
         for n in DEVIATION_WINDOWS:
-            hist_dev = base.get(f"deviate_{n}d")
-            if hist_dev is None:
+            live = current.get(f"deviate_{n}d")
+            if live is None:
                 continue
-            live = hist_dev + rt_delta
             up_t, down_t = rule.thresholds[n]
             threshold = up_t if live >= 0 else down_t
             closeness = abs(live) / threshold if threshold > 0 else 0.0
@@ -264,7 +260,7 @@ def build_overview(
             "name": base.get("name"),
             "board": rule.board,
             "st": rule.st,
-            "close": base.get("close"),
+            "close": close,
             "rt_pct": rt_pct,
             "windows": windows,
             "max_closeness": round(max_closeness, 4),

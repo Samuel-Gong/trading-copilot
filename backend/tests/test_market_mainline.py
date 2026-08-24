@@ -119,6 +119,37 @@ class TestComputeMainline:
         # 同日重算不产生重复行
         assert stored.filter(pl.col("date") == d1).height == first.height
 
+    def test_range_replace_clears_stale_rows_when_recompute_is_empty(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """指定范围重算为空时，也必须删除该维度的历史旧行。"""
+        repo, d1, d2 = self._setup(tmp_path, monkeypatch)
+        rows = market_mainline.compute_mainline_range(
+            repo,
+            tmp_path,
+            d1,
+            d2,
+            kind="concept",
+            filter_cfg={"min_members": 1, "max_members": 5000, "blacklist": []},
+        )
+        industry = rows.with_columns(pl.lit("industry").alias("kind"))
+        market_mainline.upsert_mainline_history(tmp_path, rows)
+        market_mainline.upsert_mainline_history(tmp_path, industry)
+
+        market_mainline.replace_mainline_history_range(
+            tmp_path,
+            pl.DataFrame(),
+            start=d1,
+            end=d2,
+            kind="concept",
+        )
+
+        stored = pl.read_parquet(market_mainline.mainline_path(tmp_path))
+        assert stored.filter(pl.col("kind") == "concept").is_empty()
+        assert not stored.filter(pl.col("kind") == "industry").is_empty()
+
     def test_incremental_fills_missing_days(self, tmp_path, monkeypatch):
         repo, d1, d2 = self._setup(tmp_path, monkeypatch)
         cfg = {"min_members": 4, "max_members": 600, "blacklist": []}

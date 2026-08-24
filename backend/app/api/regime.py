@@ -143,8 +143,8 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
       与 daily_pipeline 的增量补差(compute_regime_incremental)不同 —— 此接口面向
       人工「我要重新算一遍」的预期, 必须真正重算而非增量补缺口。
     - 传 start: 仅重算 [start, end] 区间。
-    - 重算后统一重标情绪周期阶段(refresh_phase_labels)并回填主线
-      (概念+行业, 概念成分为当前快照回看历史, 早年有归属漂移)。
+    - 重算后统一重标情绪周期阶段(refresh_phase_labels)并回填主线；概念/行业
+      仅使用带生效日期的 point-in-time 成分快照。
     """
     repo = request.app.state.repo
     data_dir = _data_dir(request)
@@ -166,9 +166,14 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
     mainline_rows = 0
     for kind in ("concept", "industry"):
         rows = market_mainline.compute_mainline_range(repo, data_dir, start, end, kind=kind)
-        if not rows.is_empty():
-            market_mainline.upsert_mainline_history(data_dir, rows)
-            mainline_rows += rows.height
+        market_mainline.replace_mainline_history_range(
+            data_dir,
+            rows,
+            start=start,
+            end=end,
+            kind=kind,
+        )
+        mainline_rows += rows.height
 
     invalidate_regime_cache()
     return {
@@ -305,9 +310,14 @@ def mainline_recompute(request: Request):
         computed = market_mainline.compute_mainline_range(
             repo, data_dir, earliest, date.today(), kind=kind
         )
-        if not computed.is_empty():
-            market_mainline.upsert_mainline_history(data_dir, computed)
-            rows += computed.height
+        market_mainline.replace_mainline_history_range(
+            data_dir,
+            computed,
+            start=earliest,
+            end=date.today(),
+            kind=kind,
+        )
+        rows += computed.height
     return {"ok": True, "rows": rows}
 
 
@@ -321,7 +331,7 @@ def regime_mainline(
 ):
     """每日主线排行(截 rank<=top) + 窗口内持续性汇总。
 
-    membership_note 说明概念成分口径(当前快照回看历史)。
+    membership_note 说明 point-in-time 概念成分口径。
     """
     from app.services.market_mainline import MEMBERSHIP_NOTE, load_mainline_history
 

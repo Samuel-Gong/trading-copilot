@@ -55,16 +55,10 @@ def test_incremental_share_sync_updates_existing_and_backfills_new_symbols(tmp_p
     def fake_fetch(table, symbols, capset, latest_only=True):
         assert table == "shares"
         calls.append((symbols, latest_only))
-        if latest_only:
-            return pl.DataFrame({
-                "symbol": ["600000.SH"],
-                "period_end": ["2024-06-30"],
-                "float_shares": [11.0],
-            })
         return pl.DataFrame({
-            "symbol": ["000001.SZ", "000001.SZ"],
-            "period_end": ["2023-12-31", "2024-06-30"],
-            "float_shares": [20.0, 21.0],
+            "symbol": ["600000.SH", "000001.SZ", "000001.SZ"],
+            "period_end": ["2024-06-30", "2023-12-31", "2024-06-30"],
+            "float_shares": [11.0, 20.0, 21.0],
         })
 
     monkeypatch.setattr(financial_sync, "_fetch_table", fake_fetch)
@@ -72,10 +66,48 @@ def test_incremental_share_sync_updates_existing_and_backfills_new_symbols(tmp_p
     rows = financial_sync.sync_shares(tmp_path, CapabilitySet())
 
     assert rows == 3
-    assert calls == [(["000001.SZ"], False), (["600000.SH"], True)]
+    assert calls == [(["600000.SH", "000001.SZ"], False)]
     stored = pl.read_parquet(path).sort(["symbol", "period_end"])
     assert stored.filter(pl.col("symbol") == "600000.SH")["float_shares"].to_list() == [11.0]
     assert stored.filter(pl.col("symbol") == "000001.SZ")["float_shares"].to_list() == [20.0, 21.0]
+
+
+def test_incremental_financial_sync_discovers_older_period_revision(
+    tmp_path,
+    monkeypatch,
+):
+    """较新报告期公布后，后续同步仍要发现旧报告期修订公告。"""
+    _write_instruments(tmp_path, ["600000.SH"])
+    path = tmp_path / "financials" / "metrics" / "part.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["600000.SH", "600000.SH"],
+        "period_end": ["2025-09-30", "2025-12-31"],
+        "announce_date": ["2025-10-20", "2026-01-20"],
+        "roe": [8.0, 9.0],
+    }).write_parquet(path)
+    calls: list[tuple[list[str], bool]] = []
+
+    def fake_fetch(table, symbols, capset, latest_only=True):
+        calls.append((symbols, latest_only))
+        if latest_only:
+            return pl.DataFrame()
+        return pl.DataFrame({
+            "symbol": ["600000.SH"],
+            "period_end": ["2025-09-30"],
+            "announce_date": ["2026-02-01"],
+            "roe": [8.5],
+        })
+
+    monkeypatch.setattr(financial_sync, "_fetch_table", fake_fetch)
+
+    rows = financial_sync.sync_metrics(tmp_path, CapabilitySet())
+
+    assert calls == [(["600000.SH"], False)]
+    assert rows == 3
+    stored = pl.read_parquet(path).sort(["period_end", "announce_date"])
+    revised = stored.filter(pl.col("period_end") == "2025-09-30")
+    assert revised["roe"].to_list() == [8.0, 8.5]
 
 
 def test_custom_financial_provider_receives_shares_contract(monkeypatch):

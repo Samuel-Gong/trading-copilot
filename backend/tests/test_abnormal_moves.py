@@ -216,6 +216,9 @@ class _FakeQuotes:
             {
                 "symbol": ["600000.SH", "300001.SZ", "000002.SZ"],
                 "change_pct": [0.05, 0.02, 0.01],
+                "deviate_3d": [0.20, 0.37, 0.06],
+                "deviate_10d": [1.0, 0.42, 0.21],
+                "deviate_30d": [1.96, 2.12, 0.61],
             }
         ), cn_today()
 
@@ -332,8 +335,8 @@ def test_build_overview_stale_snapshot_without_today_quote_fails_closed() -> Non
     assert result["rows"] == []
 
 
-def test_build_overview_uses_today_stock_quote_and_exchange_benchmark() -> None:
-    """盘中续算使用当日个股行情, 并按标的交易所选择实时基准。"""
+def test_build_overview_uses_standardized_today_deviations() -> None:
+    """盘中结果直接使用已按交易所基准标准化的今日偏离值。"""
     with _hist_cache_lock:
         _hist_cache.clear()
 
@@ -365,14 +368,53 @@ def test_build_overview_uses_today_stock_quote_and_exchange_benchmark() -> None:
                 {
                     "symbol": ["600000.SH", "000001.SZ"],
                     "change_pct": [0.02, 0.02],
+                    "deviate_3d": [0.20, 0.22],
+                    "deviate_10d": [None, None],
+                    "deviate_30d": [None, None],
                 }
             ), cn_today()
 
     result = build_overview(_FakeRepo(df), _ExchangeQuotes(), min_closeness=0.0)
     by_symbol = {row["symbol"]: row for row in result["rows"]}
-    # 沪股: 0.19 + 2% - 1% = 0.20; 深股: 0.19 + 2% - (-1%) = 0.22。
+    # QuoteService 已分别按沪、深基准产出 0.20 与 0.22。
     assert by_symbol["600000.SH"]["windows"]["3d"]["value"] == 0.20
     assert by_symbol["000001.SZ"]["windows"]["3d"]["value"] == 0.22
+
+
+def test_build_overview_uses_today_rolling_deviation_directly() -> None:
+    """昨日窗口滑出旧交易日后，直接采用今日标准化偏离值。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+    historical = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "name": ["沪股"],
+        "close": [10.0],
+        "change_pct": [0.01],
+        # 该旧值包含今日已经滑出 3 日窗口的交易日。
+        "deviate_3d": [0.19],
+        "deviate_10d": [None],
+        "deviate_30d": [None],
+    })
+
+    class _TodayRollingQuotes(_FakeQuotes):
+        def get_enriched_today(self):
+            return pl.DataFrame({
+                "symbol": ["600000.SH"],
+                "close": [10.2],
+                "change_pct": [0.02],
+                "deviate_3d": [0.07],
+                "deviate_10d": [None],
+                "deviate_30d": [None],
+            }), cn_today()
+
+    result = build_overview(
+        _FakeRepo(historical),
+        _TodayRollingQuotes(),
+        min_closeness=0.0,
+    )
+
+    assert result["rows"][0]["windows"]["3d"]["value"] == 0.07
 
 
 def test_build_overview_missing_exchange_benchmark_fails_closed() -> None:
@@ -398,7 +440,13 @@ def test_build_overview_missing_exchange_benchmark_fails_closed() -> None:
 
         def get_enriched_today(self):
             return pl.DataFrame(
-                {"symbol": ["000001.SZ"], "change_pct": [0.02]}
+                {
+                    "symbol": ["000001.SZ"],
+                    "change_pct": [0.02],
+                    "deviate_3d": [None],
+                    "deviate_10d": [None],
+                    "deviate_30d": [None],
+                }
             ), cn_today()
 
     result = build_overview(_FakeRepo(df), _MissingSzBenchmark(), min_closeness=0.0)

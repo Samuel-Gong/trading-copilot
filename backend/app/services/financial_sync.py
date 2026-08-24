@@ -68,8 +68,8 @@ def _fetch_table(
 
     # 自定义数据源分流
     if is_custom:
-        from app.services import preferences
         from app.data_providers import custom as custom_sources
+        from app.services import preferences
         try:
             provider = custom_sources.get_provider(preferences.get_financial_provider())
             df = provider.get_financials(table, symbols, latest_only=latest_only)
@@ -182,25 +182,17 @@ def _sync_history_table_for_symbols(
     data_dir: Path,
     capset: CapabilitySet,
 ) -> int:
-    """历史累积同步: 保留已有各期记录, 仅拉最新期 + 为新标的补全量历史。
+    """历史累积同步: 拉取完整公告版本集合并与本地历史合并。
 
-    与 shares 同一模式。若改为 latest_only 全量覆盖, 历史各期会在每次同步时
-    被冲掉, 财务因子将永远只有单期快照, 任何回测都是未来函数。
+    Provider 暂无按公告日增量接口。为发现较新报告期公布后的旧报告期修订，
+    既有标的也必须请求完整历史；写入前按公告版本去重，不覆盖本地独有记录。
     """
     existing = get_financial_df(data_dir, table)
     if existing.is_empty() or not {"symbol", "period_end"} <= set(existing.columns):
         return _sync_table(table, symbols, data_dir, capset, latest_only=False)
 
-    existing_symbols = set(existing["symbol"].drop_nulls().to_list())
-    missing_symbols = [symbol for symbol in symbols if symbol not in existing_symbols]
-    missing_history = (
-        _fetch_table(table, missing_symbols, capset, latest_only=False)
-        if missing_symbols
-        else pl.DataFrame()
-    )
-    current_symbols = [symbol for symbol in symbols if symbol in existing_symbols]
-    latest = _fetch_table(table, current_symbols, capset, latest_only=True)
-    merged = _merge_report_history(existing, missing_history, latest)
+    history = _fetch_table(table, symbols, capset, latest_only=False)
+    merged = _merge_report_history(existing, history)
     return _write_table(table, merged, data_dir)
 
 

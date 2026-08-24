@@ -360,6 +360,59 @@ def upsert_mainline_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
     combined.write_parquet(p)
 
 
+def replace_mainline_history_range(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    *,
+    start: date,
+    end: date,
+    kind: str,
+) -> None:
+    """以重算结果完整替换指定日期与维度范围，允许结果为空。"""
+    if start > end:
+        return
+    p = mainline_path(data_dir)
+    old = pl.read_parquet(p) if p.exists() else pl.DataFrame()
+    if old.is_empty() and new_rows.is_empty():
+        return
+
+    incoming = new_rows
+    if not incoming.is_empty():
+        incoming = incoming.filter(
+            (pl.col("date") >= start)
+            & (pl.col("date") <= end)
+            & (pl.col("kind") == kind)
+        )
+
+    if old.is_empty():
+        combined = incoming
+    else:
+        kept = old.filter(
+            ~(
+                (pl.col("date") >= start)
+                & (pl.col("date") <= end)
+                & (pl.col("kind") == kind)
+            )
+        )
+        if incoming.is_empty():
+            combined = kept
+        else:
+            target_cols = incoming.columns
+            kept = kept.select([
+                pl.col(column)
+                if column in kept.columns
+                else pl.lit(None).alias(column)
+                for column in target_cols
+            ])
+            combined = pl.concat(
+                [kept, incoming.select(target_cols)],
+                how="vertical_relaxed",
+            )
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    combined.sort(["date", "kind", "rank"]).write_parquet(p)
+
+
 def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = None,
                                  kind: str = "concept") -> pl.DataFrame:
     """增量补算主线(供 daily_pipeline / 手动触发): 补 enriched 已有而主线缺失的日。"""
