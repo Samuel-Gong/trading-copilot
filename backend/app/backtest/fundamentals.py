@@ -44,7 +44,7 @@ FUNDAMENTAL_FACTOR_NAMES = frozenset(FUNDAMENTAL_FACTORS)
 def load_fundamental_snapshot(data_dir: Path | None) -> pl.DataFrame | None:
     """读取财务指标快照; 文件缺失或无有效行时返回 None。
 
-    返回列: symbol, _announce (Date), 以及各因子对应的 metrics 列。
+    返回列: symbol, period_end, _announce (Date), 以及各因子对应的 metrics 列。
     """
     if data_dir is None:
         return None
@@ -56,7 +56,7 @@ def load_fundamental_snapshot(data_dir: Path | None) -> pl.DataFrame | None:
     except Exception as exc:
         logger.warning("读取财务指标快照失败: %s", exc)
         return None
-    needed = {"symbol", "announce_date"} | {
+    needed = {"symbol", "period_end", "announce_date"} | {
         spec["column"] for spec in FUNDAMENTAL_FACTORS.values()
     }
     if not needed.issubset(frame.columns):
@@ -69,13 +69,65 @@ def load_fundamental_snapshot(data_dir: Path | None) -> pl.DataFrame | None:
             & pl.col("announce_date").is_not_null()
         )
         .with_columns(
-            pl.col("announce_date").cast(pl.Utf8).str.slice(0, 10).str.to_date().alias("_announce")
+            pl.col("announce_date")
+            .cast(pl.Utf8)
+            .str.slice(0, 10)
+            .str.to_date()
+            .alias("_announce"),
+            pl.col("period_end")
+            .cast(pl.Utf8)
+            .str.slice(0, 10)
+            .str.to_date()
+            .alias("_period_end"),
         )
-        .sort(["symbol", "_announce"])
+        .filter(pl.col("_period_end").is_not_null())
+        .sort(["symbol", "_announce", "_period_end"])
     )
     if snapshot.is_empty():
         return None
     return snapshot
+
+
+def _active_fundamental_events(
+    snapshot: pl.DataFrame,
+    columns: list[str],
+) -> pl.DataFrame:
+    """保留会改变最新报告期因子值的公告事件。"""
+    required = {"symbol", "period_end", *columns}
+    if "_announce" not in snapshot.columns:
+        required.add("announce_date")
+    if not required.issubset(snapshot.columns):
+        return pl.DataFrame()
+
+    announce = (
+        pl.col("_announce").cast(pl.Date)
+        if "_announce" in snapshot.columns
+        else pl.col("announce_date").cast(pl.Utf8).str.slice(0, 10).str.to_date()
+    )
+    events = (
+        snapshot.select(
+            pl.col("symbol").cast(pl.Utf8),
+            announce.alias("_announce"),
+            pl.col("period_end")
+            .cast(pl.Utf8)
+            .str.slice(0, 10)
+            .str.to_date()
+            .alias("_period_end"),
+            *columns,
+        )
+        .filter(
+            pl.col("symbol").is_not_null()
+            & pl.col("_announce").is_not_null()
+            & pl.col("_period_end").is_not_null()
+        )
+        .sort(["symbol", "_announce", "_period_end"])
+        .with_columns(
+            pl.col("_period_end").cum_max().over("symbol").alias("_latest_period")
+        )
+        .filter(pl.col("_period_end") == pl.col("_latest_period"))
+        .drop("_latest_period")
+    )
+    return events
 
 
 def attach_fundamental_factors(
@@ -103,16 +155,27 @@ def attach_fundamental_factors(
     columns = sorted(
         {FUNDAMENTAL_FACTORS[name]["column"] for name in missing_columns}
     )
-    right = snapshot.select(["symbol", "_announce", *columns]).sort(["symbol", "_announce"])
+    events = _active_fundamental_events(snapshot, columns)
+    if events.is_empty():
+        return panel.with_columns([
+            pl.lit(None, dtype=pl.Float64).alias(name)
+            for name in missing_columns
+        ])
+    right = (
+        events.with_columns(
+            pl.col("_announce").dt.offset_by("1d").alias("_effective_date")
+        )
+        .select(["symbol", "_effective_date", *columns])
+        .sort(["symbol", "_effective_date"])
+    )
     joined = panel.join_asof(
         right,
         left_on="date",
-        right_on="_announce",
+        right_on="_effective_date",
         by="symbol",
         strategy="backward",
         check_sortedness=False,  # 双侧均已按 (symbol, key) 排序, 免除逐组检查开销
     )
-    announced = pl.col("_announce").is_not_null() & (pl.col("date") > pl.col("_announce"))
     expressions = []
     for name in missing_columns:
         spec = FUNDAMENTAL_FACTORS[name]
@@ -131,7 +194,7 @@ def attach_fundamental_factors(
         else:
             value = source
         expressions.append(
-            pl.when(announced).then(value).otherwise(None).alias(name)
+            value.alias(name)
         )
     return joined.with_columns(expressions)
 
@@ -162,16 +225,23 @@ def build_fundamental_matrices(
     labels = market.timestamp_labels
     label_dates = np.array([label[:10] for label in labels], dtype="datetime64[D]")
 
+    columns = sorted({FUNDAMENTAL_FACTORS[name]["column"] for name in requested})
+    events = _active_fundamental_events(snapshot, columns)
+    if events.is_empty():
+        for name in requested:
+            result[name] = np.full(shape, np.nan, dtype=np.float32)
+        return result
+
     raw_columns = {
         FUNDAMENTAL_FACTORS[name]["column"]: np.full(shape, np.nan, dtype=np.float32)
         for name in requested
     }
-    announce_text = snapshot["announce_date"].str.slice(0, 10)
-    for row_index, symbol in enumerate(snapshot["symbol"].to_list()):
+    announce_dates = events["_announce"].to_list()
+    for row_index, symbol in enumerate(events["symbol"].to_list()):
         column_index = asset_index.get(symbol)
         if column_index is None:
             continue
-        announce = announce_text[row_index]
+        announce = announce_dates[row_index]
         if announce is None:
             continue
         # 公告日之后 (严格大于) 的首个时间行索引
@@ -179,7 +249,7 @@ def build_fundamental_matrices(
         if start >= shape[0]:
             continue
         for column, target in raw_columns.items():
-            value = snapshot[column][row_index]
+            value = events[column][row_index]
             if value is None or not np.isfinite(float(value)):
                 continue
             target[start:, column_index] = float(value)
@@ -188,7 +258,11 @@ def build_fundamental_matrices(
         spec = FUNDAMENTAL_FACTORS[name]
         source = raw_columns[spec["column"]]
         if spec["price_ratio"]:
-            raw_close = market.fields.get("raw_close")
+            raw_close = (
+                market.fields.get("raw_close")
+                if "raw_close" in getattr(market, "source_fields", frozenset())
+                else None
+            )
             if raw_close is None:
                 matrix = np.full(shape, np.nan, dtype=np.float32)
             else:

@@ -13,12 +13,15 @@ from app.backtest.fundamentals import (
     build_fundamental_matrices,
     load_fundamental_snapshot,
 )
-from app.backtest.matrix import build_market_data_matrix
+from app.backtest.matrix import (
+    build_market_data_matrix,
+    load_market_data_matrix_from_parquet,
+)
 
 
 def _snapshot_frame(rows: list[dict]) -> pl.DataFrame:
     frame = pl.DataFrame({
-        "period_end": ["2026-03-31"] * len(rows),
+        "period_end": [r.get("period_end", "2026-03-31") for r in rows],
         "symbol": [r["symbol"] for r in rows],
         "announce_date": [r["announce"] for r in rows],
         "roe": [r.get("roe", 10.0) for r in rows],
@@ -86,7 +89,7 @@ def test_attach_replaces_with_newer_announcement():
     assert roe[4] is None            # 4-5 公告日
     assert roe[5] == 20.0            # 4-6 起 20.0
     assert roe[13] == 20.0           # 4-14
-    assert roe[14] is None           # 4-15 二次公告日, 当天仍不可用 (严格大于)
+    assert roe[14] == 20.0           # 4-15 新公告尚不可用, 旧版本继续有效
     assert roe[15] == 33.0           # 4-16 起新公告生效
 
 
@@ -150,6 +153,64 @@ def test_pb_uses_unadjusted_close_in_polars_and_matrix_paths():
         market_missing, snapshot, ["pb_latest"]
     )["pb_latest"]
     assert np.isnan(matrix_missing).all()
+
+
+def test_matrix_pb_fails_closed_when_requested_raw_close_is_synthetic(tmp_path: Path):
+    """显式请求 raw_close 后的 close 合成回退不能用于 PB。"""
+    panel = _daily_panel(date(2026, 4, 1), 4, ("600000.SH",)).drop("raw_close")
+    snapshot = _snapshot_frame([
+        {"symbol": "600000.SH", "announce": "2026-04-01", "bps": 2.0},
+    ])
+
+    market_root = tmp_path / "kline_daily_enriched"
+    for day in panel["date"].unique().sort().to_list():
+        part = market_root / f"date={day.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True)
+        panel.filter(pl.col("date") == day).write_parquet(part)
+
+    market = load_market_data_matrix_from_parquet(
+        market_root,
+        date(2026, 4, 1),
+        date(2026, 4, 4),
+        field_columns={"raw_close"},
+        cache_root=tmp_path / "matrix_cache",
+    )
+    np.testing.assert_array_equal(market.fields["raw_close"], market.close)
+    matrix = build_fundamental_matrices(market, snapshot, ["pb_latest"])["pb_latest"]
+
+    assert np.isnan(matrix).all()
+
+
+def test_older_period_revision_does_not_replace_latest_period():
+    """旧报告期晚修订后，当前因子仍使用已公布的最新报告期。"""
+    panel = _daily_panel(date(2026, 1, 1), 40, ("600000.SH",))
+    snapshot = _snapshot_frame([
+        {
+            "symbol": "600000.SH",
+            "period_end": "2025-09-30",
+            "announce": "2026-01-05",
+            "roe": 10.0,
+        },
+        {
+            "symbol": "600000.SH",
+            "period_end": "2025-12-31",
+            "announce": "2026-01-20",
+            "roe": 20.0,
+        },
+        {
+            "symbol": "600000.SH",
+            "period_end": "2025-09-30",
+            "announce": "2026-02-01",
+            "roe": 99.0,
+        },
+    ])
+
+    attached = attach_fundamental_factors(panel, snapshot, ["roe_latest"]).sort("date")
+    assert attached.filter(pl.col("date") == date(2026, 2, 2))["roe_latest"].item() == 20.0
+
+    market = build_market_data_matrix(panel)
+    matrix = build_fundamental_matrices(market, snapshot, ["roe_latest"])["roe_latest"]
+    assert matrix[32, 0] == 20.0
 
 
 def test_bps_nonpositive_gives_null_pb():

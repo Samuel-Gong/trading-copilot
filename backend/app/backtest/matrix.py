@@ -51,7 +51,7 @@ except ImportError:
     prange = range
 
 _MATRIX_CACHE_VERSION = 1
-_DIRECT_MATRIX_LOADER_VERSION = 4
+_DIRECT_MATRIX_LOADER_VERSION = 5
 _MATRIX_AXIS_INDEX_VERSION = 1
 _ARROW_BATCH_SIZE = 131_072
 _SCORE_ASSET_CHUNK_SIZE = 256
@@ -443,6 +443,8 @@ class MarketDataMatrix:
     cache_path: str | None = None
     cache_lease: Any | None = field(default=None, compare=False, repr=False)
     vector_fields: frozenset[str] = field(default_factory=frozenset)
+    # 由输入面板或 Parquet 直接提供的字段，不含兼容性合成字段。
+    source_fields: frozenset[str] = field(default_factory=frozenset)
     cache_timing_ms: Mapping[str, float] = field(default_factory=dict)
     _valid_bars: ValidBarIndex | None = field(
         default=None,
@@ -671,6 +673,7 @@ def build_market_data_matrix(
         limit_up_locked=limit_up_locked,
         limit_down_locked=limit_down_locked,
         fields=MappingProxyType(fields),
+        source_fields=frozenset(panel.columns),
     )
 
 
@@ -1039,6 +1042,7 @@ def _build_market_data_matrix_from_dataset(
         limit_down_locked=limit_down_locked,
         fields=MappingProxyType(fields),
         cache_status=cache_status,
+        source_fields=frozenset(parquet_fields),
     )
 
 
@@ -1205,6 +1209,7 @@ def _build_market_data_matrix_cache_from_dataset(
             "names": list(names),
             "arrays": array_specs,
             "fields": field_specs,
+            "source_fields": sorted(parquet_fields),
         }
         (temporary / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
@@ -1761,6 +1766,7 @@ def _load_market_data_matrix_cache(
         cache_path=str(path),
         cache_lease=_MatrixDiskCacheLease(path),
         vector_fields=vector_field_names,
+        source_fields=frozenset(str(name) for name in manifest["source_fields"]),
         cache_timing_ms=MappingProxyType({
             str(name): float(value)
             for name, value in manifest.get("build_timing_ms", {}).items()
@@ -1819,6 +1825,7 @@ def _slice_and_project_market_data_matrix(
         cache_path=sliced.cache_path,
         cache_lease=sliced.cache_lease,
         vector_fields=frozenset(),
+        source_fields=sliced.source_fields & requested_fields,
         cache_timing_ms=sliced.cache_timing_ms,
     )
 
@@ -2461,6 +2468,7 @@ def slice_market_data_matrix(market: MarketDataMatrix, start: int, stop: int) ->
         cache_path=market.cache_path,
         cache_lease=market.cache_lease,
         vector_fields=market.vector_fields,
+        source_fields=market.source_fields,
         cache_timing_ms=market.cache_timing_ms,
     )
     _make_read_only(
@@ -2587,6 +2595,7 @@ def _writable_market_copy(market: MarketDataMatrix) -> MarketDataMatrix:
         limit_up_locked=np.array(market.limit_up_locked, copy=True),
         limit_down_locked=np.array(market.limit_down_locked, copy=True),
         fields=MappingProxyType(fields),
+        source_fields=market.source_fields,
     )
 
 
@@ -2613,6 +2622,7 @@ def _readonly_market_view(market: MarketDataMatrix) -> MarketDataMatrix:
         limit_up_locked=_readonly_view(market.limit_up_locked),
         limit_down_locked=_readonly_view(market.limit_down_locked),
         fields=MappingProxyType(fields),
+        source_fields=market.source_fields,
     )
 
 
@@ -2675,6 +2685,7 @@ def _append_market_row(
         symbols=market.symbols,
         names=market.names,
         fields=MappingProxyType(fields),
+        source_fields=market.source_fields,
         **arrays,
     )
 
