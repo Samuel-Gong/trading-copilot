@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -21,6 +22,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.indicators.pipeline import run_pipeline
 from app.config import settings
+from app.market_time import cn_today
 from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
@@ -537,11 +539,18 @@ def run_now(
                 invalidate_regime_cache()
                 logger.info("compute_regime: %d days", regime_days)
             emit("compute_regime", 92, f"市场环境 {regime_days} 天")
-            # 阶段切换推送监控通知 (软失败, 不影响管道): 末两日阶段不同 = 今日发生切换。
+            # 阶段切换推送监控通知 (软失败, 不影响管道): 仅推送本次重算且发生在
+            # 当前业务日的切换；历史回填/stale 修复不得重放旧通知。
             # 切入退潮/冰点为风险信号, 用 warn 级别; 其余 info。
             if regime_days:
                 try:
-                    _push_phase_change_alert(repo.store.data_dir)
+                    computed_dates = set(
+                        new_regime["date"].cast(pl.Date).to_list()
+                    ) if "date" in new_regime.columns else set()
+                    _push_phase_change_alert(
+                        repo.store.data_dir,
+                        computed_dates=computed_dates,
+                    )
                 except Exception as e:
                     logger.warning("phase change alert failed (soft): %s", e)
         except Exception as e:  # noqa: BLE001
@@ -656,7 +665,7 @@ def _refresh_instruments_view(repo: KlineRepository) -> None:
         logger.warning("refresh instruments view failed: %s", e)
 
 
-def _push_phase_change_alert(data_dir) -> None:
+def _push_phase_change_alert(data_dir, *, computed_dates: set[date]) -> None:
     """情绪周期阶段切换 → 推送监控通知(SSE toast + 监控中心)。
 
     阶段切换(如 退潮→冰点)是重要的市场信号, 原先只有打开市场环境页才能看到。
@@ -669,6 +678,13 @@ def _push_phase_change_alert(data_dir) -> None:
     if not tr:
         return
     prev, cur, d = tr
+    try:
+        transition_date = date.fromisoformat(d)
+    except ValueError:
+        logger.warning("invalid phase transition date: %s", d)
+        return
+    if transition_date != cn_today() or transition_date not in computed_dates:
+        return
     msg = f"情绪周期阶段切换: {PHASE_LABELS.get(prev, prev)} → {PHASE_LABELS.get(cur, cur)} ({d})"
     severity = "warn" if cur in ("ebb", "ice") else "info"
     app_state = _get_app_state()

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+from datetime import date
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
@@ -15,6 +17,59 @@ from app.services.pipeline_jobs import JobStore
 from app.services.quote_service import QuoteService
 from app.strategy import monitor_rules
 from app.strategy.monitor import MonitorRuleEngine
+
+
+class _AlertCapture:
+    def __init__(self) -> None:
+        self.alerts: list[dict] = []
+
+    def push_alerts(self, alerts: list[dict]) -> None:
+        self.alerts.extend(alerts)
+
+
+def test_phase_alert_skips_historical_recompute(monkeypatch, tmp_path):
+    """历史回填或 stale 重算不得重放早已发生的阶段切换。"""
+    capture = _AlertCapture()
+    monkeypatch.setattr(
+        "app.services.regime_builder.latest_phase_transition",
+        lambda data_dir: ("ebb", "ice", "2026-07-30"),
+    )
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: date(2026, 7, 31))
+    monkeypatch.setattr(
+        daily_pipeline,
+        "_get_app_state",
+        lambda: SimpleNamespace(quote_service=capture),
+    )
+
+    daily_pipeline._push_phase_change_alert(
+        tmp_path,
+        computed_dates={date(2026, 7, 30)},
+    )
+
+    assert capture.alerts == []
+
+
+def test_phase_alert_pushes_current_recomputed_transition(monkeypatch, tmp_path):
+    """仅本次确实重算的当前业务日切换可以推送。"""
+    capture = _AlertCapture()
+    monkeypatch.setattr(
+        "app.services.regime_builder.latest_phase_transition",
+        lambda data_dir: ("ebb", "ice", "2026-07-31"),
+    )
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: date(2026, 7, 31))
+    monkeypatch.setattr(
+        daily_pipeline,
+        "_get_app_state",
+        lambda: SimpleNamespace(quote_service=capture),
+    )
+
+    daily_pipeline._push_phase_change_alert(
+        tmp_path,
+        computed_dates={date(2026, 7, 31)},
+    )
+
+    assert len(capture.alerts) == 1
+    assert capture.alerts[0]["type"] == "phase_change"
 
 # ── JobStore 单飞 ────────────────────────────────────────────────────────
 

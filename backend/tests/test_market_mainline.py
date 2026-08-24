@@ -222,6 +222,47 @@ class TestComputeMainline:
             (d2, d2, "concept"),
         ]
 
+    def test_incremental_clears_stale_rows_when_recompute_is_empty(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """被覆写日期不再产出主线时，旧结果必须随重算一起清除。"""
+        repo, d1, d2 = self._setup(tmp_path, monkeypatch)
+        initial = market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+        assert set(initial["date"].to_list()) == {d1, d2}
+
+        _write_enriched(
+            tmp_path,
+            _mk_rows(d2, [
+                ("S1.SH", 0, 6e8),
+                ("S2.SH", 0, 2e8),
+                ("S3.SH", 0, 1e8),
+                ("S4.SH", 0, 4e8),
+            ]),
+        )
+        overwritten = (
+            tmp_path / "kline_daily_enriched" / f"date={d2.isoformat()}" / "part.parquet"
+        )
+        future = overwritten.stat().st_mtime + 10
+        os.utime(overwritten, (future, future))
+
+        refreshed = market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+
+        assert refreshed.is_empty()
+        stored = market_mainline.load_mainline_history(tmp_path, "concept")
+        assert set(stored["date"].to_list()) == {d1}
+
     def test_industry_level_truncation(self, tmp_path, monkeypatch):
         d1 = date(2024, 1, 2)
         rows = _mk_rows(d1, [("S1.SH", 2, 5e8), ("S2.SH", 1, 1e8),

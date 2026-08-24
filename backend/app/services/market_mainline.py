@@ -553,7 +553,12 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         to_compute[-1],
         kind=kind,
     )
-    if not new_rows.is_empty():
-        upsert_mainline_history(data_dir, new_rows)
+    replace_mainline_history_range(
+        data_dir,
+        new_rows,
+        start=to_compute[0],
+        end=to_compute[-1],
+        kind=kind,
+    )
     _mark_mainline_dates_processed(data_dir, repo, kind, set(to_compute))
     return new_rows
