@@ -12,6 +12,7 @@ from typing import Annotated, Any
 import polars as pl
 from fastapi import APIRouter, Query, Request
 
+from app.market_time import cn_today
 from app.services import regime_builder
 
 router = APIRouter(prefix="/api/regime", tags=["regime"])
@@ -166,7 +167,7 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
     """
     repo = request.app.state.repo
     data_dir = _data_dir(request)
-    end = end or date.today()
+    end = end or cn_today()
     if start is None:
         # 全量: 从 enriched 最早日强制重算到今天
         earliest = regime_builder.earliest_enriched_date(repo)
@@ -175,8 +176,12 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             return {"ok": True, "computed": 0}
         start = earliest
     new_rows = regime_builder.run_regime_batch(repo, start=start, end=end)
-    if not new_rows.is_empty():
-        regime_builder.upsert_regime_history(data_dir, new_rows)
+    regime_builder.replace_regime_history_range(
+        data_dir,
+        new_rows,
+        start=start,
+        end=end,
+    )
     phase_days = regime_builder.refresh_phase_labels(data_dir)
 
     from app.services import market_mainline
@@ -320,16 +325,17 @@ def mainline_recompute(request: Request):
     earliest = regime_builder.earliest_enriched_date(repo)
     if earliest is None:
         return {"ok": True, "rows": 0}
+    business_today = cn_today()
     rows = 0
     for kind in ("concept", "industry"):
         computed = market_mainline.compute_mainline_range(
-            repo, data_dir, earliest, date.today(), kind=kind
+            repo, data_dir, earliest, business_today, kind=kind
         )
         market_mainline.replace_mainline_history_range(
             data_dir,
             computed,
             start=earliest,
-            end=date.today(),
+            end=business_today,
             kind=kind,
         )
         rows += computed.height

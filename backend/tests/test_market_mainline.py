@@ -185,6 +185,36 @@ class TestComputeMainline:
 
         assert calls == [(d1, d2, "concept")]
 
+    def test_incremental_defaults_to_cn_business_date(self, tmp_path, monkeypatch):
+        """未显式传 today 时应使用北京时间业务日。"""
+        target = date(2099, 1, 2)
+        repo = _fake_repo(tmp_path)
+        calls: list[tuple[date, date, str]] = []
+        monkeypatch.setattr(
+            market_mainline,
+            "cn_today",
+            lambda: target,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.services.regime_builder.enriched_date_set",
+            lambda current_repo: {target},
+        )
+
+        def compute(current_repo, data_dir, start, end, kind="concept", **kwargs):
+            calls.append((start, end, kind))
+            return pl.DataFrame()
+
+        monkeypatch.setattr(market_mainline, "compute_mainline_range", compute)
+
+        market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            kind="concept",
+        )
+
+        assert calls == [(target, target, "concept")]
+
     def test_incremental_recomputes_overwritten_enriched_partition(
         self,
         tmp_path,

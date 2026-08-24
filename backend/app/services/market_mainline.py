@@ -21,6 +21,7 @@ from pathlib import Path
 
 import polars as pl
 
+from app.market_time import cn_today
 from app.services.ext_data import ExtConfigStore
 from app.services.market_overview_builder import (
     _dimension_field,
@@ -523,7 +524,7 @@ def replace_mainline_history_range(
 def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = None,
                                  kind: str = "concept") -> pl.DataFrame:
     """增量补算主线：补缺失日，并重算被覆写的 enriched 分区。"""
-    today = today or date.today()
+    today = today or cn_today()
     from app.services.regime_builder import enriched_date_set
 
     enriched_dates = enriched_date_set(repo)

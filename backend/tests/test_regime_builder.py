@@ -257,6 +257,33 @@ def test_upsert_overwrites_existing_date(tmp_path):
     assert r1["state"] == "range"
 
 
+def test_replace_range_clears_dates_missing_from_recompute(tmp_path):
+    """范围重算局部或整体为空时，必须清除范围内没有新结果的旧行。"""
+    d1, d2, d3 = date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3)
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2, d3],
+        "state": ["range", "strong", "weak"],
+        "score": [50, 80, 20],
+    }))
+
+    regime_builder.replace_regime_history_range(
+        tmp_path,
+        pl.DataFrame({
+            "date": [d1],
+            "state": ["strong"],
+            "score": [90],
+        }),
+        start=d1,
+        end=d2,
+    )
+
+    loaded = regime_builder.load_regime_history(tmp_path).sort("date")
+    assert loaded.to_dicts() == [
+        {"date": d1, "state": "strong", "score": 90},
+        {"date": d3, "state": "weak", "score": 20},
+    ]
+
+
 def test_coverage_metadata(tmp_path):
     regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
         "date": [date(2026, 1, 1), date(2026, 1, 5)],
@@ -334,6 +361,74 @@ def test_compute_incremental_missing_dates(tmp_path):
     new = regime_builder.compute_regime_incremental(_FakeRepo(), tmp_path, today=date(2026, 1, 3))
     # 无真实 enriched 数据 → 不算出新行, 但不报错
     assert new.is_empty() or new.height >= 0
+
+
+def test_compute_incremental_defaults_to_cn_business_date(tmp_path, monkeypatch):
+    """增量 regime 的默认截止日应来自北京时间，而非服务器日历。"""
+    target = date(2099, 1, 2)
+    calls: list[tuple[date, date]] = []
+    monkeypatch.setattr(
+        regime_builder,
+        "cn_today",
+        lambda: target,
+        raising=False,
+    )
+    monkeypatch.setattr(regime_builder, "enriched_date_set", lambda repo: {target})
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda repo, start, end: calls.append((start, end)) or pl.DataFrame(),
+    )
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    regime_builder.compute_regime_incremental(_FakeRepo(), tmp_path)
+
+    assert calls == [(target, target)]
+
+
+def test_compute_incremental_clears_stale_date_when_recompute_is_empty(
+    tmp_path,
+    monkeypatch,
+):
+    """stale 分区重算为空时，旧 regime 行必须被删除。"""
+    d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+    enriched_dir = tmp_path / "kline_daily_enriched"
+    for target in (d1, d2):
+        part = enriched_dir / f"date={target.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True)
+        part.write_bytes(b"source")
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2],
+        "state": ["range", "strong"],
+        "score": [50, 80],
+    }))
+    future = time.time() + 10
+    os.utime(
+        enriched_dir / f"date={d2.isoformat()}" / "part.parquet",
+        (future, future),
+    )
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda repo, start, end: pl.DataFrame(),
+    )
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    result = regime_builder.compute_regime_incremental(
+        _FakeRepo(),
+        tmp_path,
+        today=d2,
+    )
+
+    assert result.is_empty()
+    stored = regime_builder.load_regime_history(tmp_path)
+    assert set(stored["date"].to_list()) == {d1}
 
 
 # ───────────────────────── 回测环境过滤(T-1 防未来函数) ─────────────────────────

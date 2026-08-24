@@ -20,6 +20,66 @@ def _request(tmp_path):
     )
 
 
+def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
+    tmp_path,
+    monkeypatch,
+):
+    """两个重算入口使用北京时间，并以请求范围完整替换旧结果。"""
+    start = date(2099, 1, 1)
+    business_today = date(2099, 1, 2)
+    regime_ranges: list[tuple[date, date, bool]] = []
+    mainline_ranges: list[tuple[str, date, date]] = []
+
+    monkeypatch.setattr(
+        regime,
+        "cn_today",
+        lambda: business_today,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "earliest_enriched_date",
+        lambda repo: start,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        lambda repo, start, end: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "replace_regime_history_range",
+        lambda data_dir, rows, *, start, end: regime_ranges.append(
+            (start, end, rows.is_empty())
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(regime.regime_builder, "refresh_phase_labels", lambda data_dir: 0)
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda repo, data_dir, start, end, *, kind: (
+            mainline_ranges.append((kind, start, end)) or pl.DataFrame()
+        ),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "replace_mainline_history_range",
+        lambda *args, **kwargs: None,
+    )
+
+    regime.regime_recompute(_request(tmp_path))
+    regime.mainline_recompute(_request(tmp_path))
+
+    assert regime_ranges == [(start, business_today, True)]
+    assert mainline_ranges == [
+        ("concept", start, business_today),
+        ("industry", start, business_today),
+        ("concept", start, business_today),
+        ("industry", start, business_today),
+    ]
+
+
 def test_regime_phases_limit_uses_latest_trading_days(tmp_path, monkeypatch):
     days = [date(2026, 8, 20), date(2026, 8, 21), date(2026, 8, 24)]
     history = pl.DataFrame({

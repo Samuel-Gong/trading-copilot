@@ -19,6 +19,8 @@ from pathlib import Path
 
 import polars as pl
 
+from app.market_time import cn_today
+
 logger = logging.getLogger(__name__)
 
 # ───────────────────────── 状态分类阈值(可调) ─────────────────────────
@@ -539,6 +541,50 @@ def upsert_regime_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
     combined.write_parquet(p)
 
 
+def replace_regime_history_range(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    """以重算结果完整替换日期范围，允许结果局部或整体为空。"""
+    if start > end:
+        return
+    p = regime_path(data_dir)
+    old = load_regime_history(data_dir)
+    if old.is_empty() and new_rows.is_empty():
+        return
+
+    incoming = new_rows
+    if not incoming.is_empty():
+        incoming = incoming.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end)
+        )
+
+    if old.is_empty():
+        combined = incoming
+    else:
+        kept = old.filter(~((pl.col("date") >= start) & (pl.col("date") <= end)))
+        if incoming.is_empty():
+            combined = kept
+        else:
+            target_cols = incoming.columns
+            kept = kept.select([
+                pl.col(column)
+                if column in kept.columns
+                else pl.lit(None).alias(column)
+                for column in target_cols
+            ])
+            combined = pl.concat(
+                [kept, incoming.select(target_cols)],
+                how="vertical_relaxed",
+            )
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    combined.sort("date").unique(subset=["date"], keep="last").write_parquet(p)
+
+
 def get_regime_coverage(data_dir: Path) -> dict:
     """返回 regime 时序的覆盖元信息(供数据画像/API)。"""
     df = load_regime_history(data_dir)
@@ -608,7 +654,7 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
     双检测: 1) 缺口(enriched 有但 regime 没有) 2) stale(enriched 被覆写)。
     自动补齐所有需要的日。返回本次新算的 DataFrame。
     """
-    today = today or date.today()
+    today = today or cn_today()
     existing = load_regime_history(data_dir)
 
     # 缺口: enriched 有哪些天, regime 缺哪些
@@ -627,9 +673,13 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
     logger.info("regime incremental: compute %d days (missing=%d, stale=%d)",
                 len(to_compute), len(missing), len(stale))
     new_rows = run_regime_batch(repo, start=to_compute[0], end=to_compute[-1])
-    if not new_rows.is_empty():
-        upsert_regime_history(data_dir, new_rows)
-        refresh_phase_labels(data_dir)
+    replace_regime_history_range(
+        data_dir,
+        new_rows,
+        start=to_compute[0],
+        end=to_compute[-1],
+    )
+    refresh_phase_labels(data_dir)
     return new_rows
 
 
