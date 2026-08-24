@@ -284,29 +284,41 @@ def _get_previous_closes(
     """返回每个交易时段上一交易日的同口径收盘价。"""
     if not trade_dates:
         return {}
-    start = min(trade_dates) - timedelta(days=45)
+    start = min(trade_dates)
     end = max(trade_dates)
     close_column = "close" if asset_type == "index" else "raw_close"
+    frames = []
     try:
-        daily = repo.get_daily_asset(
+        frames.append(repo.get_daily_asset_before(
+            asset_type,
+            symbol,
+            start,
+            columns=["date", close_column],
+        ))
+    except Exception:
+        pass
+    try:
+        frames.append(repo.get_daily_asset(
             asset_type,
             symbol,
             start,
             end,
             columns=["date", close_column],
-        ).sort("date")
+        ))
     except Exception:
-        daily = None
-    if daily is None or daily.is_empty() or close_column not in daily.columns:
-        return {trade_date: None for trade_date in trade_dates}
+        pass
 
-    closes: list[tuple[date, float]] = []
-    for daily_date, close in daily.select(["date", close_column]).iter_rows():
-        if close is None:
+    closes_by_date: dict[date, float] = {}
+    for frame in frames:
+        if frame is None or frame.is_empty() or close_column not in frame.columns:
             continue
-        numeric = float(close)
-        if math.isfinite(numeric) and numeric > 0:
-            closes.append((daily_date, numeric))
+        for daily_date, close in frame.select(["date", close_column]).iter_rows():
+            if close is None:
+                continue
+            numeric = float(close)
+            if math.isfinite(numeric) and numeric > 0:
+                closes_by_date[daily_date] = numeric
+    closes = sorted(closes_by_date.items())
 
     result: dict[date, float | None] = {}
     for trade_date in trade_dates:

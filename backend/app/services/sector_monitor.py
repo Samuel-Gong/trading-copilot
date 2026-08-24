@@ -11,6 +11,7 @@ from typing import Any
 
 import polars as pl
 
+from app.market_time import CN_TZ
 from app.services import preferences
 from app.services.ext_data import ExtConfig, ExtConfigStore
 
@@ -354,7 +355,7 @@ class SectorMonitorService:
         return None
 
     def _reset_history_for_day(self, now: float) -> None:
-        day = datetime.fromtimestamp(now).date().isoformat()
+        day = datetime.fromtimestamp(now, tz=CN_TZ).date().isoformat()
         if self._history_day == day:
             return
         self._history_day = day

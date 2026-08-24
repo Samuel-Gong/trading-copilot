@@ -108,6 +108,32 @@ def test_previous_closes_use_index_close_column():
     assert repo.get_daily_asset.call_args.kwargs["columns"] == ["date", "close"]
 
 
+def test_previous_closes_use_actual_row_before_long_suspension():
+    """停牌超过固定自然日窗口时，仍应取复牌前最后一个真实收盘价。"""
+    repo = MagicMock()
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 8, 10)],
+        "raw_close": [10.2],
+    })
+    repo.get_daily_asset_before.return_value = pl.DataFrame({
+        "date": [date(2026, 5, 20)],
+        "raw_close": [9.8],
+    })
+
+    assert kline_api._get_previous_closes(
+        repo,
+        "600000.SH",
+        [date(2026, 8, 10)],
+        "stock",
+    ) == {date(2026, 8, 10): 9.8}
+    repo.get_daily_asset_before.assert_called_once_with(
+        "stock",
+        "600000.SH",
+        date(2026, 8, 10),
+        columns=["date", "raw_close"],
+    )
+
+
 def test_minute_range_does_not_read_stock_store_for_index():
     repo = MagicMock()
     repo.resolve_asset_type.return_value = "index"

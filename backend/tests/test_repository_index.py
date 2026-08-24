@@ -131,6 +131,30 @@ def test_get_enriched_latest_asset_index(repo):
     assert "ma5" in df.columns or "rsi_14" in df.columns  # 重算产出指标列
 
 
+def test_get_daily_asset_before_returns_last_actual_partition(repo):
+    """前序日 K 查询应直接定位最后一条实际记录，不受停牌天数影响。"""
+    for ds, raw_close in (("2026-05-20", 9.8), ("2026-08-10", 10.2)):
+        target = repo.store.data_dir / "kline_daily_enriched" / f"date={ds}"
+        target.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({
+            "symbol": ["600000.SH"],
+            "date": [_dt.date.fromisoformat(ds)],
+            "raw_close": [raw_close],
+        }).write_parquet(target / "part.parquet")
+
+    result = repo.get_daily_asset_before(
+        "stock",
+        "600000.SH",
+        _dt.date(2026, 8, 10),
+        columns=["date", "raw_close"],
+    )
+
+    assert result.to_dicts() == [{
+        "date": _dt.date(2026, 5, 20),
+        "raw_close": 9.8,
+    }]
+
+
 def test_get_enriched_latest_asset_index_cold_no_refresh(repo):
     df, dt = repo.get_enriched_latest_asset("index", refresh=False)
     assert df.is_empty() and dt is None
@@ -164,4 +188,3 @@ def test_merge_live_enriched_asset_index_merges_cache(repo):
     cached, dt = repo.get_enriched_latest_asset("index", refresh=False)
     assert str(dt) == "2026-07-25"
     assert set(cached["symbol"].to_list()) == {"000001.SH", "000300.SH"}
-

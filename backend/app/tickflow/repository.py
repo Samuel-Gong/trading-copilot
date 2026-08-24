@@ -1538,6 +1538,34 @@ class KlineRepository:
             return self.get_etf_daily(symbol, start, end, columns)
         return pl.DataFrame()
 
+    def get_daily_asset_before(
+        self,
+        asset_type: str,
+        symbol: str,
+        before: date,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame:
+        """读取指定日期前最后一根真实日 K，不以固定自然日窗口近似。"""
+        if asset_type == "stock":
+            return self._scan_daily_before_from_glob(
+                self._enriched_glob, symbol, before, columns, "日K",
+            )
+        if asset_type == "index":
+            return self._scan_daily_before_from_glob(
+                self._index_enriched_glob, symbol, before, columns, "指数日K",
+            )
+        if asset_type == "etf":
+            frame = self._scan_daily_before_from_glob(
+                self._etf_enriched_glob, symbol, before, columns, "ETF 日K",
+                log_level="debug",
+            )
+            if frame.is_empty():
+                frame = self._scan_daily_before_from_glob(
+                    self._index_enriched_glob, symbol, before, columns, "旧版 ETF 日K",
+                )
+            return frame
+        return pl.DataFrame()
+
     def get_daily_close_batch(
         self,
         asset_type: str,
@@ -1801,6 +1829,35 @@ class KlineRepository:
             return lf.collect()
         except Exception as e:  # noqa: BLE001
             logger.warning("日K查询失败: %s", e)
+            return pl.DataFrame()
+
+    def _scan_daily_before_from_glob(
+        self,
+        parquet_glob: str,
+        symbol: str,
+        before: date,
+        columns: list[str] | None,
+        label: str,
+        *,
+        log_level: str = "warning",
+    ) -> pl.DataFrame:
+        try:
+            lf = (
+                scan_enriched_parquet(
+                    parquet_glob,
+                    cast_options=pl.ScanCastOptions(integer_cast="allow-float"),
+                )
+                .filter((pl.col("symbol") == symbol) & (pl.col("date") < before))
+                .sort("date", descending=True)
+                .limit(1)
+            )
+            if columns:
+                schema_names = lf.collect_schema().names()
+                existing = [column for column in columns if column in schema_names]
+                lf = lf.select(existing)
+            return lf.collect()
+        except Exception as e:  # noqa: BLE001
+            getattr(logger, log_level)("%s前序查询失败: %s", label, e)
             return pl.DataFrame()
 
     def _scan_daily_batch(

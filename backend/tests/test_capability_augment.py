@@ -118,3 +118,27 @@ def test_update_data_providers_refreshes_capability_snapshot(monkeypatch):
         mock_request,
     )
     assert mock_request.app.state.capabilities is sentinel
+    mock_request.app.state.financial_scheduler.update_capabilities.assert_called_once_with(sentinel)
+
+
+def test_delete_active_financial_source_refreshes_scheduler_capabilities(monkeypatch):
+    """删除正在使用的财务源后，调度器不能继续持有旧的增广能力。"""
+    from app.api import settings as settings_api
+    from app.data_providers import custom as custom_sources
+    from app.services import preferences
+
+    monkeypatch.setattr(custom_sources, "delete_config", lambda name: None)
+    monkeypatch.setattr(custom_sources, "load_all", lambda: None)
+    monkeypatch.setattr(preferences, "get_daily_data_provider", lambda: "tickflow")
+    monkeypatch.setattr(preferences, "get_realtime_data_provider", lambda: "tickflow")
+    monkeypatch.setattr(preferences, "get_financial_provider", lambda: "mock_src")
+    monkeypatch.setattr(preferences, "get_adj_factor_provider", lambda: "same_as_daily")
+    monkeypatch.setattr(preferences, "save", MagicMock())
+    monkeypatch.setattr(settings_api, "list_data_sources", lambda: {"custom": []})
+    sentinel = CapabilitySet()
+    monkeypatch.setattr(settings_api, "detect_capabilities", lambda: sentinel)
+    mock_request = MagicMock()
+
+    assert settings_api.delete_data_source("mock_src", mock_request) == {"custom": []}
+    assert mock_request.app.state.capabilities is sentinel
+    mock_request.app.state.financial_scheduler.update_capabilities.assert_called_once_with(sentinel)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import polars as pl
@@ -214,3 +215,27 @@ def test_momentum_rule_triggers_after_complete_window(tmp_path):
     assert len(events) == 1
     assert events[0]["type"] == "sector_momentum_up"
     assert events[0]["window_change_pct"] == pytest.approx(0.011)
+
+
+def test_momentum_history_resets_on_beijing_date_change(tmp_path, monkeypatch):
+    """宿主机不在中国时区时，历史仍必须按北京时间跨日清空。"""
+    real_datetime = datetime
+
+    class UtcHostDatetime:
+        @classmethod
+        def fromtimestamp(cls, timestamp, tz=None):
+            if tz is None:
+                return real_datetime.fromtimestamp(timestamp, tz=UTC).replace(tzinfo=None)
+            return real_datetime.fromtimestamp(timestamp, tz=tz)
+
+    monkeypatch.setattr(sector_monitor, "datetime", UtcHostDatetime)
+    service = SectorMonitorService(_Repo(tmp_path))
+    before_midnight = real_datetime(2026, 8, 24, 15, 59, tzinfo=UTC).timestamp()
+    after_midnight = real_datetime(2026, 8, 24, 16, 1, tzinfo=UTC).timestamp()
+
+    service._reset_history_for_day(before_midnight)
+    service._history["index:000001.SH"] = sector_monitor.deque([(before_midnight, 0.1)])
+    service._reset_history_for_day(after_midnight)
+
+    assert service._history_day == "2026-08-25"
+    assert service._history == {}

@@ -628,7 +628,9 @@ def delete_data_source(name: str, request: Request) -> dict:
     if updates:
         preferences.save(updates)
     # 删除源可能触发偏好回退 tickflow, 同步刷新能力快照
-    request.app.state.capabilities = detect_capabilities()
+    capset = detect_capabilities()
+    request.app.state.capabilities = capset
+    _sync_financial_scheduler_caps(request.app.state, capset)
     return list_data_sources()
 
 
@@ -665,7 +667,9 @@ def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
     if updates:
         preferences.save(updates)
     # 刷新能力快照: 当前 provider 变化会改变自定义源能力增广结果 (读缓存, 无网络请求)
-    request.app.state.capabilities = detect_capabilities()
+    capset = detect_capabilities()
+    request.app.state.capabilities = capset
+    _sync_financial_scheduler_caps(request.app.state, capset)
     return {
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
