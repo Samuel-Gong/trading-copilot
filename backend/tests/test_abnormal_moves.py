@@ -276,6 +276,37 @@ def test_build_overview_cache_date_today_no_double_count() -> None:
     assert abs(row["windows"]["3d"]["value"] - 0.19) < 1e-9
 
 
+def test_build_overview_does_not_cache_today_enriched_snapshot() -> None:
+    """今日 enriched 会盘中更新，连续检查必须读取最新快照。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+    class _ChangingTodayRepo:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_enriched_latest(self):
+            self.calls += 1
+            deviate = 0.10 if self.calls == 1 else 0.21
+            return pl.DataFrame({
+                "symbol": ["600000.SH"],
+                "name": ["股A"],
+                "close": [10.0],
+                "change_pct": [0.05],
+                "deviate_3d": [deviate],
+                "deviate_10d": [None],
+                "deviate_30d": [None],
+            }), cn_today()
+
+    repo = _ChangingTodayRepo()
+    first = build_overview(repo, _FakeQuotes(), min_closeness=0.0)
+    second = build_overview(repo, _FakeQuotes(), min_closeness=0.0)
+
+    assert repo.calls == 2
+    assert first["rows"][0]["windows"]["3d"]["value"] == 0.10
+    assert second["rows"][0]["windows"]["3d"]["value"] == 0.21
+
+
 def test_build_overview_stale_snapshot_without_today_quote_fails_closed() -> None:
     """历史分区过期且没有当日个股行情时, 不得复用旧日涨跌幅。"""
     with _hist_cache_lock:

@@ -145,7 +145,7 @@ def bootstrap_from_env() -> bool:
     pwd = (settings.auth_password or "").strip()
     # Compose 会对 env_file 中未加单引号的 $VAR 做插值。Docker 部署时同时
     # 只读挂载原始 .env,首次初始化密码直接按 dotenv 语义读取,避免特殊字符被截断。
-    if _ENV_FILE.is_file():
+    if "AUTH_PASSWORD" not in os.environ and _ENV_FILE.is_file():
         from dotenv import dotenv_values
 
         raw_pwd = dotenv_values(_ENV_FILE, encoding="utf-8", interpolate=False).get("AUTH_PASSWORD")

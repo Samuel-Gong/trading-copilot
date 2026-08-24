@@ -91,6 +91,23 @@ def test_previous_closes_fail_closed_without_raw_close():
     ) == {date(2026, 8, 6): None}
 
 
+def test_previous_closes_use_index_close_column():
+    """指数日线没有 raw_close，昨收应直接使用 close。"""
+    repo = MagicMock()
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 8, 5), date(2026, 8, 6)],
+        "close": [3500.0, 3520.0],
+    })
+
+    assert kline_api._get_previous_closes(
+        repo,
+        "000001.SH",
+        [date(2026, 8, 6)],
+        "index",
+    ) == {date(2026, 8, 6): 3500.0}
+    assert repo.get_daily_asset.call_args.kwargs["columns"] == ["date", "close"]
+
+
 def test_minute_range_does_not_read_stock_store_for_index():
     repo = MagicMock()
     repo.resolve_asset_type.return_value = "index"

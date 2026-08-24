@@ -100,11 +100,17 @@ def _status_of(closeness: float) -> str:
 
 
 def _hist_snapshot(repo: Any) -> dict[str, Any]:
-    """enriched 最新日的偏离列快照 (60s 进程内缓存)。"""
+    """enriched 最新日偏离快照；仅缓存已经完成的历史交易日。"""
     now = time.monotonic()
+    today_iso = cn_today().isoformat()
     with _hist_cache_lock:
         cached = _hist_cache.get("data")
-        if cached is not None and now - cached["_ts"] < _HIST_CACHE_TTL:
+        if (
+            cached is not None
+            and cached.get("cache_date") is not None
+            and cached["cache_date"] < today_iso
+            and now - cached["_ts"] < _HIST_CACHE_TTL
+        ):
             return cached
 
     df, cache_date = repo.get_enriched_latest()
@@ -122,9 +128,13 @@ def _hist_snapshot(repo: Any) -> dict[str, Any]:
                 "deviate_10d": r.get("deviate_10d"),
                 "deviate_30d": r.get("deviate_30d"),
             }
-    payload = {"_ts": now, "rows": rows, "cache_date": cache_date.isoformat() if cache_date else None}
+    cache_date_iso = cache_date.isoformat() if cache_date else None
+    payload = {"_ts": now, "rows": rows, "cache_date": cache_date_iso}
     with _hist_cache_lock:
-        _hist_cache["data"] = payload
+        if cache_date_iso is not None and cache_date_iso < today_iso:
+            _hist_cache["data"] = payload
+        else:
+            _hist_cache.pop("data", None)
     return payload
 
 

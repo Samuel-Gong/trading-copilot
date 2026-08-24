@@ -129,7 +129,7 @@ def _industry_member(member: str, kind: str) -> str:
 def _load_point_in_time_map_df(repo, kind: str) -> pl.DataFrame:
     """加载带生效日期的概念/行业成分版本；snapshot 数据一律 fail-closed。"""
     data_dir = repo.store.data_dir
-    pairs: list[tuple[date, str, str]] = []
+    pairs: list[tuple[str, date, str, str]] = []
     for config in ExtConfigStore(data_dir).load_all():
         if config.mode != "timeseries":
             continue
@@ -160,17 +160,19 @@ def _load_point_in_time_map_df(repo, kind: str) -> pl.DataFrame:
                 continue
             for symbol in _symbol_keys(row, config):
                 for member in members:
-                    pairs.append((effective, symbol, member))
+                    pairs.append((config.id, effective, symbol, member))
     if not pairs:
         return pl.DataFrame(schema={
+            "_source_id": pl.Utf8,
             "_effective_date": pl.Date,
             "_sym_up": pl.Utf8,
             kind: pl.Utf8,
         })
     return pl.DataFrame({
-        "_effective_date": [item[0] for item in pairs],
-        "_sym_up": [item[1] for item in pairs],
-        kind: [item[2] for item in pairs],
+        "_source_id": [item[0] for item in pairs],
+        "_effective_date": [item[1] for item in pairs],
+        "_sym_up": [item[2] for item in pairs],
+        kind: [item[3] for item in pairs],
     }).unique()
 
 
@@ -179,23 +181,30 @@ def _join_point_in_time_membership(
     map_df: pl.DataFrame,
     kind: str,
 ) -> pl.DataFrame:
-    """按交易日选择不晚于该日的最近一组成分快照。"""
-    versions = sorted(map_df["_effective_date"].unique().to_list())
+    """各来源独立按交易日选择最近成分快照，再合并去重。"""
     parts: list[pl.DataFrame] = []
-    for index, effective in enumerate(versions):
-        next_effective = versions[index + 1] if index + 1 < len(versions) else None
-        rows = limit_rows.filter(pl.col("date") >= effective)
-        if next_effective is not None:
-            rows = rows.filter(pl.col("date") < next_effective)
-        if rows.is_empty():
-            continue
-        membership = map_df.filter(pl.col("_effective_date") == effective).drop(
-            "_effective_date"
-        )
-        joined = rows.join(membership, on="_sym_up", how="inner")
-        if not joined.is_empty():
-            parts.append(joined)
-    return pl.concat(parts, how="vertical_relaxed") if parts else pl.DataFrame()
+    for source in map_df["_source_id"].unique().to_list():
+        source_map = map_df.filter(pl.col("_source_id") == source)
+        versions = sorted(source_map["_effective_date"].unique().to_list())
+        for index, effective in enumerate(versions):
+            next_effective = versions[index + 1] if index + 1 < len(versions) else None
+            rows = limit_rows.filter(pl.col("date") >= effective)
+            if next_effective is not None:
+                rows = rows.filter(pl.col("date") < next_effective)
+            if rows.is_empty():
+                continue
+            membership = source_map.filter(
+                pl.col("_effective_date") == effective
+            ).drop(["_source_id", "_effective_date"])
+            joined = rows.join(membership, on="_sym_up", how="inner")
+            if not joined.is_empty():
+                parts.append(joined)
+    if not parts:
+        return pl.DataFrame()
+    return pl.concat(parts, how="vertical_relaxed").unique(
+        subset=["date", "_sym_up", kind],
+        maintain_order=True,
+    )
 
 
 def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
@@ -225,16 +234,22 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
 
     cfg = _resolve_filter_config(filter_cfg)
     if cfg["min_members"] > 1 or cfg["max_members"] < 5000 or cfg["blacklist"]:
-        member_counts = map_df.group_by(["_effective_date", kind]).len().rename(
-            {"len": "_members"}
+        member_counts = (
+            map_df.group_by(["_source_id", "_effective_date", kind])
+            .len()
+            .rename({"len": "_members"})
         )
         member_counts = member_counts.filter(
             pl.col("_members").ge(cfg["min_members"])
             & pl.col("_members").le(cfg["max_members"])
             & ~pl.col(kind).is_in(sorted(cfg["blacklist"]))
         )
-        allowed = member_counts.select(["_effective_date", kind])
-        map_df = map_df.join(allowed, on=["_effective_date", kind], how="semi")
+        allowed = member_counts.select(["_source_id", "_effective_date", kind])
+        map_df = map_df.join(
+            allowed,
+            on=["_source_id", "_effective_date", kind],
+            how="semi",
+        )
         if map_df.is_empty():
             return pl.DataFrame()
 

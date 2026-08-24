@@ -281,26 +281,27 @@ def _get_previous_closes(
     trade_dates: list[date],
     asset_type: str,
 ) -> dict[date, float | None]:
-    """返回每个交易时段上一交易日的未复权收盘价。"""
+    """返回每个交易时段上一交易日的同口径收盘价。"""
     if not trade_dates:
         return {}
     start = min(trade_dates) - timedelta(days=45)
     end = max(trade_dates)
+    close_column = "close" if asset_type == "index" else "raw_close"
     try:
         daily = repo.get_daily_asset(
             asset_type,
             symbol,
             start,
             end,
-            columns=["date", "raw_close"],
+            columns=["date", close_column],
         ).sort("date")
     except Exception:
         daily = None
-    if daily is None or daily.is_empty() or "raw_close" not in daily.columns:
+    if daily is None or daily.is_empty() or close_column not in daily.columns:
         return {trade_date: None for trade_date in trade_dates}
 
     closes: list[tuple[date, float]] = []
-    for daily_date, close in daily.select(["date", "raw_close"]).iter_rows():
+    for daily_date, close in daily.select(["date", close_column]).iter_rows():
         if close is None:
             continue
         numeric = float(close)

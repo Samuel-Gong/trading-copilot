@@ -34,11 +34,17 @@ def _patch_map(
 ) -> None:
     map_df = pl.DataFrame(
         {
+            "_source_id": ["test_source" for _, ms in mapping.items() for _ in ms],
             "_effective_date": [effective_date for _, ms in mapping.items() for _ in ms],
             "_sym_up": [s for s, ms in mapping.items() for _ in ms],
             kind: [m for _, ms in mapping.items() for m in ms],
         },
-        schema={"_effective_date": pl.Date, "_sym_up": pl.Utf8, kind: pl.Utf8},
+        schema={
+            "_source_id": pl.Utf8,
+            "_effective_date": pl.Date,
+            "_sym_up": pl.Utf8,
+            kind: pl.Utf8,
+        },
     ).unique()
 
     def fake_load(repo, k="concept"):
@@ -231,6 +237,65 @@ class TestComputeMainline:
             {"date": first_date, "member": "旧概念"},
             {"date": second_date, "member": "新概念"},
         ]
+
+    def test_timeseries_sources_advance_on_independent_schedules(self, tmp_path):
+        """一个来源更新时，其他来源的上一版成分仍应继续生效。"""
+        first_date = date(2024, 1, 2)
+        second_date = date(2024, 1, 3)
+        first_symbols = ["S1.SH", "S2.SH", "S3.SH"]
+        second_symbols = ["T1.SH", "T2.SH", "T3.SH"]
+        _write_enriched(
+            tmp_path,
+            _mk_rows(first_date, [(symbol, 1, 1e8) for symbol in first_symbols])
+            + _mk_rows(
+                second_date,
+                [(symbol, 1, 1e8) for symbol in first_symbols + second_symbols],
+            ),
+        )
+
+        for config_id, effective, symbols, member in (
+            ("source_a", first_date, first_symbols, "来源甲概念"),
+            ("source_b", second_date, second_symbols, "来源乙概念"),
+        ):
+            config = ExtConfig(
+                id=config_id,
+                label=config_id,
+                mode="timeseries",
+                fields=[
+                    ExtField("symbol", "string", "标的代码"),
+                    ExtField("concept", "string", "概念"),
+                ],
+            )
+            ExtConfigStore(tmp_path).upsert(config)
+            part = (
+                tmp_path
+                / "ext_data"
+                / config.id
+                / "timeseries"
+                / f"date={effective}"
+                / "part.parquet"
+            )
+            part.parent.mkdir(parents=True, exist_ok=True)
+            pl.DataFrame({
+                "symbol": symbols,
+                "concept": [member] * len(symbols),
+            }).write_parquet(part)
+
+        out = market_mainline.compute_mainline_range(
+            _fake_repo(tmp_path),
+            tmp_path,
+            first_date,
+            second_date,
+            kind="concept",
+            filter_cfg={"min_members": 1, "max_members": 5000, "blacklist": []},
+            exclude_st=False,
+        )
+
+        assert set(out.select(["date", "member"]).iter_rows()) == {
+            (first_date, "来源甲概念"),
+            (second_date, "来源甲概念"),
+            (second_date, "来源乙概念"),
+        }
 
 
 class TestMainlineFilterPreferences:

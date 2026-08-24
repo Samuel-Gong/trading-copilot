@@ -51,6 +51,21 @@ def test_bootstrap_recovers_compose_interpolated_password_from_raw_env(
     assert auth.verify_and_create_session("pw-secret") is None
 
 
+def test_bootstrap_prefers_explicit_process_env_over_dotenv(
+    isolated_auth_store: tuple[ModuleType, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式进程环境变量的优先级必须高于 .env 原始值。"""
+    auth, _, env_path = isolated_auth_store
+    env_path.write_text("AUTH_PASSWORD=dotenv-secret\n", encoding="utf-8")
+    monkeypatch.setenv("AUTH_PASSWORD", "process-secret")
+    app_config.settings.auth_password = "process-secret"
+
+    assert auth.bootstrap_from_env() is True
+    assert auth.verify_and_create_session("process-secret") is not None
+    assert auth.verify_and_create_session("dotenv-secret") is None
+
+
 def test_bootstrap_from_env_does_not_override_existing_password(
     isolated_auth_store: tuple[ModuleType, Path, Path],
 ) -> None:
