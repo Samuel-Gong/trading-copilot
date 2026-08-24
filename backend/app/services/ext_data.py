@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import re
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
@@ -12,6 +13,8 @@ from typing import Literal
 import polars as pl
 
 logger = logging.getLogger(__name__)
+
+EXT_DATA_GENERATION_FILE = ".generation"
 
 # ---------------------------------------------------------------------------
 # 配置模型
@@ -526,6 +529,13 @@ def _config_dir(config_id: str, data_dir: Path) -> Path:
     return data_dir / "ext_data" / config_id
 
 
+def _bump_ext_data_generation(config_id: str, data_dir: Path) -> None:
+    """更新扩展数据版本标记，供实时消费者以 O(1) 成本判断缓存失效。"""
+    marker = _config_dir(config_id, data_dir) / EXT_DATA_GENERATION_FILE
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(uuid.uuid4().hex, encoding="ascii")
+
+
 def write_ext_parquet(
     df: pl.DataFrame,
     config: ExtConfig,
@@ -581,6 +591,7 @@ def write_ext_parquet(
 
     df = cast_df_to_schema(df, config.fields)
     df.write_parquet(out_path)
+    _bump_ext_data_generation(config.id, data_dir)
     logger.info("扩展表写入: %s → %s (%d 行)", config.id, out_path, len(df))
     return len(df)
 
@@ -592,15 +603,20 @@ def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
     - timeseries: 删除 ext_data/{id}/timeseries/ 目录
     """
     cfg_dir = _config_dir(config_id, data_dir)
+    changed = False
     # 删除快照文件
     snap = cfg_dir / "part.parquet"
     if snap.exists():
         snap.unlink()
+        changed = True
     # 删除时序目录
     ts_dir = cfg_dir / "timeseries"
     if ts_dir.exists():
         import shutil
         shutil.rmtree(ts_dir, ignore_errors=True)
+        changed = True
+    if changed:
+        _bump_ext_data_generation(config_id, data_dir)
 
 
 def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
@@ -649,6 +665,8 @@ def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
         except Exception as e:
             logger.warning("代码格式修复跳过 %s: %s", parquet_path, e)
 
+    if fixed:
+        _bump_ext_data_generation(config.id, data_dir)
     return fixed
 
 

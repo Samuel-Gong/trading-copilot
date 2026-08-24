@@ -14,8 +14,11 @@ join 概念映射后 group_by, 峰值内存 <100MB。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
+from bisect import bisect_right
 from datetime import date
 from pathlib import Path
 
@@ -110,15 +113,102 @@ def _enriched_partition_mtime_ns(repo, target_date: date) -> int | None:
         return None
 
 
+def _membership_effective_date(path: Path) -> date | None:
+    """从 timeseries 分区路径提取生效日期。"""
+    for parent in path.parents:
+        if not parent.name.startswith("date="):
+            continue
+        try:
+            return date.fromisoformat(parent.name.removeprefix("date="))
+        except ValueError:
+            return None
+    return None
+
+
+def _membership_versions_by_date(
+    data_dir: Path,
+    kind: str,
+    dates: set[date],
+) -> dict[date, tuple[str, int]]:
+    """计算各交易日实际参与主线计算的成分快照版本。"""
+    sources: list[
+        tuple[str, int, tuple[date, ...], dict[date, list[tuple[str, int, int]]]]
+    ] = []
+    for config in ExtConfigStore(data_dir).load_all():
+        if config.mode != "timeseries" or not _dimension_field(config, kind):
+            continue
+        semantic_config = {
+            "id": config.id,
+            "mode": config.mode,
+            "fields": [field.to_dict() for field in config.fields],
+            "symbol_map": config.symbol_map,
+            "code_map": config.code_map,
+        }
+        config_version = json.dumps(
+            semantic_config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        config_path = data_dir / "ext_data" / config.id / "config.json"
+        try:
+            config_mtime_ns = config_path.stat().st_mtime_ns
+        except OSError:
+            config_mtime_ns = 0
+        snapshots: dict[date, list[tuple[str, int, int]]] = {}
+        for raw_path in _ext_files(data_dir, config):
+            path = Path(raw_path)
+            effective = _membership_effective_date(path)
+            if effective is None:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            relative = str(path.relative_to(data_dir))
+            snapshots.setdefault(effective, []).append(
+                (relative, stat.st_mtime_ns, stat.st_size),
+            )
+        if snapshots:
+            sources.append((
+                config_version,
+                config_mtime_ns,
+                tuple(sorted(snapshots)),
+                snapshots,
+            ))
+
+    versions: dict[date, tuple[str, int]] = {}
+    for target_date in dates:
+        digest = hashlib.sha256()
+        newest_mtime_ns = 0
+        for config_version, config_mtime_ns, effective_dates, snapshots in sources:
+            effective_index = bisect_right(effective_dates, target_date) - 1
+            if effective_index < 0:
+                continue
+            effective = effective_dates[effective_index]
+            digest.update(config_version.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(effective.isoformat().encode("ascii"))
+            digest.update(b"\0")
+            newest_mtime_ns = max(newest_mtime_ns, config_mtime_ns)
+            for relative, mtime_ns, size in sorted(snapshots[effective]):
+                digest.update(relative.encode("utf-8"))
+                digest.update(f"\0{mtime_ns}\0{size}".encode("ascii"))
+                newest_mtime_ns = max(newest_mtime_ns, mtime_ns)
+        versions[target_date] = (digest.hexdigest(), newest_mtime_ns)
+    return versions
+
+
 def _stale_mainline_dates(
     data_dir: Path,
     repo,
     kind: str,
     completed_dates: set[date],
 ) -> set[date]:
-    """返回源分区版本与完成水位不一致的已处理日期。"""
+    """返回行情或成分快照版本与完成水位不一致的已处理日期。"""
     path = mainline_coverage_path(data_dir)
     versions: dict[date, int | None] = {}
+    membership_versions: dict[date, str | None] = {}
     if path.exists():
         try:
             frame = pl.read_parquet(path)
@@ -127,6 +217,13 @@ def _stale_mainline_dates(
                     row["date"]: row["source_mtime_ns"]
                     for row in frame.filter(pl.col("kind") == kind)
                     .select(["date", "source_mtime_ns"])
+                    .iter_rows(named=True)
+                }
+            if {"date", "kind", "membership_version"}.issubset(frame.columns):
+                membership_versions = {
+                    row["date"]: row["membership_version"]
+                    for row in frame.filter(pl.col("kind") == kind)
+                    .select(["date", "membership_version"])
                     .iter_rows(named=True)
                 }
         except Exception as exc:  # noqa: BLE001
@@ -139,15 +236,39 @@ def _stale_mainline_dates(
         except OSError:
             continue
 
+    current_membership_versions = _membership_versions_by_date(
+        data_dir,
+        kind,
+        completed_dates,
+    )
     stale: set[date] = set()
     for target_date in completed_dates:
         source_mtime_ns = _enriched_partition_mtime_ns(repo, target_date)
-        if source_mtime_ns is None:
-            continue
-        recorded_mtime_ns = versions.get(target_date)
-        if target_date in versions and recorded_mtime_ns != source_mtime_ns:
+        recorded_source_mtime_ns = versions.get(target_date)
+        if (
+            source_mtime_ns is not None
+            and target_date in versions
+            and recorded_source_mtime_ns != source_mtime_ns
+        ):
             stale.add(target_date)
-        elif target_date not in versions and source_mtime_ns > legacy_mtime_ns:
+        elif (
+            source_mtime_ns is not None
+            and target_date not in versions
+            and source_mtime_ns > legacy_mtime_ns
+        ):
+            stale.add(target_date)
+        current_version, membership_mtime_ns = current_membership_versions[target_date]
+        recorded_membership_version = membership_versions.get(target_date)
+        if (
+            target_date in membership_versions
+            and recorded_membership_version is not None
+            and recorded_membership_version != current_version
+        ):
+            stale.add(target_date)
+        elif (
+            recorded_membership_version is None
+            and membership_mtime_ns > legacy_mtime_ns
+        ):
             stale.add(target_date)
     return stale
 
@@ -163,6 +284,7 @@ def _mark_mainline_dates_processed(
     path = mainline_coverage_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered_dates = sorted(dates)
+    membership_versions = _membership_versions_by_date(data_dir, kind, dates)
     incoming = pl.DataFrame({
         "date": pl.Series(ordered_dates, dtype=pl.Date),
         "kind": pl.Series([kind] * len(ordered_dates), dtype=pl.Utf8),
@@ -170,10 +292,18 @@ def _mark_mainline_dates_processed(
             [_enriched_partition_mtime_ns(repo, item) for item in ordered_dates],
             dtype=pl.Int64,
         ),
+        "membership_version": pl.Series(
+            [membership_versions[item][0] for item in ordered_dates],
+            dtype=pl.Utf8,
+        ),
     })
     old = pl.read_parquet(path) if path.exists() else pl.DataFrame()
     if not old.is_empty() and "source_mtime_ns" not in old.columns:
         old = old.with_columns(pl.lit(None).cast(pl.Int64).alias("source_mtime_ns"))
+    if not old.is_empty() and "membership_version" not in old.columns:
+        old = old.with_columns(
+            pl.lit(None).cast(pl.Utf8).alias("membership_version"),
+        )
     combined = incoming if old.is_empty() else pl.concat(
         [old.select(incoming.columns), incoming],
         how="vertical_relaxed",

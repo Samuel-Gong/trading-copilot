@@ -252,6 +252,76 @@ class TestComputeMainline:
             (d2, d2, "concept"),
         ]
 
+    def test_incremental_recomputes_dates_affected_by_new_membership_snapshot(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """成分快照新增版本后，只重算其生效日起的已处理交易日。"""
+        d1, d2 = date(2024, 1, 2), date(2024, 1, 3)
+        repo = _fake_repo(tmp_path)
+        config = ExtConfig(
+            id="versioned_concepts",
+            label="历史概念",
+            mode="timeseries",
+            fields=[
+                ExtField("symbol", "string", "标的代码"),
+                ExtField("concept", "string", "概念"),
+            ],
+        )
+        ExtConfigStore(tmp_path).upsert(config)
+        first_part = (
+            tmp_path
+            / "ext_data"
+            / config.id
+            / "timeseries"
+            / f"date={d1}"
+            / "part.parquet"
+        )
+        first_part.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"symbol": ["S1.SH"], "concept": ["旧概念"]}).write_parquet(
+            first_part,
+        )
+        calls: list[tuple[date, date, str]] = []
+        monkeypatch.setattr(
+            "app.services.regime_builder.enriched_date_set",
+            lambda current_repo: {d1, d2},
+        )
+
+        def compute(current_repo, data_dir, start, end, kind="concept", **kwargs):
+            calls.append((start, end, kind))
+            return pl.DataFrame()
+
+        monkeypatch.setattr(market_mainline, "compute_mainline_range", compute)
+
+        market_mainline.compute_mainline_incremental(
+            repo, tmp_path, today=d2, kind="concept",
+        )
+        market_mainline.compute_mainline_incremental(
+            repo, tmp_path, today=d2, kind="concept",
+        )
+
+        second_part = (
+            tmp_path
+            / "ext_data"
+            / config.id
+            / "timeseries"
+            / f"date={d2}"
+            / "part.parquet"
+        )
+        second_part.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"symbol": ["S1.SH"], "concept": ["新概念"]}).write_parquet(
+            second_part,
+        )
+        market_mainline.compute_mainline_incremental(
+            repo, tmp_path, today=d2, kind="concept",
+        )
+
+        assert calls == [
+            (d1, d2, "concept"),
+            (d2, d2, "concept"),
+        ]
+
     def test_incremental_clears_stale_rows_when_recompute_is_empty(
         self,
         tmp_path,

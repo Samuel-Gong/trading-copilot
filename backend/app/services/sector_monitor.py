@@ -13,7 +13,7 @@ import polars as pl
 
 from app.market_time import CN_TZ
 from app.services import preferences
-from app.services.ext_data import ExtConfig, ExtConfigStore
+from app.services.ext_data import EXT_DATA_GENERATION_FILE, ExtConfig, ExtConfigStore
 
 CORE_INDICES = {
     "000001.SH": "上证指数",
@@ -212,18 +212,39 @@ class SectorMonitorService:
 
     def _data_signature(self) -> tuple[tuple[str, int, int], ...]:
         base = self._data_dir / "ext_data"
-        paths: list[Path] = []
+        signature: list[tuple[str, int, int]] = []
         for config in ExtConfigStore(self._data_dir).load_all():
             if not any(_dimension_kind(field.name, field.label) for field in config.fields):
                 continue
             config_dir = base / config.id
-            paths.extend(config_dir.rglob("config.json"))
-            paths.extend(config_dir.rglob("*.parquet"))
-        signature = [
-            (str(path), path.stat().st_mtime_ns, path.stat().st_size)
-            for path in sorted(paths)
-            if path.is_file()
-        ]
+            config_path = config_dir / "config.json"
+            if config_path.is_file():
+                stat = config_path.stat()
+                signature.append((str(config_path), stat.st_mtime_ns, stat.st_size))
+            generation_path = config_dir / EXT_DATA_GENERATION_FILE
+            if generation_path.is_file():
+                stat = generation_path.stat()
+                try:
+                    generation = generation_path.read_text(encoding="ascii").strip()
+                except OSError:
+                    generation = ""
+                signature.append((
+                    f"{generation_path}:{generation}",
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                ))
+                continue
+
+            # 兼容尚未由新版写入端生成 generation 的旧数据；只检查固定快照
+            # 或 timeseries 根目录，不在实时行情热路径遍历历史分区。
+            legacy_path = (
+                config_dir / "part.parquet"
+                if config.mode == "snapshot"
+                else config_dir / "timeseries"
+            )
+            if legacy_path.exists():
+                stat = legacy_path.stat()
+                signature.append((str(legacy_path), stat.st_mtime_ns, stat.st_size))
         index_mode = preferences.get_realtime_index_mode()
         index_enabled = preferences.get_realtime_pull_index()
         index_symbols = sorted(preferences.get_realtime_index_symbols() or CORE_INDICES)

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
 from app.services import sector_monitor
-from app.services.ext_data import ExtConfig, ExtConfigStore, ExtField
+from app.services.ext_data import (
+    EXT_DATA_GENERATION_FILE,
+    ExtConfig,
+    ExtConfigStore,
+    ExtField,
+    write_ext_parquet,
+)
 from app.services.sector_monitor import SectorMonitorService
 from app.strategy import monitor_rules
 from app.strategy.monitor import MonitorRuleEngine
@@ -187,6 +194,103 @@ def test_concept_snapshot_uses_member_average_and_full_window(tmp_path):
 
     complete = service.build_snapshots(second, pl.DataFrame(), [target], {5}, now=1300.0)
     assert complete[target["key"]]["window_changes"][5] == pytest.approx(0.01)
+
+
+def test_stable_timeseries_catalog_does_not_scan_all_history_on_quote(
+    tmp_path,
+    monkeypatch,
+):
+    """目录未变化时，实时行情热路径不得递归遍历全部历史分区。"""
+    config = ExtConfig(
+        id="concept_history",
+        label="历史概念",
+        mode="timeseries",
+        fields=[
+            ExtField("symbol", "string", "标的代码"),
+            ExtField("concept", "string", "所属概念"),
+        ],
+    )
+    ExtConfigStore(tmp_path).upsert(config)
+    for day in range(1, 11):
+        part = (
+            tmp_path
+            / "ext_data"
+            / config.id
+            / "timeseries"
+            / f"date=2024-01-{day:02d}"
+            / "part.parquet"
+        )
+        part.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({
+            "symbol": ["A", "B", "C", "D", "E"],
+            "concept": ["人工智能"] * 5,
+        }).write_parquet(part)
+
+    service = SectorMonitorService(_Repo(tmp_path))
+    target = next(
+        target for target in service.list_targets()["concept"]
+        if target["name"] == "人工智能"
+    )
+    quotes = pl.DataFrame({
+        "symbol": ["A", "B", "C", "D", "E"],
+        "change_pct": [0.01] * 5,
+    })
+
+    def fail_rglob(self, pattern):
+        raise AssertionError(f"实时热路径不应递归扫描 {self}/{pattern}")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+
+    snapshots = service.build_snapshots(
+        quotes,
+        pl.DataFrame(),
+        [target],
+        {5},
+        now=1000.0,
+    )
+
+    assert snapshots[target["key"]]["member_count"] == 5
+
+
+def test_ext_writer_generation_refreshes_timeseries_catalog(tmp_path):
+    """标准写入更新 generation 后，目录缓存应改用最新成分快照。"""
+    config = ExtConfig(
+        id="concept_generation",
+        label="版本概念",
+        mode="timeseries",
+        fields=[
+            ExtField("symbol", "string", "标的代码"),
+            ExtField("concept", "string", "所属概念"),
+        ],
+    )
+    ExtConfigStore(tmp_path).upsert(config)
+    symbols = ["A", "B", "C", "D", "E"]
+    write_ext_parquet(
+        pl.DataFrame({"symbol": symbols, "concept": ["旧概念"] * 5}),
+        config,
+        tmp_path,
+        snapshot_date=date(2024, 1, 2),
+    )
+    generation_path = (
+        tmp_path / "ext_data" / config.id / EXT_DATA_GENERATION_FILE
+    )
+    first_generation = generation_path.read_text(encoding="ascii")
+    service = SectorMonitorService(_Repo(tmp_path))
+    assert {target["name"] for target in service.list_targets()["concept"]} == {
+        "旧概念",
+    }
+
+    write_ext_parquet(
+        pl.DataFrame({"symbol": symbols, "concept": ["新概念"] * 5}),
+        config,
+        tmp_path,
+        snapshot_date=date(2024, 1, 3),
+    )
+
+    assert generation_path.read_text(encoding="ascii") != first_generation
+    assert {target["name"] for target in service.list_targets()["concept"]} == {
+        "新概念",
+    }
 
 
 def test_momentum_rule_triggers_after_complete_window(tmp_path):
