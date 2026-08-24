@@ -10,7 +10,11 @@ from app.extensions.contracts import (
     NotificationFormatContext,
     NotificationFormatter,
 )
-from app.extensions.loader import _validate_router_conflicts, configure_backend_extensions
+from app.extensions.loader import (
+    _validate_router_conflicts,
+    configure_backend_extensions,
+    start_backend_extensions,
+)
 from app.extensions.registry import BackendExtensionRegistrar, BackendExtensionRegistry
 from app.services.quote_service import QuoteService
 
@@ -154,6 +158,40 @@ def test_loader_isolates_failed_setup_and_registers_valid_route(
     assert any(getattr(route, "path", None) == "/api/custom/valid/status" for route in app.routes)
 
 
+def test_startup_runs_only_module_that_registered_duplicate_extension_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[str] = []
+    valid = types.ModuleType("app.custom.first")
+    valid.EXTENSION_ID = "company.same"
+    valid.EXTENSION_API_VERSION = BACKEND_EXTENSION_API_VERSION
+    valid.setup = lambda registrar: None
+    valid.startup = lambda context: started.append(valid.__name__)
+
+    duplicate = types.ModuleType("app.custom.second")
+    duplicate.EXTENSION_ID = "company.same"
+    duplicate.EXTENSION_API_VERSION = BACKEND_EXTENSION_API_VERSION
+    duplicate.setup = lambda registrar: None
+    duplicate.startup = lambda context: started.append(duplicate.__name__)
+    modules = {valid.__name__: valid, duplicate.__name__: duplicate}
+
+    monkeypatch.setattr(
+        "app.extensions.loader._custom_module_names",
+        lambda: [valid.__name__, duplicate.__name__],
+    )
+    monkeypatch.setattr(
+        "app.extensions.loader.importlib.import_module",
+        lambda name: modules[name],
+    )
+
+    registry, errors = configure_backend_extensions(FastAPI())
+    start_backend_extensions(types.SimpleNamespace(), registry)
+
+    assert registry.extension_ids() == frozenset({"company.same"})
+    assert len(errors) == 1
+    assert started == [valid.__name__]
+
+
 def test_extension_static_route_rejected_when_core_dynamic_route_matches() -> None:
     app = FastAPI()
 
@@ -187,6 +225,48 @@ def test_extension_static_route_allowed_when_core_converter_cannot_match() -> No
     @router.delete("/special")
     def delete_special() -> dict:
         return {"ok": True}
+
+    registrar.include_router(router)
+
+    _validate_router_conflicts(app, registrar)
+
+
+def test_extension_multi_converter_route_rejected_when_joint_values_overlap() -> None:
+    app = FastAPI()
+
+    @app.get("/api/items/{first:int}/{second:float}")
+    def get_core_item(first: int, second: float) -> dict:
+        return {"first": first, "second": second}
+
+    registrar = _registrar()
+    router = APIRouter()
+
+    @router.get("/api/items/{first:float}/{second:int}")
+    def get_extension_item(first: float, second: int) -> dict:
+        return {"first": first, "second": second}
+
+    registrar.include_router(router)
+
+    with pytest.raises(
+        ValueError,
+        match=r"GET /api/items/\{first:float\}/\{second:int\}",
+    ):
+        _validate_router_conflicts(app, registrar)
+
+
+def test_extension_dynamic_route_allowed_when_converters_are_disjoint() -> None:
+    app = FastAPI()
+
+    @app.get("/api/items/{item_id:int}")
+    def get_core_item(item_id: int) -> dict:
+        return {"item_id": item_id}
+
+    registrar = _registrar()
+    router = APIRouter()
+
+    @router.get("/api/items/{item_id:uuid}")
+    def get_extension_item(item_id: str) -> dict:
+        return {"item_id": item_id}
 
     registrar.include_router(router)
 

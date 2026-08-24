@@ -52,6 +52,7 @@ class BackendExtensionRegistrar:
 class BackendExtensionRegistry:
     def __init__(self) -> None:
         self._extension_ids: set[str] = set()
+        self._module_names: set[str] = set()
         self._notification_formatters: list[RegisteredImplementation[NotificationFormatter]] = []
         self._frozen = False
 
@@ -70,7 +71,16 @@ class BackendExtensionRegistry:
     def extension_ids(self) -> frozenset[str]:
         return frozenset(self._extension_ids)
 
-    def register(self, registrar: BackendExtensionRegistrar) -> None:
+    def module_names(self) -> frozenset[str]:
+        """返回实际完成注册的源码扩展模块。"""
+        return frozenset(self._module_names)
+
+    def register(
+        self,
+        registrar: BackendExtensionRegistrar,
+        *,
+        module_name: str | None = None,
+    ) -> None:
         """Validate a staged extension fully before mutating the registry."""
         self._ensure_mutable()
         extension_id = registrar.extension_id
@@ -103,6 +113,8 @@ class BackendExtensionRegistry:
             )
 
         self._extension_ids.add(extension_id)
+        if module_name is not None:
+            self._module_names.add(module_name)
         self._notification_formatters.extend(staged)
 
     def freeze(self) -> None:

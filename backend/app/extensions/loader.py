@@ -54,7 +54,7 @@ def configure_backend_extensions(
                 raise ValueError("backend extension module must define setup(registrar)")
             setup(registrar)
             _validate_router_conflicts(app, registrar)
-            registry.register(registrar)
+            registry.register(registrar, module_name=module_name)
             for router in registrar.routers:
                 app.include_router(router)
         except Exception as exc:
@@ -91,12 +91,77 @@ def _route_paths_overlap(left: APIRoute, right: APIRoute) -> bool:
     """判断两个 FastAPI 路径模板是否可能匹配同一请求路径。"""
     if left.path == right.path:
         return True
+    left_segments = _simple_route_segments(left)
+    right_segments = _simple_route_segments(right)
+    if left_segments is not None and right_segments is not None:
+        if len(left_segments) != len(right_segments):
+            return False
+        return all(
+            _simple_segments_overlap(left_segment, right_segment)
+            for left_segment, right_segment in zip(left_segments, right_segments, strict=True)
+        )
     left_sample = _route_sample_path(left)
     right_sample = _route_sample_path(right)
     return bool(
         left.path_regex.fullmatch(right_sample)
         or right.path_regex.fullmatch(left_sample)
     )
+
+
+_FULL_PATH_PARAMETER = re.compile(r"^\{([^}:]+)(?::([^}]+))?\}$")
+_BUILTIN_CONVERTER_NAMES = {
+    "StringConvertor",
+    "IntegerConvertor",
+    "FloatConvertor",
+    "UUIDConvertor",
+}
+_CONVERTER_WITNESSES = (
+    "1",
+    "1.0",
+    "sample",
+    "00000000-0000-0000-0000-000000000001",
+)
+
+
+def _simple_route_segments(route: APIRoute) -> list[str | object] | None:
+    """解析不跨斜杠的静态段或单转换器段；复杂模板交给正则样例回退。"""
+    segments: list[str | object] = []
+    for segment in route.path.split("/"):
+        match = _FULL_PATH_PARAMETER.fullmatch(segment)
+        if match is None:
+            if "{" in segment or "}" in segment:
+                return None
+            segments.append(segment)
+            continue
+        convertor = route.param_convertors.get(match.group(1))
+        if convertor is None or type(convertor).__name__ == "PathConvertor":
+            return None
+        segments.append(convertor)
+    return segments
+
+
+def _simple_segments_overlap(left: str | object, right: str | object) -> bool:
+    if isinstance(left, str) and isinstance(right, str):
+        return left == right
+    if isinstance(left, str):
+        return bool(re.fullmatch(getattr(right, "regex"), left))
+    if isinstance(right, str):
+        return bool(re.fullmatch(getattr(left, "regex"), right))
+
+    left_regex = getattr(left, "regex")
+    right_regex = getattr(right, "regex")
+    if any(
+        re.fullmatch(left_regex, witness) and re.fullmatch(right_regex, witness)
+        for witness in _CONVERTER_WITNESSES
+    ):
+        return True
+    if {
+        type(left).__name__,
+        type(right).__name__,
+    } <= _BUILTIN_CONVERTER_NAMES:
+        return False
+    # 自定义转换器没有可证明的交集算法时 fail-closed，避免注册不可达路由。
+    return True
 
 
 def _route_sample_path(route: APIRoute) -> str:
@@ -124,7 +189,7 @@ def start_backend_extensions(
     for module_name in _custom_module_names():
         try:
             module = importlib.import_module(module_name)
-            if getattr(module, "EXTENSION_ID", None) not in registry.extension_ids():
+            if module_name not in registry.module_names():
                 continue
             startup = getattr(module, "startup", None)
             if callable(startup):
