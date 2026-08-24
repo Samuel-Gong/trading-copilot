@@ -748,9 +748,8 @@ def get_minute_range(
     if asset_type == "index":
         return {**base_response, "sessions": [], "source": "none"}
 
-    end = cn_today()
-    start = end - timedelta(days=days * 3 + 20)
-    minute = repo.get_minute_range([symbol], start, end, asset_type=asset_type)
+    trade_dates = repo.latest_minute_dates(symbol, days, asset_type=asset_type)
+    minute = repo.get_minute_by_dates([symbol], trade_dates, asset_type=asset_type)
     if minute.is_empty() or "datetime" not in minute.columns:
         return {**base_response, "sessions": [], "source": "none"}
 

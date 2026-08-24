@@ -21,6 +21,9 @@ services:
       # 导致每次 up --build 重建容器都丢数据。environment 优先级高于 env_file,
       # 无论 .env 怎么写这里都以容器路径为准。
       - DATA_DIR=/app/data
+      # AUTH_PASSWORD 由上方 env_file 注入；认证初始化应从只读挂载的原始
+      # /app/.env 读取，避免 Compose 展开密码中的 ${VAR}。
+      - TICKFLOW_AUTH_PASSWORD_SOURCE=mounted_env
       # 将主机 Codex Desktop 的 loopback local-access 端点映射到 Docker host gateway。
       - CODEX_DOCKER_HOST=host.docker.internal
       # Codex CLI 必须走主机代理；容器内不能使用 127.0.0.1 访问主机。

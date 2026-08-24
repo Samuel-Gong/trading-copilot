@@ -1994,6 +1994,36 @@ class KlineRepository:
             pass
         return None
 
+    def latest_minute_dates(
+        self,
+        symbol: str,
+        limit: int,
+        asset_type: str = "stock",
+    ) -> list[date]:
+        """返回标的最近 N 个实际已落库分钟交易日，停牌间隔不影响结果。"""
+        if limit <= 0:
+            return []
+        table = "kline_etf_minute" if asset_type == "etf" else "kline_minute"
+        try:
+            rows = self.execute_all(
+                f"""
+                SELECT DISTINCT CAST(datetime AS DATE) AS trade_date
+                FROM {table}
+                WHERE symbol = ? AND datetime IS NOT NULL
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                [symbol, limit],
+            )
+        except duckdb.CatalogException:
+            return []
+        dates = [
+            value if isinstance(value, date) else date.fromisoformat(str(value))
+            for row in rows
+            if row and (value := row[0]) is not None
+        ]
+        return sorted(dates)
+
     def latest_minute_date_global(self) -> date | None:
         """全市场最近分钟K日期 (不分 symbol)。用于非交易日回退到上一交易日。"""
         try:

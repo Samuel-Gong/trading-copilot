@@ -143,9 +143,14 @@ def bootstrap_from_env() -> bool:
     from app.config import _ENV_FILE, settings
 
     pwd = (settings.auth_password or "").strip()
-    # Compose 会对 env_file 中未加单引号的 $VAR 做插值。Docker 部署时同时
-    # 只读挂载原始 .env,首次初始化密码直接按 dotenv 语义读取,避免特殊字符被截断。
-    if "AUTH_PASSWORD" not in os.environ and _ENV_FILE.is_file():
+    # Compose 会对 env_file 中未加单引号的 $VAR 做插值。官方 Compose 用
+    # TICKFLOW_AUTH_PASSWORD_SOURCE=mounted_env 标记该进程变量来自 env_file，
+    # 此时应从只读挂载的原始 .env 恢复；非 Compose 场景的显式进程变量仍优先。
+    password_source = os.environ.get("TICKFLOW_AUTH_PASSWORD_SOURCE", "").strip().lower()
+    should_read_raw_env = (
+        password_source == "mounted_env" or "AUTH_PASSWORD" not in os.environ
+    )
+    if should_read_raw_env and _ENV_FILE.is_file():
         from dotenv import dotenv_values
 
         raw_pwd = dotenv_values(_ENV_FILE, encoding="utf-8", interpolate=False).get("AUTH_PASSWORD")

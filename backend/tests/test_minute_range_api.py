@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api import kline as kline_api
+from app.tickflow.repository import KlineRepository
 
 
 def _request(repo=None, capset=None):
@@ -33,7 +34,9 @@ def test_minute_range_returns_latest_sessions_with_previous_closes():
         "total_shares": [1.0],
         "float_shares": [1.0],
     })
-    repo.get_minute_range.return_value = pl.DataFrame({
+    minute_dates = [date(2026, 8, 6), date(2026, 8, 7)]
+    repo.latest_minute_dates.return_value = minute_dates
+    repo.get_minute_by_dates.return_value = pl.DataFrame({
         "symbol": ["600000.SH"] * 3,
         "datetime": [
             datetime(2026, 8, 5, 1, 30),
@@ -73,7 +76,69 @@ def test_minute_range_returns_latest_sessions_with_previous_closes():
         22.2,
     ]
     assert result["sessions"][0]["rows"][0]["close"] == 11.1
+    repo.latest_minute_dates.assert_called_once_with("600000.SH", 2, asset_type="stock")
+    repo.get_minute_by_dates.assert_called_once_with(
+        ["600000.SH"], minute_dates, asset_type="stock",
+    )
+    repo.get_minute_range.assert_not_called()
     assert repo.get_daily_asset.call_args.kwargs["columns"] == ["date", "raw_close"]
+
+
+def test_minute_range_uses_actual_dates_across_long_suspension():
+    repo = MagicMock()
+    repo.resolve_asset_type.return_value = "stock"
+    repo.get_instruments.return_value = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "name": ["浦发银行"],
+        "total_shares": [1.0],
+        "float_shares": [1.0],
+    })
+    actual_dates = [date(2026, 5, 20), date(2026, 8, 24)]
+    repo.latest_minute_dates.return_value = actual_dates
+    repo.get_minute_by_dates.return_value = pl.DataFrame({
+        "symbol": ["600000.SH", "600000.SH"],
+        "datetime": [datetime(2026, 5, 20, 9, 30), datetime(2026, 8, 24, 9, 30)],
+        "open": [9.8, 10.0],
+        "high": [9.9, 10.1],
+        "low": [9.7, 9.9],
+        "close": [9.8, 10.0],
+        "volume": [100.0, 120.0],
+        "amount": [98_000.0, 120_000.0],
+    })
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 5, 19), date(2026, 5, 20), date(2026, 8, 24)],
+        "raw_close": [9.7, 9.8, 10.0],
+    })
+
+    result = kline_api.get_minute_range(_request(repo), "600000.SH", 2)
+
+    assert [session["date"] for session in result["sessions"]] == [
+        "2026-05-20", "2026-08-24",
+    ]
+    repo.get_minute_by_dates.assert_called_once_with(
+        ["600000.SH"], actual_dates, asset_type="stock",
+    )
+
+
+def test_repository_latest_minute_dates_returns_sorted_distinct_days():
+    repo = MagicMock()
+    repo.execute_all.return_value = [
+        (date(2026, 8, 24),),
+        (date(2026, 5, 20),),
+    ]
+
+    result = KlineRepository.latest_minute_dates(
+        repo,
+        "600000.SH",
+        2,
+        asset_type="stock",
+    )
+
+    assert result == [date(2026, 5, 20), date(2026, 8, 24)]
+    sql, params = repo.execute_all.call_args.args
+    assert "FROM kline_minute" in sql
+    assert "SELECT DISTINCT CAST(datetime AS DATE)" in sql
+    assert params == ["600000.SH", 2]
 
 
 def test_previous_closes_fail_closed_without_raw_close():

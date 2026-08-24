@@ -16,6 +16,8 @@ def isolated_auth_store(
     tmp_path: Path,
 ) -> Iterator[tuple[ModuleType, Path, Path]]:
     monkeypatch.setattr(app_config.settings, "data_dir", tmp_path)
+    monkeypatch.delenv("AUTH_PASSWORD", raising=False)
+    monkeypatch.delenv("TICKFLOW_AUTH_PASSWORD_SOURCE", raising=False)
     from app.services import auth
 
     auth_path = tmp_path / "user_data" / "auth.json"
@@ -43,12 +45,21 @@ def test_bootstrap_recovers_compose_interpolated_password_from_raw_env(
     configured = Settings(_env_file=env_path)
     configured.auth_password = "pw-secret"  # 模拟 Compose 将未定义的 ${special} 插值为空串
     monkeypatch.setattr(app_config, "settings", configured)
+    monkeypatch.setenv("AUTH_PASSWORD", "pw-secret")
+    monkeypatch.setenv("TICKFLOW_AUTH_PASSWORD_SOURCE", "mounted_env")
 
     assert auth.bootstrap_from_env() is True
     assert auth_path.exists()
     assert password not in auth_path.read_text(encoding="utf-8")
     assert auth.verify_and_create_session(password) is not None
     assert auth.verify_and_create_session("pw-secret") is None
+
+
+def test_compose_marks_auth_password_as_mounted_raw_env_source() -> None:
+    compose_path = Path(__file__).resolve().parents[2] / "docker-compose.yml"
+    compose = compose_path.read_text(encoding="utf-8")
+
+    assert "TICKFLOW_AUTH_PASSWORD_SOURCE=mounted_env" in compose
 
 
 def test_bootstrap_prefers_explicit_process_env_over_dotenv(
