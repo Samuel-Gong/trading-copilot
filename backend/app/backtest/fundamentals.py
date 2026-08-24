@@ -4,8 +4,8 @@
 - 输入为 data/financials/metrics/part.parquet, 每行一份报告期指标;
 - ``announce_date`` 是公告日。因子只在 **严格晚于公告日的交易日** 才有值
   (公告多在盘后发布, 保守取 T+1 生效), 此前保持 null;
-- 财报历史按 (symbol, period_end) 累积 (见 services/financial_sync.py),
-  同一期以最新公告为准;
+- 财报历史按 (symbol, period_end, announce_date) 累积 (见 services/financial_sync.py),
+  同一期的原公告与修订公告都保留, 并按目标交易日选择当时最新可用版本;
 - 无财务数据的标的/日期一律为 null, 绝不填 0 (填 0 会污染截面排名,
   例如资产负债率 0 会被当成最优杠杆)。下游 IC/分层/评分对 null 自动剔除。
 
@@ -27,7 +27,7 @@ import polars as pl
 logger = logging.getLogger(__name__)
 
 # 财务因子名 -> (metrics 表列名, 是否需要除以收盘价)
-# pb_latest 单列声明为 bps 倒数口径: 因子值 = close / bps。
+# pb_latest 单列声明为 bps 倒数口径: 因子值 = raw_close / bps。
 FUNDAMENTAL_FACTORS: dict[str, dict[str, Any]] = {
     "pb_latest": {"column": "bps", "price_ratio": True},
     "roe_latest": {"column": "roe", "price_ratio": False},
@@ -118,9 +118,14 @@ def attach_fundamental_factors(
         spec = FUNDAMENTAL_FACTORS[name]
         source = pl.col(spec["column"])
         if spec["price_ratio"]:
+            price = (
+                pl.col("raw_close")
+                if "raw_close" in joined.columns
+                else pl.lit(None, dtype=pl.Float64)
+            )
             value = (
                 pl.when(source > 0)
-                .then(pl.col("close") / source)
+                .then(price / source)
                 .otherwise(None)
             )
         else:
@@ -139,7 +144,8 @@ def build_fundamental_matrices(
     """为 MarketDataMatrix 构建财务因子 TxN float32 字段。
 
     与 attach_fundamental_factors 同一口径: 公告日次一交易日起前向填充,
-    无数据为 NaN。pb 类因子在矩阵侧用 close / bps 现算。
+    无数据为 NaN。pb 类因子在矩阵侧用 raw_close / bps 现算; 缺少未复权价时
+    fail-closed 为 NaN, 不能回退到前复权 close。
     """
     requested = [str(name) for name in names if str(name) in FUNDAMENTAL_FACTOR_NAMES]
     if not requested:
@@ -182,8 +188,12 @@ def build_fundamental_matrices(
         spec = FUNDAMENTAL_FACTORS[name]
         source = raw_columns[spec["column"]]
         if spec["price_ratio"]:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                matrix = (market.close / source).astype(np.float32)
+            raw_close = market.fields.get("raw_close")
+            if raw_close is None:
+                matrix = np.full(shape, np.nan, dtype=np.float32)
+            else:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    matrix = (raw_close / source).astype(np.float32)
             matrix[~(source > 0)] = np.nan
             matrix[np.isinf(matrix)] = np.nan
         else:

@@ -44,6 +44,7 @@ def _daily_panel(start: date, days: int, symbols: tuple[str, ...]) -> pl.DataFra
                 "high": 10.5,
                 "low": 9.5,
                 "close": 10.0 + offset * 0.1,
+                "raw_close": 10.0 + offset * 0.1,
                 "volume": 1000.0,
             })
     return pl.DataFrame(rows).sort(["symbol", "date"])
@@ -104,7 +105,7 @@ def test_matrix_field_matches_polars_attach():
         {"symbol": "000001.SZ", "announce": "2026-04-08", "roe": -5.0, "bps": -1.0},
     ])
     attached = attach_fundamental_factors(panel, snapshot, ["roe_latest", "pb_latest"])
-    market = build_market_data_matrix(panel)
+    market = build_market_data_matrix(panel, field_columns={"raw_close"})
     matrices = build_fundamental_matrices(market, snapshot, ["roe_latest", "pb_latest"])
     symbols = {s: i for i, s in enumerate(market.symbols)}
     dates = {str(d): t for t, d in enumerate(
@@ -119,6 +120,36 @@ def test_matrix_field_matches_polars_attach():
                 assert np.isnan(actual), (name, row["date"], row["symbol"], actual)
             else:
                 np.testing.assert_allclose(actual, expected, rtol=1e-6)
+
+
+def test_pb_uses_unadjusted_close_in_polars_and_matrix_paths():
+    """PB 的分子必须使用未复权价格, 不能随前复权因子失真。"""
+    panel = _daily_panel(date(2026, 4, 1), 4, ("600000.SH",)).with_columns(
+        pl.lit(5.0).alias("close"),
+        pl.lit(10.0).alias("raw_close"),
+    )
+    snapshot = _snapshot_frame([
+        {"symbol": "600000.SH", "announce": "2026-04-01", "bps": 2.0},
+    ])
+
+    attached = attach_fundamental_factors(panel, snapshot, ["pb_latest"]).sort("date")
+    assert attached["pb_latest"].to_list() == [None, 5.0, 5.0, 5.0]
+
+    market = build_market_data_matrix(panel, field_columns={"raw_close"})
+    matrix = build_fundamental_matrices(market, snapshot, ["pb_latest"])["pb_latest"]
+    assert np.isnan(matrix[0, 0])
+    np.testing.assert_allclose(matrix[1:, 0], np.array([5.0, 5.0, 5.0]))
+
+    missing_raw = panel.drop("raw_close")
+    attached_missing = attach_fundamental_factors(
+        missing_raw, snapshot, ["pb_latest"]
+    )
+    assert attached_missing["pb_latest"].null_count() == attached_missing.height
+    market_missing = build_market_data_matrix(missing_raw)
+    matrix_missing = build_fundamental_matrices(
+        market_missing, snapshot, ["pb_latest"]
+    )["pb_latest"]
+    assert np.isnan(matrix_missing).all()
 
 
 def test_bps_nonpositive_gives_null_pb():
@@ -177,7 +208,7 @@ def test_financial_sync_merges_history(tmp_path: Path):
     })
     merged = fs._merge_report_history(old, latest)
     assert merged.height == 4  # 旧各期保留 + 新一期并入
-    # 同期修正: 旧 2025-12-31 公告 2026-01-20 vs 更晚的修正公告
+    # 同期修正: 原公告版本与更晚的修正公告都必须保留, 供历史点时选择。
     revised = pl.DataFrame({
         "symbol": ["600000.SH"],
         "period_end": ["2025-12-31"],
@@ -188,6 +219,7 @@ def test_financial_sync_merges_history(tmp_path: Path):
     row = merged2.filter(
         (pl.col("symbol") == "600000.SH") & (pl.col("period_end") == "2025-12-31")
     )
-    assert row.height == 1
-    assert row["roe"].item() == 9.5
-    assert merged2.height == 2  # 修正不增加行数
+    assert row.height == 2
+    assert row.sort("announce_date")["roe"].to_list() == [9.0, 9.5]
+    assert merged2.height == 3
+    assert fs._merge_report_history(merged2, revised).height == 3

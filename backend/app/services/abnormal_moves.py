@@ -22,12 +22,10 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from datetime import date
 from typing import Any
 
-import polars as pl
-
-from app.indicators.pipeline import DEVIATION_WINDOWS
+from app.indicators.pipeline import _BENCHMARK_PREFERENCE, DEVIATION_WINDOWS
+from app.market_time import cn_today
 
 # ── 规则表 ────────────────────────────────────────────────
 
@@ -53,9 +51,6 @@ RULES_META: list[dict[str, Any]] = [
     {"board": "北交所", "st": False, "thresholds": {f"{k}d": {"up": u, "down": d} for k, (u, d) in _BSE.items()},
      "note": "30%涨跌幅板块, 3日±40%"},
 ]
-
-_BENCH_RT_CANDIDATES = ["000002.SH", "000001.SH", "399107.SZ", "399001.SZ", "899050.BJ"]
-
 
 def board_of(symbol: str) -> str:
     """按代码前缀判定板块。"""
@@ -133,27 +128,64 @@ def _hist_snapshot(repo: Any) -> dict[str, Any]:
     return payload
 
 
-def _bench_rt_pct(quote_service: Any) -> float:
-    """基准指数今日实时涨跌 (各候选均值, 缺数据时 0)。"""
+def _row_change_pct(row: dict[str, Any], *, percent_value: bool) -> float | None:
+    """从标准化行情行读取涨跌幅, 优先用价格比值消除单位歧义。"""
+    close = row.get("close")
+    prev_close = row.get("prev_close")
+    if close is not None and prev_close not in (None, 0):
+        return float(close / prev_close - 1)
+    for col in ("change_pct", "pct", "pct_change"):
+        value = row.get(col)
+        if value is not None:
+            pct = float(value)
+            return pct / 100.0 if percent_value else pct
+    return None
+
+
+def _bench_rt_pcts(quote_service: Any) -> dict[str, float | None]:
+    """按交易所读取今日基准指数涨跌幅, 缺数据时保留不可用状态。"""
     try:
         df = quote_service.get_index_quotes()
     except Exception:
-        return 0.0
+        return {exchange: None for exchange in _BENCHMARK_PREFERENCE}
     if df is None or df.is_empty():
-        return 0.0
-    df = df.filter(pl.col("symbol").is_in(_BENCH_RT_CANDIDATES))
-    if df.is_empty():
-        return 0.0
-    for col in ("change_pct", "pct", "pct_change"):
-        if col in df.columns:
-            vals = df[col].drop_nulls()
-            if vals.len() > 0:
-                return float(vals.mean())
-    if {"close", "prev_close"} <= set(df.columns):
-        sub = df.select(["close", "prev_close"]).drop_nulls()
-        if sub.height > 0:
-            return float((sub["close"] / sub["prev_close"] - 1).mean())
-    return 0.0
+        return {exchange: None for exchange in _BENCHMARK_PREFERENCE}
+
+    by_symbol = {str(row["symbol"]): row for row in df.iter_rows(named=True)}
+    result: dict[str, float | None] = {}
+    for exchange, candidates in _BENCHMARK_PREFERENCE.items():
+        value = None
+        for symbol in candidates:
+            row = by_symbol.get(symbol)
+            if row is None:
+                continue
+            # QuoteService 的指数缓存 change_pct 为百分数值, 股票 enriched 则为小数制。
+            value = _row_change_pct(row, percent_value=True)
+            if value is not None:
+                break
+        result[exchange] = value
+    return result
+
+
+def _today_stock_pcts(quote_service: Any) -> dict[str, float]:
+    """读取当日标准化个股行情; 日期或字段不可信时返回空映射。"""
+    try:
+        frame, quote_date = quote_service.get_enriched_today()
+    except Exception:
+        return {}
+    if quote_date != cn_today() or frame is None or frame.is_empty() or "symbol" not in frame.columns:
+        return {}
+    rows: dict[str, float] = {}
+    for row in frame.iter_rows(named=True):
+        value = _row_change_pct(row, percent_value=False)
+        if value is not None:
+            rows[str(row["symbol"])] = value
+    return rows
+
+
+def _symbol_exchange(symbol: str) -> str | None:
+    exchange = symbol.rsplit(".", 1)[-1].upper() if "." in symbol else ""
+    return exchange if exchange in _BENCHMARK_PREFERENCE else None
 
 
 def build_overview(
@@ -168,15 +200,36 @@ def build_overview(
     cache_date = hist.get("cache_date")
     hist_rows: dict[str, dict[str, Any]] = hist["rows"]
 
-    bench_rt = _bench_rt_pct(quote_service) if quote_service is not None else 0.0
     # enriched 已含今日收盘 (盘后已同步) 时, 今日涨跌已计入历史偏离, 不再叠加
-    includes_today = cache_date is not None and cache_date >= date.today().isoformat()
+    includes_today = cache_date is not None and cache_date >= cn_today().isoformat()
+    bench_rt_by_exchange = (
+        _bench_rt_pcts(quote_service)
+        if quote_service is not None
+        else {exchange: None for exchange in _BENCHMARK_PREFERENCE}
+    )
+    today_stock_pcts = (
+        _today_stock_pcts(quote_service)
+        if quote_service is not None and not includes_today
+        else {}
+    )
 
     out_rows: list[dict[str, Any]] = []
     for symbol, base in hist_rows.items():
         rule = rule_for(symbol, base.get("name"))
-        rt_pct = base.get("rt_pct")
-        rt_delta = 0.0 if includes_today else ((rt_pct or 0.0) - bench_rt)
+        if includes_today:
+            rt_pct = base.get("rt_pct")
+            rt_delta = 0.0
+        else:
+            rt_pct = today_stock_pcts.get(symbol)
+            if rt_pct is None:
+                # 历史分区的 change_pct 属于旧交易日, 不能冒充当日行情。
+                continue
+            exchange = _symbol_exchange(symbol)
+            bench_rt = bench_rt_by_exchange.get(exchange)
+            if bench_rt is None:
+                # 无对应实时基准时无法按交易所口径续算, 避免产生错误通知。
+                continue
+            rt_delta = rt_pct - bench_rt
 
         windows: dict[str, dict[str, Any]] = {}
         max_closeness = 0.0
@@ -217,7 +270,12 @@ def build_overview(
     return {
         "asof": time.time(),
         "cache_date": cache_date,
-        "bench_rt_pct": round(bench_rt, 4),
+        # 保留既有标量响应契约, 仅用于页面摘要; 逐标的计算使用上面的交易所映射。
+        "bench_rt_pct": round(
+            sum(value for value in bench_rt_by_exchange.values() if value is not None)
+            / max(sum(value is not None for value in bench_rt_by_exchange.values()), 1),
+            4,
+        ),
         "includes_today": includes_today,
         "rules": RULES_META,
         "counts": counts,

@@ -10,7 +10,6 @@ import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import polars as pl
 
@@ -166,11 +165,14 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
         pl.concat(valid, how="diagonal_relaxed")
         .filter(pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null())
     )
-    # 同一 (symbol, period_end) 多条时保留 announce_date 最新一条 (业绩修正以最新公告为准)。
+    # 同一报告期的原公告与修订公告必须同时保留, 历史回测才能按目标日还原当时
+    # 已公开的版本; 仅完全相同的公告版本去重。
+    unique_columns = ["symbol", "period_end"]
     if "announce_date" in merged.columns:
+        unique_columns.append("announce_date")
         merged = merged.sort(["symbol", "period_end", "announce_date"], nulls_last=True)
-    return merged.unique(subset=["symbol", "period_end"], keep="last").sort(
-        ["symbol", "period_end"]
+    return merged.unique(subset=unique_columns, keep="last", maintain_order=True).sort(
+        unique_columns
     )
 
 

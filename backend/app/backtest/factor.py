@@ -430,6 +430,8 @@ class FactorBacktestService:
             "symbol", "date", "open", "high", "low", "close", "volume", "amount",
             "turnover_rate",
         ]
+        if "pb_latest" in factor_names:
+            panel_columns.append("raw_close")
         if any(
             name in ("limit_up_count_20d", "limit_up_count_60d")
             for name in factor_names

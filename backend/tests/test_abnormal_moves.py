@@ -204,8 +204,20 @@ class _FakeRepo:
 class _FakeQuotes:
     def get_index_quotes(self):
         return pl.DataFrame(
-            {"symbol": ["000001.SH"], "close": [3300.0], "prev_close": [3270.0]}
+            {
+                "symbol": ["000001.SH", "399001.SZ"],
+                "close": [3300.0, 1000.0],
+                "prev_close": [3270.0, 1000.0],
+            }
         )
+
+    def get_enriched_today(self):
+        return pl.DataFrame(
+            {
+                "symbol": ["600000.SH", "300001.SZ", "000002.SZ"],
+                "change_pct": [0.05, 0.02, 0.01],
+            }
+        ), date.today()
 
 
 def test_build_overview_closeness_and_status() -> None:
@@ -262,6 +274,104 @@ def test_build_overview_cache_date_today_no_double_count() -> None:
     result = build_overview(_TodayRepo(df), _FakeQuotes(), min_closeness=0.5)
     row = result["rows"][0]
     assert abs(row["windows"]["3d"]["value"] - 0.19) < 1e-9
+
+
+def test_build_overview_stale_snapshot_without_today_quote_fails_closed() -> None:
+    """历史分区过期且没有当日个股行情时, 不得复用旧日涨跌幅。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+    df = pl.DataFrame(
+        {
+            "symbol": ["600000.SH"],
+            "name": ["股A"],
+            "close": [10.0],
+            "change_pct": [0.99],
+            "deviate_3d": [0.19],
+            "deviate_10d": [None],
+            "deviate_30d": [None],
+        }
+    )
+
+    class _StaleQuotes(_FakeQuotes):
+        def get_enriched_today(self):
+            return pl.DataFrame({"symbol": [], "change_pct": []}), date(2026, 8, 19)
+
+    result = build_overview(_FakeRepo(df), _StaleQuotes(), min_closeness=0.0)
+    assert result["rows"] == []
+
+
+def test_build_overview_uses_today_stock_quote_and_exchange_benchmark() -> None:
+    """盘中续算使用当日个股行情, 并按标的交易所选择实时基准。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+    df = pl.DataFrame(
+        {
+            "symbol": ["600000.SH", "000001.SZ"],
+            "name": ["沪股", "深股"],
+            "close": [10.0, 12.0],
+            # 故意放入陈旧的大涨幅, 确保实现不会复用历史分区值。
+            "change_pct": [0.99, 0.99],
+            "deviate_3d": [0.19, 0.19],
+            "deviate_10d": [None, None],
+            "deviate_30d": [None, None],
+        }
+    )
+
+    class _ExchangeQuotes:
+        def get_index_quotes(self):
+            return pl.DataFrame(
+                {
+                    "symbol": ["000001.SH", "399001.SZ"],
+                    # QuoteService 指数缓存使用百分数值, 1.0 表示 1%。
+                    "change_pct": [1.0, -1.0],
+                }
+            )
+
+        def get_enriched_today(self):
+            return pl.DataFrame(
+                {
+                    "symbol": ["600000.SH", "000001.SZ"],
+                    "change_pct": [0.02, 0.02],
+                }
+            ), date.today()
+
+    result = build_overview(_FakeRepo(df), _ExchangeQuotes(), min_closeness=0.0)
+    by_symbol = {row["symbol"]: row for row in result["rows"]}
+    # 沪股: 0.19 + 2% - 1% = 0.20; 深股: 0.19 + 2% - (-1%) = 0.22。
+    assert by_symbol["600000.SH"]["windows"]["3d"]["value"] == 0.20
+    assert by_symbol["000001.SZ"]["windows"]["3d"]["value"] == 0.22
+
+
+def test_build_overview_missing_exchange_benchmark_fails_closed() -> None:
+    """缺少标的所属交易所的实时基准时, 不输出可能触发错误通知的结果。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+    df = pl.DataFrame(
+        {
+            "symbol": ["000001.SZ"],
+            "name": ["深股"],
+            "close": [12.0],
+            "change_pct": [0.99],
+            "deviate_3d": [0.19],
+            "deviate_10d": [None],
+            "deviate_30d": [None],
+        }
+    )
+
+    class _MissingSzBenchmark:
+        def get_index_quotes(self):
+            return pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [1.0]})
+
+        def get_enriched_today(self):
+            return pl.DataFrame(
+                {"symbol": ["000001.SZ"], "change_pct": [0.02]}
+            ), date.today()
+
+    result = build_overview(_FakeRepo(df), _MissingSzBenchmark(), min_closeness=0.0)
+    assert result["rows"] == []
 
 
 def test_build_overview_negative_side_stricter_threshold() -> None:

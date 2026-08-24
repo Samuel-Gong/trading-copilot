@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import threading
-from datetime import date, datetime, timezone
-from functools import reduce
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -33,6 +30,19 @@ def _in_time_window(start: str | None, end: str | None) -> bool:
         return start <= now < end
     # 跨午夜: 如 22:00-02:00
     return now >= start or now < end
+
+
+def _seconds_until_window_start(start: str, *, now: datetime | None = None) -> float | None:
+    """返回本地当前时刻到下一个每日窗口起点的秒数; 格式非法时返回 None。"""
+    current = now or datetime.now()
+    try:
+        hour, minute = (int(part) for part in start.split(":", 1))
+        target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except (TypeError, ValueError):
+        return None
+    if target <= current:
+        target += timedelta(days=1)
+    return max((target - current).total_seconds(), 60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -273,9 +283,19 @@ class PullScheduler:
                     fresh.pull.last_run = datetime.now(timezone.utc).isoformat()
                     fresh.pull.last_status = "skipped"
                     fresh.pull.last_message = "不在拉取时间窗口内"
+                    schedule_interval = max(pull.schedule_minutes * 60, 60)
+                    until_window = _seconds_until_window_start(pull.time_window_start)
+                    interval = (
+                        min(schedule_interval, until_window)
+                        if until_window is not None
+                        else schedule_interval
+                    )
+                    next_dt = datetime.now(timezone.utc).timestamp() + interval
+                    fresh.pull.next_run = datetime.fromtimestamp(
+                        next_dt, tz=timezone.utc
+                    ).isoformat()
                     store.upsert(fresh)
                     logger.info("PullScheduler: %s skipped (outside time window)", config.id)
-                    interval = max(pull.schedule_minutes * 60, 60)
                     await asyncio.sleep(interval)
                     continue
 
