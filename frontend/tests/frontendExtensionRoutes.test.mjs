@@ -26,9 +26,9 @@ test('全部已注册核心页面都拒绝扩展路由覆盖', async () => {
     [...block[1].matchAll(/'([^']+)'/g)].map(match => match[1]),
   )
   const registry = await vite.ssrLoadModule('/src/extensions/registry.ts')
-  const paths = ['/watch-pool', '/portfolio', '/daily-review']
+  const paths = ['/watch-pool', '/portfolio', '/daily-review', '/WATCHLIST/']
 
-  await registry.loadFrontendExtensions(Object.fromEntries(paths.map((path, index) => [
+  const modules = Object.fromEntries(paths.map((path, index) => [
     `extension-${index}`,
     async () => ({
       default: {
@@ -37,12 +37,38 @@ test('全部已注册核心页面都拒绝扩展路由覆盖', async () => {
         routes: [{ id: `route-${index}`, path, component: () => React.createElement('div') }],
       },
     }),
-  ])))
+  ]))
+  modules['extension-duplicate-0'] = async () => ({
+    default: {
+      id: 'duplicate-0',
+      apiVersion: 1,
+      routes: [{
+        id: 'duplicate-route-0',
+        path: '/custom-route',
+        component: () => React.createElement('div'),
+      }],
+    },
+  })
+  modules['extension-duplicate-1'] = async () => ({
+    default: {
+      id: 'duplicate-1',
+      apiVersion: 1,
+      routes: [{
+        id: 'duplicate-route-1',
+        path: '/CUSTOM-ROUTE/',
+        component: () => React.createElement('div'),
+      }],
+    },
+  })
+  await registry.loadFrontendExtensions(modules)
   registry.finalizeFrontendExtensions(reservedPaths)
 
-  assert.deepEqual(registry.getFrontendExtensionRoutes(), [])
+  assert.deepEqual(
+    registry.getFrontendExtensionRoutes().map(route => route.extensionId),
+    ['duplicate-0'],
+  )
   assert.deepEqual(
     registry.getFrontendExtensionLoadErrors().map(error => error.extensionId).sort(),
-    ['conflict-0', 'conflict-1', 'conflict-2'],
+    ['conflict-0', 'conflict-1', 'conflict-2', 'conflict-3', 'duplicate-1'],
   )
 })

@@ -96,8 +96,64 @@ def _processed_mainline_dates(data_dir: Path, kind: str) -> set[date]:
     )
 
 
+def _enriched_partition_mtime_ns(repo, target_date: date) -> int | None:
+    part = (
+        repo.store.data_dir
+        / "kline_daily_enriched"
+        / f"date={target_date.isoformat()}"
+        / "part.parquet"
+    )
+    try:
+        return part.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _stale_mainline_dates(
+    data_dir: Path,
+    repo,
+    kind: str,
+    completed_dates: set[date],
+) -> set[date]:
+    """返回源分区版本与完成水位不一致的已处理日期。"""
+    path = mainline_coverage_path(data_dir)
+    versions: dict[date, int | None] = {}
+    if path.exists():
+        try:
+            frame = pl.read_parquet(path)
+            if {"date", "kind", "source_mtime_ns"}.issubset(frame.columns):
+                versions = {
+                    row["date"]: row["source_mtime_ns"]
+                    for row in frame.filter(pl.col("kind") == kind)
+                    .select(["date", "source_mtime_ns"])
+                    .iter_rows(named=True)
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("load mainline coverage versions failed: %s", exc)
+
+    legacy_mtime_ns = 0
+    for completed_path in (mainline_path(data_dir), path):
+        try:
+            legacy_mtime_ns = max(legacy_mtime_ns, completed_path.stat().st_mtime_ns)
+        except OSError:
+            continue
+
+    stale: set[date] = set()
+    for target_date in completed_dates:
+        source_mtime_ns = _enriched_partition_mtime_ns(repo, target_date)
+        if source_mtime_ns is None:
+            continue
+        recorded_mtime_ns = versions.get(target_date)
+        if target_date in versions and recorded_mtime_ns != source_mtime_ns:
+            stale.add(target_date)
+        elif target_date not in versions and source_mtime_ns > legacy_mtime_ns:
+            stale.add(target_date)
+    return stale
+
+
 def _mark_mainline_dates_processed(
     data_dir: Path,
+    repo,
     kind: str,
     dates: set[date],
 ) -> None:
@@ -105,16 +161,25 @@ def _mark_mainline_dates_processed(
         return
     path = mainline_coverage_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    ordered_dates = sorted(dates)
     incoming = pl.DataFrame({
-        "date": sorted(dates),
-        "kind": [kind] * len(dates),
+        "date": pl.Series(ordered_dates, dtype=pl.Date),
+        "kind": pl.Series([kind] * len(ordered_dates), dtype=pl.Utf8),
+        "source_mtime_ns": pl.Series(
+            [_enriched_partition_mtime_ns(repo, item) for item in ordered_dates],
+            dtype=pl.Int64,
+        ),
     })
     old = pl.read_parquet(path) if path.exists() else pl.DataFrame()
+    if not old.is_empty() and "source_mtime_ns" not in old.columns:
+        old = old.with_columns(pl.lit(None).cast(pl.Int64).alias("source_mtime_ns"))
     combined = incoming if old.is_empty() else pl.concat(
-        [old.select(["date", "kind"]), incoming],
+        [old.select(incoming.columns), incoming],
         how="vertical_relaxed",
     )
-    combined.unique(subset=["date", "kind"]).sort(["date", "kind"]).write_parquet(path)
+    combined.unique(subset=["date", "kind"], keep="last").sort(
+        ["date", "kind"]
+    ).write_parquet(path)
 
 
 _ST_SYMBOLS_CACHE: tuple[float, frozenset[str]] | None = None
@@ -457,7 +522,7 @@ def replace_mainline_history_range(
 
 def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = None,
                                  kind: str = "concept") -> pl.DataFrame:
-    """增量补算主线(供 daily_pipeline / 手动触发): 补 enriched 已有而主线缺失的日。"""
+    """增量补算主线：补缺失日，并重算被覆写的 enriched 分区。"""
     today = today or date.today()
     from app.services.regime_builder import enriched_date_set
 
@@ -467,11 +532,28 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
     processed_dates = _processed_mainline_dates(data_dir, kind)
     completed_dates = existing_dates | processed_dates
     missing = sorted(d for d in enriched_dates if d not in completed_dates and d <= today)
-    if not missing:
+    stale = sorted(
+        d for d in _stale_mainline_dates(data_dir, repo, kind, completed_dates)
+        if d in enriched_dates and d <= today
+    )
+    to_compute = sorted(set(missing) | set(stale))
+    if not to_compute:
         return pl.DataFrame()
-    logger.info("mainline incremental(%s): compute %d days", kind, len(missing))
-    new_rows = compute_mainline_range(repo, data_dir, missing[0], missing[-1], kind=kind)
+    logger.info(
+        "mainline incremental(%s): compute %d days (missing=%d, stale=%d)",
+        kind,
+        len(to_compute),
+        len(missing),
+        len(stale),
+    )
+    new_rows = compute_mainline_range(
+        repo,
+        data_dir,
+        to_compute[0],
+        to_compute[-1],
+        kind=kind,
+    )
     if not new_rows.is_empty():
         upsert_mainline_history(data_dir, new_rows)
-    _mark_mainline_dates_processed(data_dir, kind, set(missing))
+    _mark_mainline_dates_processed(data_dir, repo, kind, set(to_compute))
     return new_rows

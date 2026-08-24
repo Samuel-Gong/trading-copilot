@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -29,7 +28,6 @@ WorkerRunner = Callable[
 TaskFactory = Callable[[str, Path, dict[str, Any]], dict[str, Any]]
 
 _SUCCESS_STATUSES = {"succeeded", "succeeded_with_budget_exhausted"}
-_SHUTDOWN_JOIN_SECONDS = 1.0
 
 
 class MiningJobManager:
@@ -132,21 +130,15 @@ class MiningJobManager:
     def shutdown(self) -> None:
         with self._lock:
             self._shutdown = True
-            run_ids = list(self._threads)
-        for run_id in run_ids:
+            workers = list(self._threads.items())
+        for run_id, _ in workers:
             self.cancel(run_id)
 
-        deadline = time.monotonic() + _SHUTDOWN_JOIN_SECONDS
         current = threading.current_thread()
-        for run_id in run_ids:
-            with self._lock:
-                thread = self._threads.get(run_id)
-            if thread is None or thread is current:
+        for _, thread in workers:
+            if thread is current:
                 continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            thread.join(timeout=remaining)
+            thread.join()
 
     def recover_interrupted(self) -> int:
         return self._store.recover_interrupted()

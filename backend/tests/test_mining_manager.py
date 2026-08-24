@@ -321,9 +321,8 @@ def test_recover_interrupted_delegates_to_store(make_manager) -> None:
     assert manager.store.get("queued_before_restart")["status"] == "interrupted"  # type: ignore[index]
 
 
-def test_shutdown_sets_cancel_uses_bounded_join_and_keeps_history(
+def test_shutdown_waits_for_workers_and_keeps_history(
     make_manager,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner_started = threading.Event()
     release_runner = threading.Event()
@@ -333,19 +332,24 @@ def test_shutdown_sets_cancel_uses_bounded_join_and_keeps_history(
         assert release_runner.wait(2)
         return {"status": "succeeded"}
 
-    monkeypatch.setattr(mining_manager_module, "_SHUTDOWN_JOIN_SECONDS", 0.02)
     manager = make_manager(runner)
     created = manager.start({"factor_names": ["reversal"]}, "data-v1")
     run_id = created["run_id"]
     assert runner_started.wait(1)
 
-    started = time.monotonic()
-    manager.shutdown()
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.2
-    assert manager.store.get(run_id)["status"] == "cancelling"  # type: ignore[index]
+    shutdown_done = threading.Event()
+    shutdown_thread = threading.Thread(
+        target=lambda: (manager.shutdown(), shutdown_done.set()),
+    )
+    shutdown_thread.start()
 
-    release_runner.set()
+    try:
+        assert not shutdown_done.wait(1.1)
+        assert manager.store.get(run_id)["status"] == "cancelling"  # type: ignore[index]
+    finally:
+        release_runner.set()
+        assert shutdown_done.wait(1)
+        shutdown_thread.join()
     _wait_for_status(manager, run_id, "cancelled")
     assert manager.store.get(run_id) is not None
     with pytest.raises(RuntimeError, match="shut down"):

@@ -26,6 +26,11 @@ function assertId(value: string, label: string) {
   if (!ID_RE.test(value)) throw new Error(`${label} 非法: ${value}`)
 }
 
+function normalizeRoutePath(path: string) {
+  const withoutTrailingSlash = path.length > 1 ? path.replace(/\/+$/, '') : path
+  return withoutTrailingSlash.toLowerCase()
+}
+
 function registerExtension(extension: FrontendExtension) {
   assertMutable()
   assertId(extension.id, '扩展 ID')
@@ -46,12 +51,15 @@ function registerExtension(extension: FrontendExtension) {
     if (routes.has(route.id) || localRouteIds.has(route.id)) {
       throw new Error(`扩展路由 ID 重复: ${route.id}`)
     }
-    const duplicatePath = [...routes.values()].find(item => item.path === route.path)
-    if (duplicatePath || localRoutePaths.has(route.path)) {
+    const routePathKey = normalizeRoutePath(route.path)
+    const duplicatePath = [...routes.values()].find(
+      item => normalizeRoutePath(item.path) === routePathKey,
+    )
+    if (duplicatePath || localRoutePaths.has(routePathKey)) {
       throw new Error(`扩展路由路径重复: ${route.path}`)
     }
     localRouteIds.add(route.id)
-    localRoutePaths.add(route.path)
+    localRoutePaths.add(routePathKey)
   }
 
   const localNavigationIds = new Set<string>()
@@ -154,8 +162,8 @@ function removeExtension(extensionId: string) {
 }
 
 function coreRouteMatches(pattern: string, path: string) {
-  const patternParts = pattern.split('/').filter(Boolean)
-  const pathParts = path.split('/').filter(Boolean)
+  const patternParts = normalizeRoutePath(pattern).split('/').filter(Boolean)
+  const pathParts = normalizeRoutePath(path).split('/').filter(Boolean)
   return patternParts.length === pathParts.length
     && patternParts.every((part, index) => part.startsWith(':') || part === pathParts[index])
 }

@@ -1,6 +1,7 @@
 """市场主线(market_mainline)与过滤配置单元测试。"""
 from __future__ import annotations
 
+import os
 from datetime import date
 
 import polars as pl
@@ -183,6 +184,43 @@ class TestComputeMainline:
         ).is_empty()
 
         assert calls == [(d1, d2, "concept")]
+
+    def test_incremental_recomputes_overwritten_enriched_partition(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """已处理 enriched 分区被覆写后，仍应重新计算对应交易日。"""
+        repo, d1, d2 = self._setup(tmp_path, monkeypatch)
+        calls: list[tuple[date, date, str]] = []
+
+        def compute(current_repo, data_dir, start, end, kind="concept", **kwargs):
+            calls.append((start, end, kind))
+            return pl.DataFrame()
+
+        monkeypatch.setattr(market_mainline, "compute_mainline_range", compute)
+
+        market_mainline.compute_mainline_incremental(
+            repo, tmp_path, today=d2, kind="concept",
+        )
+        market_mainline.compute_mainline_incremental(
+            repo, tmp_path, today=d2, kind="concept",
+        )
+
+        overwritten = (
+            tmp_path / "kline_daily_enriched" / f"date={d2.isoformat()}" / "part.parquet"
+        )
+        future = overwritten.stat().st_mtime + 10
+        os.utime(overwritten, (future, future))
+
+        market_mainline.compute_mainline_incremental(
+            repo, tmp_path, today=d2, kind="concept",
+        )
+
+        assert calls == [
+            (d1, d2, "concept"),
+            (d2, d2, "concept"),
+        ]
 
     def test_industry_level_truncation(self, tmp_path, monkeypatch):
         d1 = date(2024, 1, 2)
