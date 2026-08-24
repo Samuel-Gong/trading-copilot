@@ -114,6 +114,28 @@ def test_engine_group_scope_empty_group(monkeypatch, tmp_path):
     assert eng.evaluate(_stock_df()) == []
 
 
+def test_engine_group_rebind_clears_rule_runtime_state():
+    """同一规则改绑分组时必须丢弃旧分组的冷却与策略运行态。"""
+    eng = MonitorRuleEngine()
+    eng.set_rules([_group_rule(group_id="group-a")])
+    eng._last_fire[("r_grp", "600000.SH", "signal")] = 100.0
+    eng._strategy_pools[("r_grp", "strategy-a", "stock")] = {"600000.SH"}
+    eng._strategy_signal_state[("r_grp", "strategy-a", "stock", "buy_signal")] = (
+        "2026-08-24",
+        {"600000.SH"},
+    )
+    eng._strategy_signal_seen[(
+        "r_grp", "strategy-a", "stock", "buy_signal", "600000.SH",
+    )] = "2026-08-24"
+
+    eng.set_rules([_group_rule(group_id="group-b")])
+
+    assert not eng._last_fire
+    assert not eng._strategy_pools
+    assert not eng._strategy_signal_state
+    assert not eng._strategy_signal_seen
+
+
 def test_abnormal_group_scope_filtering(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     _, group = watchlist.create_group("异动池")

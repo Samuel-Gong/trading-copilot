@@ -169,7 +169,7 @@ class TestClassifyPhaseSeries:
         ])
         assert PHASE_IGNITE in labels
 
-    def test_promo_null_leading_days_ffilled(self):
+    def test_promo_null_leading_days_are_still_classified(self):
         specs = [
             {"days": 4, "height": 5, "first": 40, "ge2": 10, "promo": None, "seal": 0.6, "state": "range"},
             {"days": 4, "height": 6, "first": 50, "ge2": 14, "promo": 0.25, "seal": 0.68, "state": "strong"},
@@ -177,6 +177,26 @@ class TestClassifyPhaseSeries:
         df = _series(specs)
         out = classify_phase_series(df)
         assert out["phase"].null_count() == 0
+
+    def test_leading_null_promo_is_not_backfilled_from_future_days(self):
+        """追加未来晋级率不能反向改写此前阶段。"""
+        leading = {
+            "days": 4, "height": 8, "first": 60, "ge2": 18,
+            "promo": None, "seal": 0.7, "state": "strong",
+        }
+        prefix = _series([leading])
+        with_future = _series([
+            leading,
+            {
+                "days": 4, "height": 8, "first": 60, "ge2": 18,
+                "promo": 0.3, "seal": 0.7, "state": "strong",
+            },
+        ])
+
+        expected = classify_phase_series(prefix)["phase"].to_list()
+        actual = classify_phase_series(with_future)["phase"].to_list()[: prefix.height]
+
+        assert actual == expected
 
 
 class TestRefreshPhaseLabels:

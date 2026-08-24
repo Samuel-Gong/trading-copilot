@@ -419,6 +419,7 @@ class MonitorRuleEngine:
             rule.get("score_max"),
             rule.get("asset_type", "stock"),
             rule.get("scope", "symbols"),
+            rule.get("group_id"),
             tuple(sorted(str(symbol) for symbol in rule.get("symbols", []))),
             rule.get("sector"),
             rule.get("sector_kind"),

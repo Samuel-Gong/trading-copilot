@@ -147,25 +147,16 @@ def finalize_ladder_row(r: dict) -> dict:
     }
 
 
-def _ema(values: list[float], alpha: float = _EMA_ALPHA) -> list[float]:
+def _ema(values: list[float | None], alpha: float = _EMA_ALPHA) -> list[float]:
     out: list[float] = []
     cur = None
     for v in values:
         if v is None or v != v:  # None 或 NaN
-            if cur is None:
-                out.append(None)
-                continue
-            out.append(cur)  # ffill: 缺失沿用上一平滑值
+            # 首次有效值前只能使用当时可知的默认值，禁止用未来值反向回填。
+            out.append(cur if cur is not None else 0.0)
             continue
         cur = v if cur is None else cur + alpha * (v - cur)
         out.append(cur)
-    # 前向回填: 序列开头缺失用首个有效值
-    first_valid = next((i for i, x in enumerate(out) if x is not None), None)
-    if first_valid is not None:
-        for i in range(first_valid):
-            out[i] = out[first_valid]
-    else:
-        out = [0.0] * len(values)
     return out
 
 
@@ -173,7 +164,7 @@ def classify_phase_series(daily: pl.DataFrame) -> pl.DataFrame:
     """对完整日序打阶段标签, 追加 phase 列。
 
     输入列: date, max_consecutive, first_board, ge2_count, promo_rate, seal_rate
-    (promo_rate 允许 null)。处理: promo 前向填充 → 各驱动 EMA 平滑 →
+    (promo_rate 允许 null)。处理: promo 仅向未来填充 → 各驱动 EMA 平滑 →
     逐日规则判定(按优先级) → 连续 _CONFIRM_DAYS 日同标签才切换(持续性)。
     """
     required = {"date", "max_consecutive", "first_board", "ge2_count", "promo_rate", "seal_rate"}

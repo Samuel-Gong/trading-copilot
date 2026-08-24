@@ -99,11 +99,13 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo }: Props
     queryFn: api.monitorRulesList,
     enabled: !!symbol,
   })
-  // 异动边缘: 与异动页同 queryKey 共享缓存; 该股处于观察/边缘/触发状态时在图表上方显示信息条
+  const abnormalEnabled = storage.abnormalEnabled.get(false)
+  // 异动边缘: 与异动页同 queryKey 共享缓存; 主开关关闭时只读已有缓存，不触发全市场计算。
   const abnormal = useQuery({
     queryKey: QK.abnormalOverview(0.5, 300),
     queryFn: () => api.abnormalOverview(0.5, 300),
-    enabled: !!symbol,
+    enabled: !!symbol && abnormalEnabled,
+    staleTime: 60_000,
   })
   const abRow = symbol
     ? abnormal.data?.rows.find(r => r.symbol === symbol)
