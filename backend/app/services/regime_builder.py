@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -331,7 +331,6 @@ def _compute_batch(repo, enriched_dir, instruments, historical_shares,
     warmup 前缀保证每批边界的滚动窗口指标(ma20)正确, 不依赖相邻批次。
     返回目标区间(不含 warmup)的含指标列 DataFrame。
     """
-    from datetime import timedelta
     from app.indicators.pipeline import compute_indicators, compute_limit_signals
     warmup_start = batch_start - timedelta(days=warmup_days)
     df = pl.scan_parquet(enriched_dir / "**" / "*.parquet").filter(
@@ -440,8 +439,14 @@ def run_regime_batch(repo, start: date, end: date) -> pl.DataFrame:
     # 指数涨幅(主力指数)
     index_pct_map = _load_index_pct(repo, start, end)
 
+    # 晋级率依赖上一交易日连板池。缓存快路径也必须带一个交易日前缀，不能只取
+    # 目标日；优先从分区目录精确定位，目录不可用时多取 45 个日历日并让缓存裁剪。
+    available_dates = enriched_date_set(repo)
+    previous_date = max((value for value in available_dates if value < start), default=None)
+    cache_start = previous_date or (start - timedelta(days=45))
+
     # enriched 多日数据(优先缓存)
-    df = repo.get_enriched_range(start, end)
+    df = repo.get_enriched_range(cache_start, end)
     if df is None or df.is_empty():
         logger.info("regime batch: enriched cache miss [%s~%s], fallback to scan", start, end)
         df = _scan_enriched_fallback(repo, start, end)
@@ -449,24 +454,12 @@ def run_regime_batch(repo, start: date, end: date) -> pl.DataFrame:
         logger.info("regime batch: no enriched data for [%s~%s]", start, end)
         return pl.DataFrame()
 
-    # 口径: 默认剔除风险警示(ST)股(与主线统计同一开关) — 主板 ST 在 2026-07 前
-    # 享 5% 涨跌幅且是跨行业状态桶, 混入会系统性抬高涨停宽度/高度(弱市炒 ST 尤甚)。
-    # 涨跌家数/MA20 占比等宽度指标几乎不受影响。切换口径需全量重算 regime。
-    try:
-        from app.services import preferences as _prefs_st
-        exclude_st = _prefs_st.get_sentiment_exclude_st()
-    except Exception:
-        exclude_st = True
-    if exclude_st:
-        from app.services.market_mainline import load_risk_warning_symbols
-
-        st_syms = load_risk_warning_symbols(repo.store.data_dir)
-        if st_syms and "symbol" in df.columns:
-            df = df.filter(
-                ~pl.col("symbol").str.to_uppercase().is_in(sorted(st_syms))
-            )
-
-    return _aggregate_daily(df, index_pct_map)
+    # 当前 instruments 名称没有历史生效日期，不能用一个当前 ST 集合过滤整段历史。
+    # 在引入 point-in-time 风险警示状态前，历史 regime 明确停用该过滤。
+    aggregated = _aggregate_daily(df, index_pct_map)
+    if aggregated.is_empty():
+        return aggregated
+    return aggregated.filter((pl.col("date") >= start) & (pl.col("date") <= end))
 
 
 # ───────────────────────── 持久化(upsert) ─────────────────────────

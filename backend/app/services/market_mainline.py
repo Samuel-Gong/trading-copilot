@@ -5,9 +5,9 @@
 截面 rank 归一后加权成主线分, 持久化为日频时序, 供市场环境页展示
 "什么阶段走什么主升"。
 
-口径限制(重要): 概念成分来自 ext_gn_ths 快照(本地自 2026-07 起留存, 无历史
-版本)。历史主线是把"今天的成分"回看历史 — 早年存在归属漂移(新概念不会
-出现在旧时段、成分调整会错归属)。MEMBERSHIP_NOTE 随 API 返回给前端展示。
+口径限制(重要): 历史主线只使用带日期的 timeseries 概念/行业成分快照，按交易日
+选择当时最新可用版本。没有 point-in-time 版本的 snapshot 数据不参与历史计算，
+避免把当前成分回填到过去。MEMBERSHIP_NOTE 随 API 返回给前端展示。
 
 性能: 全量回填只窄扫 enriched 的 4 列并先过滤连板 >=1(全历史 ~10 万行),
 join 概念映射后 group_by, 峰值内存 <100MB。
@@ -21,13 +21,19 @@ from pathlib import Path
 
 import polars as pl
 
-from app.services.rps_rotation import _load_concept_map_df
+from app.services.ext_data import ExtConfigStore
+from app.services.market_overview_builder import (
+    _dimension_field,
+    _dimension_values,
+    _ext_files,
+    _symbol_keys,
+)
 
 logger = logging.getLogger(__name__)
 
 MEMBERSHIP_NOTE = (
-    "概念成分为当前快照回看历史(本地自 2026-07 起留存, 无历史版本), "
-    "早年主线存在归属漂移, 越近越准"
+    "历史主线仅使用带日期的成分快照，并按交易日选择当时最新可用版本；"
+    "早于首个版本的日期不计算"
 )
 
 MAINLINE_DIR = "mainline_history"
@@ -120,6 +126,78 @@ def _industry_member(member: str, kind: str) -> str:
     return "-".join(member.split("-")[:_INDUSTRY_LEVEL])
 
 
+def _load_point_in_time_map_df(repo, kind: str) -> pl.DataFrame:
+    """加载带生效日期的概念/行业成分版本；snapshot 数据一律 fail-closed。"""
+    data_dir = repo.store.data_dir
+    pairs: list[tuple[date, str, str]] = []
+    for config in ExtConfigStore(data_dir).load_all():
+        if config.mode != "timeseries":
+            continue
+        field = _dimension_field(config, kind)
+        if not field:
+            continue
+        files = _ext_files(data_dir, config)
+        if not files:
+            continue
+        try:
+            frame = pl.read_parquet(files, hive_partitioning=True)
+        except TypeError:
+            frame = pl.read_parquet(files)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("load point-in-time %s membership failed: %s", kind, exc)
+            continue
+        if frame.is_empty() or field not in frame.columns or "date" not in frame.columns:
+            continue
+        for row in frame.to_dicts():
+            effective = row.get("date")
+            if not isinstance(effective, date):
+                try:
+                    effective = date.fromisoformat(str(effective))
+                except (TypeError, ValueError):
+                    continue
+            members = _dimension_values(row.get(field))
+            if not members:
+                continue
+            for symbol in _symbol_keys(row, config):
+                for member in members:
+                    pairs.append((effective, symbol, member))
+    if not pairs:
+        return pl.DataFrame(schema={
+            "_effective_date": pl.Date,
+            "_sym_up": pl.Utf8,
+            kind: pl.Utf8,
+        })
+    return pl.DataFrame({
+        "_effective_date": [item[0] for item in pairs],
+        "_sym_up": [item[1] for item in pairs],
+        kind: [item[2] for item in pairs],
+    }).unique()
+
+
+def _join_point_in_time_membership(
+    limit_rows: pl.DataFrame,
+    map_df: pl.DataFrame,
+    kind: str,
+) -> pl.DataFrame:
+    """按交易日选择不晚于该日的最近一组成分快照。"""
+    versions = sorted(map_df["_effective_date"].unique().to_list())
+    parts: list[pl.DataFrame] = []
+    for index, effective in enumerate(versions):
+        next_effective = versions[index + 1] if index + 1 < len(versions) else None
+        rows = limit_rows.filter(pl.col("date") >= effective)
+        if next_effective is not None:
+            rows = rows.filter(pl.col("date") < next_effective)
+        if rows.is_empty():
+            continue
+        membership = map_df.filter(pl.col("_effective_date") == effective).drop(
+            "_effective_date"
+        )
+        joined = rows.join(membership, on="_sym_up", how="inner")
+        if not joined.is_empty():
+            parts.append(joined)
+    return pl.concat(parts, how="vertical_relaxed") if parts else pl.DataFrame()
+
+
 def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
                            kind: str = "concept",
                            filter_cfg: dict | None = None,
@@ -129,8 +207,8 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
     filter_cfg: {"min_members", "max_members", "blacklist"}; None 时读用户偏好。
     宽基/风格标签(融资融券/沪深股通等数千成分)按成员数上限过滤,
     用户黑名单按名称过滤(不论大小)。修改配置后重算主线生效。
-    exclude_st: 是否剔除风险警示(ST)股(按当前维表名称); None 时读用户偏好
-    (默认剔除 — ST 是状态桶非题材, 主板 5% 便宜板时代曾系统性霸榜)。
+    exclude_st: 为兼容既有调用保留。历史 ST 状态没有 point-in-time 版本，故历史
+    主线不执行当前名称快照过滤；待引入带日期的风险警示状态后再启用。
 
     返回列: date, kind, member, limit_up_count, ge2_count, max_boards,
     boards_sum, rungs_filled, leader_symbol, score, rank。空数据返回空表。
@@ -141,20 +219,22 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
     if not enriched_dir.exists():
         return pl.DataFrame()
 
-    map_df, _ = _load_concept_map_df(repo, kind)
+    map_df = _load_point_in_time_map_df(repo, kind)
     if map_df.is_empty():
         return pl.DataFrame()
 
     cfg = _resolve_filter_config(filter_cfg)
     if cfg["min_members"] > 1 or cfg["max_members"] < 5000 or cfg["blacklist"]:
-        member_counts = map_df.group_by(kind).len().rename({"len": "_members"})
+        member_counts = map_df.group_by(["_effective_date", kind]).len().rename(
+            {"len": "_members"}
+        )
         member_counts = member_counts.filter(
             pl.col("_members").ge(cfg["min_members"])
             & pl.col("_members").le(cfg["max_members"])
             & ~pl.col(kind).is_in(sorted(cfg["blacklist"]))
         )
-        allowed = member_counts.select(kind)
-        map_df = map_df.join(allowed, on=kind, how="semi")
+        allowed = member_counts.select(["_effective_date", kind])
+        map_df = map_df.join(allowed, on=["_effective_date", kind], how="semi")
         if map_df.is_empty():
             return pl.DataFrame()
 
@@ -172,19 +252,9 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
 
     limit_rows = limit_rows.with_columns(pl.col("symbol").str.to_uppercase().alias("_sym_up"))
 
-    # 剔除风险警示股: ST 板块的涨停生态(主板曾 5% 便宜板)不代表题材主线。
-    if exclude_st is None:
-        try:
-            from app.services import preferences
-            exclude_st = preferences.get_sentiment_exclude_st()
-        except Exception:
-            exclude_st = True
-    if exclude_st:
-        st_syms = load_risk_warning_symbols(repo.store.data_dir)
-        if st_syms:
-            limit_rows = limit_rows.filter(~pl.col("_sym_up").is_in(sorted(st_syms)))
-
-    joined = limit_rows.join(map_df, on="_sym_up", how="inner")
+    # 当前 instruments 名称没有历史生效日期，不得据此回看过滤过去的 ST 状态。
+    # exclude_st 参数保留兼容，历史口径在有 point-in-time 状态源前保持不滤。
+    joined = _join_point_in_time_membership(limit_rows, map_df, kind)
     if joined.is_empty():
         return pl.DataFrame()
     joined = joined.with_columns(

@@ -217,7 +217,7 @@ class _FakeQuotes:
                 "symbol": ["600000.SH", "300001.SZ", "000002.SZ"],
                 "change_pct": [0.05, 0.02, 0.01],
             }
-        ), date.today()
+        ), cn_today()
 
 
 def test_build_overview_closeness_and_status() -> None:
@@ -258,7 +258,7 @@ def test_build_overview_cache_date_today_no_double_count() -> None:
 
     class _TodayRepo(_FakeRepo):
         def get_enriched_latest(self):
-            return self._df, date.today()
+            return self._df, cn_today()
 
     df = pl.DataFrame(
         {
@@ -335,7 +335,7 @@ def test_build_overview_uses_today_stock_quote_and_exchange_benchmark() -> None:
                     "symbol": ["600000.SH", "000001.SZ"],
                     "change_pct": [0.02, 0.02],
                 }
-            ), date.today()
+            ), cn_today()
 
     result = build_overview(_FakeRepo(df), _ExchangeQuotes(), min_closeness=0.0)
     by_symbol = {row["symbol"]: row for row in result["rows"]}
@@ -368,7 +368,7 @@ def test_build_overview_missing_exchange_benchmark_fails_closed() -> None:
         def get_enriched_today(self):
             return pl.DataFrame(
                 {"symbol": ["000001.SZ"], "change_pct": [0.02]}
-            ), date.today()
+            ), cn_today()
 
     result = build_overview(_FakeRepo(df), _MissingSzBenchmark(), min_closeness=0.0)
     assert result["rows"] == []
@@ -381,7 +381,7 @@ def test_build_overview_negative_side_stricter_threshold() -> None:
 
     class _TodayRepo(_FakeRepo):
         def get_enriched_latest(self):
-            return self._df, date.today()
+            return self._df, cn_today()
 
     df = pl.DataFrame(
         {

@@ -6,6 +6,7 @@ from datetime import date
 import polars as pl
 
 from app.services import market_mainline, preferences
+from app.services.ext_data import ExtConfig, ExtConfigStore, ExtField
 
 
 def _write_enriched(root, rows: list[dict]) -> None:
@@ -25,17 +26,25 @@ def _fake_repo(tmp_path):
     return types.SimpleNamespace(store=types.SimpleNamespace(data_dir=tmp_path))
 
 
-def _patch_map(monkeypatch, mapping: dict[str, list[str]], kind: str = "concept") -> None:
+def _patch_map(
+    monkeypatch,
+    mapping: dict[str, list[str]],
+    kind: str = "concept",
+    effective_date: date = date(2024, 1, 2),
+) -> None:
     map_df = pl.DataFrame(
-        {"_sym_up": [s for s, ms in mapping.items() for _ in ms],
-         kind: [m for _, ms in mapping.items() for m in ms]},
-        schema={"_sym_up": pl.Utf8, kind: pl.Utf8},
+        {
+            "_effective_date": [effective_date for _, ms in mapping.items() for _ in ms],
+            "_sym_up": [s for s, ms in mapping.items() for _ in ms],
+            kind: [m for _, ms in mapping.items() for m in ms],
+        },
+        schema={"_effective_date": pl.Date, "_sym_up": pl.Utf8, kind: pl.Utf8},
     ).unique()
 
     def fake_load(repo, k="concept"):
-        return (map_df, map_df[kind].n_unique()) if k == kind else (pl.DataFrame(), 0)
+        return map_df if k == kind else pl.DataFrame()
 
-    monkeypatch.setattr(market_mainline, "_load_concept_map_df", fake_load)
+    monkeypatch.setattr(market_mainline, "_load_point_in_time_map_df", fake_load)
 
 
 def _mk_rows(d: date, spec: list[tuple[str, int, float]]) -> list[dict]:
@@ -137,6 +146,92 @@ class TestComputeMainline:
         assert sw["limit_up_count"] == 3
         assert sw["max_boards"] == 3
 
+    def test_snapshot_membership_is_not_backfilled_into_history(self, tmp_path):
+        """没有生效日期的当前概念快照不能用于历史主线重算。"""
+        historical_date = date(2024, 1, 2)
+        symbols = ["S1.SH", "S2.SH", "S3.SH"]
+        _write_enriched(
+            tmp_path,
+            _mk_rows(historical_date, [(symbol, 1, 1e8) for symbol in symbols]),
+        )
+        config = ExtConfig(
+            id="snapshot_concepts",
+            label="当前概念",
+            mode="snapshot",
+            fields=[
+                ExtField("symbol", "string", "标的代码"),
+                ExtField("concept", "string", "概念"),
+            ],
+        )
+        ExtConfigStore(tmp_path).upsert(config)
+        snapshot = tmp_path / "ext_data" / config.id / "part.parquet"
+        pl.DataFrame({
+            "symbol": symbols,
+            "concept": ["后来新增"] * len(symbols),
+        }).write_parquet(snapshot)
+
+        out = market_mainline.compute_mainline_range(
+            _fake_repo(tmp_path),
+            tmp_path,
+            historical_date,
+            historical_date,
+            kind="concept",
+            filter_cfg={"min_members": 1, "max_members": 5000, "blacklist": []},
+            exclude_st=False,
+        )
+
+        assert out.is_empty()
+
+    def test_timeseries_membership_uses_version_effective_on_each_date(self, tmp_path):
+        """带日期的成分快照按生效日切换，不把新版本回填到旧交易日。"""
+        first_date = date(2024, 1, 2)
+        second_date = date(2024, 1, 3)
+        symbols = ["S1.SH", "S2.SH", "S3.SH"]
+        _write_enriched(
+            tmp_path,
+            _mk_rows(first_date, [(symbol, 1, 1e8) for symbol in symbols])
+            + _mk_rows(second_date, [(symbol, 1, 1e8) for symbol in symbols]),
+        )
+        config = ExtConfig(
+            id="versioned_concepts",
+            label="历史概念",
+            mode="timeseries",
+            fields=[
+                ExtField("symbol", "string", "标的代码"),
+                ExtField("concept", "string", "概念"),
+            ],
+        )
+        ExtConfigStore(tmp_path).upsert(config)
+        for effective, member in ((first_date, "旧概念"), (second_date, "新概念")):
+            part = (
+                tmp_path
+                / "ext_data"
+                / config.id
+                / "timeseries"
+                / f"date={effective}"
+                / "part.parquet"
+            )
+            part.parent.mkdir(parents=True, exist_ok=True)
+            pl.DataFrame({
+                "symbol": symbols,
+                "concept": [member] * len(symbols),
+            }).write_parquet(part)
+
+        out = market_mainline.compute_mainline_range(
+            _fake_repo(tmp_path),
+            tmp_path,
+            first_date,
+            second_date,
+            kind="concept",
+            filter_cfg={"min_members": 1, "max_members": 5000, "blacklist": []},
+            exclude_st=False,
+        )
+
+        assert out.select(["date", "member"]).to_dicts() == [
+            {"date": first_date, "member": "旧概念"},
+            {"date": second_date, "member": "新概念"},
+        ]
+
 
 class TestMainlineFilterPreferences:
     def test_blacklist_string_parsing_and_clamp(self, tmp_path, monkeypatch):
@@ -203,8 +298,12 @@ class TestExcludeST:
         self._reset_cache(monkeypatch)
         assert market_mainline.load_risk_warning_symbols(tmp_path) == frozenset()
 
-    def test_compute_mainline_excludes_st(self, tmp_path, monkeypatch):
-        """S1(ST) 涨停被剔除 → 概念 X 计数/高度/龙头随之变化; 关闭开关恢复。"""
+    def test_compute_mainline_does_not_backfill_current_st_status(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """当前 ST 名称无历史生效日期时，历史主线不执行该过滤。"""
         self._reset_cache(monkeypatch)
         self._write_instruments(tmp_path, {"S1.SH": "*ST一", "S2.SH": "正常一"})
         repo, d1, d2 = TestComputeMainline()._setup(tmp_path, monkeypatch)
@@ -214,15 +313,15 @@ class TestExcludeST:
             repo, tmp_path, d1, d2, kind="concept", filter_cfg=cfg, exclude_st=True,
         )
         x_d1 = out.filter((pl.col("date") == d1) & (pl.col("member") == "X")).to_dicts()[0]
-        assert x_d1["limit_up_count"] == 3      # S1(ST) 被剔除, 剩 S2,S3,S4
-        assert x_d1["ge2_count"] == 1           # 仅 S4=2板
+        assert x_d1["limit_up_count"] == 4
+        assert x_d1["ge2_count"] == 2
         assert x_d1["max_boards"] == 2
-        assert x_d1["leader_symbol"] == "S4.SH"
+        assert x_d1["leader_symbol"] == "S1.SH"
 
         out_keep = market_mainline.compute_mainline_range(
             repo, tmp_path, d1, d2, kind="concept", filter_cfg=cfg, exclude_st=False,
         )
         x_d1_keep = out_keep.filter((pl.col("date") == d1) & (pl.col("member") == "X")).to_dicts()[0]
         assert x_d1_keep["limit_up_count"] == 4
-        assert x_d1_keep["ge2_count"] == 2      # S1=2板, S4=2板
+        assert x_d1_keep["ge2_count"] == 2
         assert x_d1_keep["leader_symbol"] == "S1.SH"

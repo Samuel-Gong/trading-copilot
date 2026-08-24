@@ -146,12 +146,8 @@ def test_aggregate_empty_returns_empty():
     assert regime_builder._aggregate_daily(pl.DataFrame()).is_empty()
 
 
-def test_run_regime_batch_excludes_st(tmp_path, monkeypatch):
-    """run_regime_batch 默认剔除风险警示股: A(*ST) 的涨停/涨幅不进入统计。
-
-    宽度类指标(涨跌家数)同样只统计非 ST 标的 — 同一 df 统一过滤。
-    关闭开关(preferences)后恢复全市场口径。
-    """
+def test_run_regime_batch_does_not_apply_current_st_snapshot(tmp_path, monkeypatch):
+    """历史 ST 状态无版本时停用过滤，不能用当前名称反向改写历史。"""
     from app.services import market_mainline, preferences
 
     instruments = tmp_path / "instruments" / "part.parquet"
@@ -171,16 +167,57 @@ def test_run_regime_batch_excludes_st(tmp_path, monkeypatch):
     out = regime_builder.run_regime_batch(_FakeRepo(), date(2026, 1, 2), date(2026, 1, 3))
     r1 = out.filter(pl.col("date") == date(2026, 1, 2)).row(0, named=True)
     r2 = out.filter(pl.col("date") == date(2026, 1, 3)).row(0, named=True)
-    assert r1["limit_up"] == 0          # A(ST) 涨停被剔除
-    assert r1["up_count"] == 1          # 剩 B/C/D 中仅 C 上涨
+    assert r1["limit_up"] == 1
+    assert r1["up_count"] == 2
     assert r1["down_count"] == 2
-    assert r2["max_consecutive"] == 1   # A 的 2板不计, C=1板
+    assert r2["max_consecutive"] == 2
 
     monkeypatch.setattr(preferences, "get_sentiment_exclude_st", lambda: False)
     out_all = regime_builder.run_regime_batch(_FakeRepo(), date(2026, 1, 2), date(2026, 1, 3))
     r1_all = out_all.filter(pl.col("date") == date(2026, 1, 2)).row(0, named=True)
-    assert r1_all["limit_up"] == 1      # A 计入
-    assert r1_all["up_count"] == 2      # A,C 上涨
+    assert r1_all["limit_up"] == 1
+    assert r1_all["up_count"] == 2
+
+
+def test_run_regime_batch_cache_path_loads_previous_trading_day(tmp_path, monkeypatch):
+    """单日增量命中缓存时，晋级率仍应使用上一交易日的连板池。"""
+    target = date(2026, 1, 5)
+    previous = date(2026, 1, 2)
+    symbols = [f"S{i}" for i in range(12)]
+    full = pl.DataFrame({
+        "date": [previous] * 12 + [target] * 12,
+        "symbol": symbols * 2,
+        "close": [10.0] * 24,
+        "change_pct": [0.1] * 24,
+        "amount": [1e8] * 24,
+        "ma20": [9.0] * 24,
+        "signal_limit_up": [True] * 24,
+        "signal_limit_down": [False] * 24,
+        "signal_broken_limit_up": [False] * 24,
+        "consecutive_limit_ups": [1] * 12 + [2] * 12,
+    })
+    requested: list[date] = []
+    monkeypatch.setattr(regime_builder, "_load_index_pct", lambda *a, **k: {})
+    for value in (previous, target):
+        part = tmp_path / "kline_daily_enriched" / f"date={value}" / "part.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"cache-only-placeholder")
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+        def get_enriched_range(self, start, end):
+            requested.append(start)
+            return full.filter((pl.col("date") >= start) & (pl.col("date") <= end))
+
+    out = regime_builder.run_regime_batch(_FakeRepo(), target, target)
+    row = out.row(0, named=True)
+
+    assert requested == [previous]
+    assert row["date"] == target
+    assert row["promo_pool"] == 12
+    assert row["promo_rate"] == 1.0
 
 
 # ───────────────────────── 持久化(upsert) ─────────────────────────
