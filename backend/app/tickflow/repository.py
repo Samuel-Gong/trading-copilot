@@ -738,8 +738,8 @@ class KlineRepository:
         start_60d = latest - timedelta(days=90)  # 日历90天 ≈ 60个交易日
 
         # 优先使用已有的历史缓存 (避免重复 scan_parquet + compute_indicators)
-        if self._enriched_history_cache is not None and not self._enriched_history_cache.is_empty():
-            hist_all = self._enriched_history_cache
+        hist_all = self._current_enriched_history_cache()
+        if hist_all is not None and not hist_all.is_empty():
             if "date" in hist_all.columns and hist_all["date"].min() <= start_60d:
                 # 从历史缓存中提取所需列 (历史缓存已有指标列)
                 base_cols = [
@@ -1122,6 +1122,11 @@ class KlineRepository:
         后台预热期间 (_enriched_warming=True) 返回空表, 不触发同步重算 ——
         否则首次访问会把异步化想避免的 50s+ 计算拉回同步路径。
         """
+        if (
+            self._enriched_history_cache is not None
+            and self._current_enriched_history_cache() is None
+        ):
+            return pl.DataFrame(), None
         if self._enriched_cache is None:
             if self._enriched_warming:
                 return pl.DataFrame(), None
@@ -1159,7 +1164,7 @@ class KlineRepository:
         warmup 部分在 _refresh_enriched 计算指标时已使用, 策略只需要最终的 lookback 窗口。
         返回 ~33万行 (90日历天) 而非 ~107万行, filter_history 策略的 group_by 快 20x+。
         """
-        cache = self._enriched_history_cache
+        cache = self._current_enriched_history_cache()
         if cache is None or cache.is_empty():
             return None
         if "date" not in cache.columns:
@@ -1197,15 +1202,7 @@ class KlineRepository:
                 # (同 get_enriched_latest 的守卫语义)。
                 return None
             self._refresh_enriched()
-        cache = self._enriched_history_cache
-        data_dir = getattr(getattr(self, "store", None), "data_dir", None)
-        if data_dir is not None:
-            try:
-                current_generation = self.get_matrix_data_generation("stock")
-            except EnrichedGenerationUnavailableError:
-                return None
-            if self._enriched_history_generation != current_generation:
-                return None
+        cache = self._current_enriched_history_cache()
         if cache is None or cache.is_empty() or "date" not in cache.columns:
             return None
 
@@ -1373,6 +1370,20 @@ class KlineRepository:
         """返回缓存中的 enriched 最新日期。"""
         return self._enriched_cache_date
 
+    def _current_enriched_history_cache(self) -> pl.DataFrame | None:
+        """仅返回与磁盘 generation 一致的 enriched 历史缓存。"""
+        cache = self._enriched_history_cache
+        data_dir = getattr(getattr(self, "store", None), "data_dir", None)
+        if cache is None or data_dir is None:
+            return cache
+        try:
+            current_generation = self.get_matrix_data_generation("stock")
+        except EnrichedGenerationUnavailableError:
+            return None
+        if self._enriched_history_generation != current_generation:
+            return None
+        return cache
+
     # ================================================================
     # 热路径: Polars 查询 (Chart / Screener / Signals / Intraday)
     # ================================================================
@@ -1412,7 +1423,7 @@ class KlineRepository:
         # 指标重算是热路径上最大的重复计算。缓存最新日可能不含当日实时行,
         # 由下方 get_enriched_latest 覆盖逻辑补齐; 覆盖不足时回退单股计算路径。
         df = pl.DataFrame()
-        hist = self._enriched_history_cache
+        hist = self._current_enriched_history_cache()
         if hist is not None and not hist.is_empty() and "date" in hist.columns:
             hist_min = self._enriched_history_start
             hist_max = hist["date"].max()

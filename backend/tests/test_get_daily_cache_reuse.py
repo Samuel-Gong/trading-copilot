@@ -11,6 +11,7 @@ from datetime import date, timedelta
 import polars as pl
 from polars.testing import assert_frame_equal
 
+from app.enriched_generation import bump_enriched_generation, get_enriched_generation
 from app.tickflow.repository import KlineRepository
 
 SYM = "600001.SH"
@@ -104,3 +105,30 @@ def test_get_daily_falls_back_to_scan_when_cache_does_not_cover_start():
     result = repo.get_daily(SYM, dates[0] - timedelta(days=5), dates[-1])
     assert calls["scan"] == 1
     assert not result.is_empty()
+
+
+def test_get_daily_falls_back_after_enriched_generation_changes(tmp_path):
+    """重建或扩展推进 generation 后不得继续复用旧历史缓存。"""
+    raw = _raw_frame()
+    dates = raw["date"].to_list()
+    repo, calls = _bare_repo(raw)
+    repo.store = type("Store", (), {"data_dir": tmp_path})()
+    stale_raw = raw.filter(pl.col("date") < dates[-1])
+    stale_history = repo._compute_enriched_range(stale_raw)
+    repo._enriched_history_cache = stale_history
+    repo._enriched_history_start = stale_history["date"].min()
+    repo._enriched_history_generation = get_enriched_generation(tmp_path, "stock")
+    stale_latest = stale_history.filter(pl.col("date") == dates[-2]).with_columns(
+        pl.lit(-1.0).alias("close"),
+    )
+    repo._enriched_cache = stale_latest
+    repo._enriched_cache_date = dates[-2]
+
+    bump_enriched_generation(tmp_path, "stock")
+    result = repo.get_daily(SYM, dates[-2], dates[-1])
+
+    assert calls["scan"] == 1
+    assert result["date"].max() == dates[-1]
+    expected_close = raw.filter(pl.col("date") == dates[-2])["close"].item()
+    actual_close = result.filter(pl.col("date") == dates[-2])["close"].item()
+    assert actual_close == expected_close
