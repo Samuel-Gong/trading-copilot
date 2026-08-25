@@ -1,10 +1,11 @@
 """扩展数据定时拉取窗口测试。"""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
+from app.market_time import CN_TZ
 from app.services import ext_pull
 from app.services.ext_data import ExtConfig, PullConfig
 
@@ -74,3 +75,55 @@ def test_pull_window_uses_beijing_time_for_aware_clock() -> None:
 
     assert ext_pull._in_time_window("15:00", "16:00", now=now) is True
     assert ext_pull._seconds_until_window_start("16:00", now=now) == 30 * 60
+
+
+@pytest.mark.asyncio
+async def test_snapshot_partition_date_uses_beijing_calendar(monkeypatch, tmp_path) -> None:
+    """UTC 主机跨日后拉取的快照必须写入北京时间当天分区。"""
+    config = ExtConfig(
+        id="test_pull",
+        label="测试拉取",
+        mode="snapshot",
+        fields=[],
+        pull=PullConfig(url="https://example.invalid/data", enabled=True),
+    )
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = cls(2026, 8, 23, 16, 30, 0, tzinfo=UTC)
+            return current.astimezone(tz) if tz is not None else current.replace(tzinfo=None)
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self):
+            return [{"symbol": "600000.SH"}]
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def request(self, *_args, **_kwargs):
+            return _Response()
+
+    captured: list[date] = []
+    monkeypatch.setattr(ext_pull, "datetime", _FixedDateTime)
+    monkeypatch.setattr(ext_pull.httpx, "AsyncClient", lambda **_kwargs: _Client())
+    monkeypatch.setattr(
+        ext_pull,
+        "rows_to_parquet",
+        lambda rows, config, data_dir, *, snapshot_date: (
+            captured.append(snapshot_date) or len(rows)
+        ),
+    )
+
+    rows, snapshot_date = await ext_pull.fetch_and_ingest(config, tmp_path)
+
+    assert rows == 1
+    assert snapshot_date == "2026-08-24"
+    assert captured == [datetime(2026, 8, 24, tzinfo=CN_TZ).date()]

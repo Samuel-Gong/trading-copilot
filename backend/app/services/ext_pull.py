@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -16,6 +16,14 @@ from app.services.ext_data import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _beijing_datetime(now: datetime | None = None) -> datetime:
+    """把当前或传入时刻统一为北京时间；无时区值按北京时间解释。"""
+    current = now or datetime.now(CN_TZ)
+    if current.tzinfo is None:
+        return current.replace(tzinfo=CN_TZ)
+    return current.astimezone(CN_TZ)
 
 
 def _in_time_window(
@@ -31,9 +39,7 @@ def _in_time_window(
     """
     if not start or not end:
         return True
-    current = now or datetime.now(CN_TZ)
-    if current.tzinfo is not None:
-        current = current.astimezone(CN_TZ)
+    current = _beijing_datetime(now)
     current_hm = current.strftime("%H:%M")
     if start <= end:
         return start <= current_hm < end
@@ -43,9 +49,7 @@ def _in_time_window(
 
 def _seconds_until_window_start(start: str, *, now: datetime | None = None) -> float | None:
     """返回北京时间当前时刻到下一个每日窗口起点的秒数; 格式非法时返回 None。"""
-    current = now or datetime.now(CN_TZ)
-    if current.tzinfo is not None:
-        current = current.astimezone(CN_TZ)
+    current = _beijing_datetime(now)
     try:
         hour, minute = (int(part) for part in start.split(":", 1))
         target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -179,7 +183,7 @@ async def fetch_and_ingest(
         raise ValueError("数据行中缺少 symbol/code 字段，请配置字段映射或标的映射")
 
     # 写入
-    snap = date.today()
+    snap = _beijing_datetime().date()
     n = rows_to_parquet(rows, config, data_dir, snapshot_date=snap)
     return n, snap.isoformat()
 

@@ -85,6 +85,12 @@ def mainline_coverage_path(data_dir: Path) -> Path:
     return data_dir / MAINLINE_DIR / "coverage.parquet"
 
 
+def clear_mainline_history(data_dir: Path) -> None:
+    """删除失去 enriched 来源后的主线历史及逐日完成水位。"""
+    for path in (mainline_path(data_dir), mainline_coverage_path(data_dir)):
+        path.unlink(missing_ok=True)
+
+
 def _processed_mainline_dates(data_dir: Path, kind: str) -> set[date]:
     path = mainline_coverage_path(data_dir)
     if not path.exists():

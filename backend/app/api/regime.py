@@ -167,6 +167,8 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
     - 重算后统一重标情绪周期阶段(refresh_phase_labels)并回填主线；概念/行业
       仅使用带生效日期的 point-in-time 成分快照。
     """
+    from app.services import market_mainline
+
     repo = request.app.state.repo
     data_dir = _data_dir(request)
     end = end or cn_today()
@@ -174,8 +176,15 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         # 全量: 从 enriched 最早日强制重算到今天
         earliest = regime_builder.earliest_enriched_date(repo)
         if earliest is None:
+            regime_builder.clear_regime_history(data_dir)
+            market_mainline.clear_mainline_history(data_dir)
             invalidate_regime_cache()
-            return {"ok": True, "computed": 0}
+            return {
+                "ok": True,
+                "computed": 0,
+                "phase_days": 0,
+                "mainline_rows": 0,
+            }
         start = earliest
     new_rows = regime_builder.run_regime_batch(repo, start=start, end=end)
     regime_builder.replace_regime_history_range(
@@ -191,8 +200,6 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         end=end,
     )
     phase_days = regime_builder.refresh_phase_labels(data_dir)
-
-    from app.services import market_mainline
 
     mainline_rows = 0
     for kind in ("concept", "industry"):
@@ -333,6 +340,7 @@ def mainline_recompute(request: Request):
     data_dir = _data_dir(request)
     earliest = regime_builder.earliest_enriched_date(repo)
     if earliest is None:
+        market_mainline.clear_mainline_history(data_dir)
         return {"ok": True, "rows": 0}
     business_today = cn_today()
     rows = 0

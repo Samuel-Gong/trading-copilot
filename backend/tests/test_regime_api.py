@@ -81,6 +81,25 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     ]
 
 
+def test_full_recompute_clears_derived_history_when_enriched_is_empty(tmp_path):
+    """全部来源分区已删除时，全量重算必须清除 regime/mainline 结果与水位。"""
+    regime_part = regime.regime_builder.regime_path(tmp_path)
+    regime_coverage = regime.regime_builder.regime_coverage_path(tmp_path)
+    mainline_part = market_mainline.mainline_path(tmp_path)
+    mainline_coverage = market_mainline.mainline_coverage_path(tmp_path)
+    for path in (regime_part, regime_coverage, mainline_part, mainline_coverage):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"date": [date(2026, 1, 2)]}).write_parquet(path)
+
+    result = regime.regime_recompute(_request(tmp_path))
+
+    assert result == {"ok": True, "computed": 0, "phase_days": 0, "mainline_rows": 0}
+    assert all(
+        not path.exists()
+        for path in (regime_part, regime_coverage, mainline_part, mainline_coverage)
+    )
+
+
 def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
     tmp_path,
     monkeypatch,

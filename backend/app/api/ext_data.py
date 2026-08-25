@@ -15,6 +15,7 @@ import polars as pl
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from app.market_time import cn_today
 from app.services.ext_data import (
     ExtConfig,
     ExtConfigStore,
@@ -546,7 +547,7 @@ async def upload_data(
     df = df.select(keep)
 
     # 解析快照日期
-    snap = date.fromisoformat(snapshot_date) if snapshot_date else date.today()
+    snap = date.fromisoformat(snapshot_date) if snapshot_date else cn_today()
 
     rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
 
@@ -578,7 +579,7 @@ def ingest_data(request: Request, config_id: str, body: IngestReq):
         if missing:
             raise HTTPException(400, f"第 {i + 1} 行缺少字段: {', '.join(sorted(missing))}")
 
-    snap = date.fromisoformat(body.date) if body.date else date.today()
+    snap = date.fromisoformat(body.date) if body.date else cn_today()
 
     rows_written = rows_to_parquet(body.rows, config, _data_dir(request), snapshot_date=snap)
 

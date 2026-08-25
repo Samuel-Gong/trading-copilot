@@ -491,6 +491,12 @@ def regime_coverage_path(data_dir: Path) -> Path:
     return data_dir / REGIME_DIR / "coverage.parquet"
 
 
+def clear_regime_history(data_dir: Path) -> None:
+    """删除失去 enriched 来源后的 regime 历史及逐日完成水位。"""
+    for path in (regime_path(data_dir), regime_coverage_path(data_dir)):
+        path.unlink(missing_ok=True)
+
+
 def _load_regime_coverage(data_dir: Path) -> pl.DataFrame:
     path = regime_coverage_path(data_dir)
     if not path.exists():

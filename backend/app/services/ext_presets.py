@@ -19,6 +19,7 @@ import logging
 import math
 from pathlib import Path
 
+from app.market_time import cn_today
 from app.services.ext_data import (
     ExtConfig,
     ExtConfigStore,
@@ -206,13 +207,11 @@ async def _fetch_json(url: str) -> list[dict]:
 
 async def _seed_one(config: ExtConfig, flatten, data_dir: Path) -> int:
     """拉取 + 转换 + 写入单个预设。返回写入行数。"""
-    from datetime import date
-
     raw = await _fetch_json(config.pull.url)
     rows = flatten(raw)
     if not rows:
         raise ValueError(f"接口返回 0 行: {config.pull.url}")
-    n = rows_to_parquet(rows, config, data_dir, snapshot_date=date.today())
+    n = rows_to_parquet(rows, config, data_dir, snapshot_date=cn_today())
     return n
 
 

@@ -12,6 +12,8 @@ from typing import Literal
 
 import polars as pl
 
+from app.market_time import cn_today
+
 logger = logging.getLogger(__name__)
 
 EXT_DATA_GENERATION_FILE = ".generation"
@@ -551,7 +553,7 @@ def write_ext_parquet(
     Returns:
         写入行数。
     """
-    snap = snapshot_date or date.today()
+    snap = snapshot_date or cn_today()
     cfg_dir = _config_dir(config.id, data_dir)
 
     # 标准化 symbol 列: 用维表查找 → 准确匹配交易所
