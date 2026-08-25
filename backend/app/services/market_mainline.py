@@ -25,6 +25,7 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import cn_today
+from app.services.market_environment_lock import serialized_market_environment_update
 from app.services.ext_data import ExtConfigStore
 from app.services.market_overview_builder import (
     _dimension_field,
@@ -594,6 +595,7 @@ def compute_mainline_range(repo, data_dir: Path, start: date, end: date,
     return result
 
 
+@serialized_market_environment_update
 def upsert_mainline_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
     """按 (date, kind) 整日覆盖 upsert; schema 以 new_rows 为权威(同 regime 模式)。"""
     if new_rows.is_empty() or "date" not in new_rows.columns:
@@ -621,6 +623,7 @@ def upsert_mainline_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
     combined.write_parquet(p)
 
 
+@serialized_market_environment_update
 def replace_mainline_history_range(
     data_dir: Path,
     new_rows: pl.DataFrame,
@@ -674,6 +677,7 @@ def replace_mainline_history_range(
     combined.sort(["date", "kind", "rank"]).write_parquet(p)
 
 
+@serialized_market_environment_update
 def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = None,
                                  kind: str = "concept") -> pl.DataFrame:
     """增量补算主线：补缺失日，并重算被覆写的 enriched 分区。"""

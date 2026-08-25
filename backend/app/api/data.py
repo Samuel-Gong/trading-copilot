@@ -13,6 +13,7 @@ from fastapi import APIRouter, Request
 
 from app.enriched_generation import EnrichedPublication
 from app.indicators.pipeline import ENRICHED_COLUMNS
+from app.services.market_environment_lock import serialized_market_environment_update
 
 logger = logging.getLogger(__name__)
 
@@ -678,6 +679,7 @@ def _clear_parquet_directories(
 
 
 @router.post("/clear")
+@serialized_market_environment_update
 def clear_data(request: Request):
     """清除所有本地 Parquet 数据（保留 capabilities.json 和目录结构）。"""
     from contextlib import nullcontext
@@ -731,6 +733,14 @@ def clear_data(request: Request):
     # 再 refresh_cache 尝试重载 (磁盘有数据则重建缓存)。
     repo.clear_cache()
     repo.refresh_cache()
+
+    # Repository 缓存不管理偏离值的基准动量与异动历史 TTL 缓存；磁盘删除后
+    # 必须显式失效，避免清库接口继续返回旧指数/股票结果。
+    from app.indicators.pipeline import invalidate_benchmark_momentum_cache
+    from app.services.abnormal_moves import invalidate_abnormal_moves_cache
+
+    invalidate_benchmark_momentum_cache(data_dir)
+    invalidate_abnormal_moves_cache()
 
     # 清除 Screener 进程级 _history_cache (TTL 缓存)
     from app.services.screener import ScreenerService

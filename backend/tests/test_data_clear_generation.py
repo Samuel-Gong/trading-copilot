@@ -143,6 +143,38 @@ def test_clear_data_removes_mining_runs_and_parquet_artifacts(
     assert store.list_runs() == []
 
 
+def test_clear_data_invalidates_benchmark_and_abnormal_move_caches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.indicators.pipeline import load_benchmark_momentum
+    from app.services.abnormal_moves import _hist_cache, _hist_cache_lock
+
+    _stub_clear_side_effects(monkeypatch)
+    repo = _RepoStub(tmp_path)
+    index_path = tmp_path / "kline_index_daily" / "date=2026-08-14" / "part.parquet"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "symbol": ["000001.SH"],
+        "date": [date(2026, 8, 14)],
+        "close": [3200.0],
+    }).write_parquet(index_path)
+    assert load_benchmark_momentum(tmp_path) is not None
+    with _hist_cache_lock:
+        _hist_cache["data"] = {
+            "_ts": 1.0,
+            "cache_date": "2026-08-14",
+            "rows": {"600000.SH": {"name": "旧名称"}},
+        }
+
+    result = data_api.clear_data(_request(repo))
+
+    assert result == {"deleted_files": 1}
+    assert load_benchmark_momentum(tmp_path) is None
+    with _hist_cache_lock:
+        assert _hist_cache == {}
+
+
 def test_clear_data_restores_ready_generation_when_first_delete_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

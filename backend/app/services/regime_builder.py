@@ -20,6 +20,7 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import cn_today
+from app.services.market_environment_lock import serialized_market_environment_update
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +498,7 @@ def load_regime_history(data_dir: Path) -> pl.DataFrame:
         return pl.DataFrame()
 
 
+@serialized_market_environment_update
 def refresh_phase_labels(data_dir: Path) -> int:
     """对全量 regime 时序重标情绪周期阶段(冰点/启动/主升/高潮/退潮/修复)。
 
@@ -519,6 +521,7 @@ def refresh_phase_labels(data_dir: Path) -> int:
     return labeled.height
 
 
+@serialized_market_environment_update
 def upsert_regime_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
     """按 date 覆盖(upsert): 重算的天覆盖旧行, 新天追加。
 
@@ -553,6 +556,7 @@ def upsert_regime_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
     combined.write_parquet(p)
 
 
+@serialized_market_environment_update
 def replace_regime_history_range(
     data_dir: Path,
     new_rows: pl.DataFrame,
@@ -660,6 +664,7 @@ def latest_phase_transition(data_dir: Path) -> tuple[str, str, str] | None:
     return prev_phase, cur_phase, str(tail["date"][-1])
 
 
+@serialized_market_environment_update
 def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = None) -> pl.DataFrame:
     """增量计算 regime(供 daily_pipeline / 启动补算调用)。
 

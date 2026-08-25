@@ -91,6 +91,12 @@ _STATUS_EDGE = "edge"
 _STATUS_WATCH = "watch"
 
 
+def invalidate_abnormal_moves_cache() -> None:
+    """清除异动历史快照缓存。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+
 def _status_of(closeness: float) -> str:
     if closeness >= 1.0:
         return _STATUS_TRIGGERED
@@ -116,12 +122,18 @@ def _hist_snapshot(repo: Any) -> dict[str, Any]:
     df, cache_date = repo.get_enriched_latest()
     rows: dict[str, dict[str, Any]] = {}
     if not df.is_empty() and "symbol" in df.columns:
+        symbols = [str(symbol) for symbol in df["symbol"].to_list()]
+        try:
+            name_map = repo.get_name_map(symbols)
+        except Exception:
+            name_map = {}
         cols = ["symbol", *[c for c in ("name", "close", "change_pct",
                                         "deviate_3d", "deviate_10d", "deviate_30d") if c in df.columns]]
         df = df.select(cols)
         for r in df.iter_rows(named=True):
-            rows[str(r["symbol"])] = {
-                "name": r.get("name"),
+            symbol = str(r["symbol"])
+            rows[symbol] = {
+                "name": r.get("name") or name_map.get(symbol),
                 "close": r.get("close"),
                 "rt_pct": r.get("change_pct"),
                 "deviate_3d": r.get("deviate_3d"),

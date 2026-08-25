@@ -1,6 +1,7 @@
 """市场环境 API 的时间窗口契约回归测试。"""
 from __future__ import annotations
 
+import threading
 from datetime import date
 from types import SimpleNamespace
 
@@ -78,6 +79,96 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
         ("concept", start, business_today),
         ("industry", start, business_today),
     ]
+
+
+def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
+    tmp_path,
+    monkeypatch,
+):
+    """后台 regime 计算与手动主线重算必须共享完整计算区间锁。"""
+    target = date(2026, 8, 25)
+    regime_entered = threading.Event()
+    release_regime = threading.Event()
+    mainline_entered = threading.Event()
+    errors: list[BaseException] = []
+    request = _request(tmp_path)
+
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "enriched_date_set",
+        lambda repo: {target},
+    )
+
+    def run_regime_batch(repo, start, end):
+        regime_entered.set()
+        assert release_regime.wait(2)
+        return pl.DataFrame()
+
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        run_regime_batch,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "replace_regime_history_range",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "refresh_phase_labels",
+        lambda data_dir: 0,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "earliest_enriched_date",
+        lambda repo: target,
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda *args, **kwargs: (
+            mainline_entered.set() or pl.DataFrame()
+        ),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "replace_mainline_history_range",
+        lambda *args, **kwargs: None,
+    )
+
+    def invoke(fn) -> None:
+        try:
+            fn()
+        except BaseException as exc:  # pragma: no cover - 断言线程异常
+            errors.append(exc)
+
+    pipeline_thread = threading.Thread(
+        target=lambda: invoke(
+            lambda: regime.regime_builder.compute_regime_incremental(
+                request.app.state.repo,
+                tmp_path,
+                today=target,
+            )
+        ),
+    )
+    manual_thread = threading.Thread(
+        target=lambda: invoke(lambda: regime.mainline_recompute(request)),
+    )
+
+    pipeline_thread.start()
+    assert regime_entered.wait(1)
+    manual_thread.start()
+    blocked = not mainline_entered.wait(0.2)
+    release_regime.set()
+    pipeline_thread.join(2)
+    manual_thread.join(2)
+
+    assert blocked
+    assert mainline_entered.is_set()
+    assert not pipeline_thread.is_alive()
+    assert not manual_thread.is_alive()
+    assert errors == []
 
 
 def test_regime_phases_limit_uses_latest_trading_days(tmp_path, monkeypatch):

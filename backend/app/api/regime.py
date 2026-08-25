@@ -14,6 +14,7 @@ from fastapi import APIRouter, Query, Request
 
 from app.market_time import cn_today
 from app.services import regime_builder
+from app.services.market_environment_lock import serialized_market_environment_update
 
 router = APIRouter(prefix="/api/regime", tags=["regime"])
 
@@ -155,6 +156,7 @@ def regime_coverage(request: Request):
 
 
 @router.post("/recompute")
+@serialized_market_environment_update
 def regime_recompute(request: Request, start: date | None = None, end: date | None = None):
     """手动触发重算(全量或指定区间)。管理员操作。
 
@@ -312,6 +314,7 @@ def _segment_mainlines(mainline: pl.DataFrame, start: date, end: date, top: int 
 
 
 @router.post("/mainline/recompute")
+@serialized_market_environment_update
 def mainline_recompute(request: Request):
     """全量重算主线(概念+行业), 应用当前过滤配置。窄扫描, 秒级。
 

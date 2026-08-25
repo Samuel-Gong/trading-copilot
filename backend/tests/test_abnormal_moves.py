@@ -265,6 +265,19 @@ class _FakeRepo:
     def get_enriched_latest(self):
         return self._df, date(2026, 8, 19)
 
+    def get_name_map(self, symbols=None):
+        if "name" not in self._df.columns:
+            return {}
+        names = {
+            str(symbol): str(name)
+            for symbol, name in self._df.select(["symbol", "name"]).iter_rows()
+            if name
+        }
+        if symbols is None:
+            return names
+        wanted = set(symbols)
+        return {symbol: name for symbol, name in names.items() if symbol in wanted}
+
 
 class _FakeQuotes:
     def get_index_quotes(self):
@@ -317,6 +330,33 @@ def test_build_overview_closeness_and_status() -> None:
     closeness = [r["max_closeness"] for r in result["rows"]]
     assert closeness == sorted(closeness, reverse=True)
     assert result["counts"]["triggered"] >= 1
+
+
+def test_build_overview_joins_name_map_when_enriched_omits_name() -> None:
+    """生产 enriched 不含 name 时，仍应从权威维表补名称与 ST 标记。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+    class _NamedRepo(_FakeRepo):
+        def get_enriched_latest(self):
+            return self._df, cn_today()
+
+        def get_name_map(self, symbols=None):
+            return {"600000.SH": "*ST示例"}
+
+    frame = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "close": [10.0],
+        "change_pct": [0.01],
+        "deviate_3d": [0.20],
+        "deviate_10d": [None],
+        "deviate_30d": [None],
+    })
+
+    result = build_overview(_NamedRepo(frame), None, min_closeness=0.0)
+
+    assert result["rows"][0]["name"] == "*ST示例"
+    assert result["rows"][0]["st"] is True
 
 
 def test_build_overview_cache_date_today_no_double_count() -> None:
