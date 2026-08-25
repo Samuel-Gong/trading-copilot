@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -13,6 +14,7 @@ from typing import Any
 
 
 FileWriter = Callable[[Path], None]
+logger = logging.getLogger(__name__)
 
 
 def _stage_file(writer: FileWriter, target: Path) -> Path:
@@ -121,6 +123,14 @@ def _restore_from_backup(target: Path, backup: Path | None) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _cleanup_backup(backup: Path) -> None:
+    """提交完成后的恢复副本仅是垃圾；清理失败不得改变事务结果。"""
+    try:
+        backup.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("原子发布恢复副本清理失败，已保留 %s: %s", backup, exc)
+
+
 def recover_file_set(journal_path: Path) -> bool:
     """若上次发布被进程退出中断，则从持久化日志恢复完整旧快照。"""
     if not journal_path.exists():
@@ -128,11 +138,13 @@ def recover_file_set(journal_path: Path) -> bool:
     entries = _journal_entries(journal_path)
     for target, backup in reversed(entries):
         _restore_from_backup(target, backup)
-    for _target, backup in entries:
-        if backup is not None:
-            backup.unlink(missing_ok=True)
+    # 日志删除是“旧快照已完整恢复”的提交点。之后的 backup 仅是可遗留垃圾，
+    # 即使进程退出或清理失败，下一次读取也不会再次进入恢复并要求已删副本。
     journal_path.unlink()
     _fsync_directory(journal_path.parent)
+    for _target, backup in entries:
+        if backup is not None:
+            _cleanup_backup(backup)
     return True
 
 
@@ -222,7 +234,7 @@ def replace_file_set(
                 and backup not in preserved_backups
                 and not journal_needs_backup
             ):
-                backup.unlink(missing_ok=True)
+                _cleanup_backup(backup)
 
 
 def replace_parquet_set(

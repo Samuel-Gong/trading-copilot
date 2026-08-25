@@ -137,3 +137,60 @@ def test_recovery_journal_restores_interrupted_file_set(tmp_path, monkeypatch) -
     assert pl.read_parquet(second)["value"].to_list() == [2]
     assert not journal.exists()
     assert not list(tmp_path.rglob(".*.bak"))
+
+
+def test_recovery_commits_before_best_effort_backup_cleanup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """恢复完成后先删除日志；副本清理失败不能让下一次读取重入恢复。"""
+    target = tmp_path / "history" / "part.parquet"
+    journal = tmp_path / ".publish.json"
+    target.parent.mkdir(parents=True)
+    pl.DataFrame({"value": [1]}).write_parquet(target)
+    backup = target.with_name(".part.parquet.recovery.bak")
+    backup.write_bytes(target.read_bytes())
+    pl.DataFrame({"value": [10]}).write_parquet(target)
+    atomic_parquet._write_recovery_journal(journal, {target: backup})
+    original_unlink = Path.unlink
+
+    def keep_backup(path, *args, **kwargs) -> None:
+        if path == backup:
+            raise OSError("backup busy")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", keep_backup)
+
+    assert atomic_parquet.recover_file_set(journal)
+    assert pl.read_parquet(target)["value"].to_list() == [1]
+    assert not journal.exists()
+    assert backup.exists()
+    assert not atomic_parquet.recover_file_set(journal)
+
+
+def test_committed_publish_ignores_backup_cleanup_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """新快照与 journal 已提交后，垃圾回收失败不得向调用方报错。"""
+    target = tmp_path / "history" / "part.parquet"
+    journal = tmp_path / ".publish.json"
+    target.parent.mkdir(parents=True)
+    pl.DataFrame({"value": [1]}).write_parquet(target)
+    original_unlink = Path.unlink
+
+    def keep_backups(path, *args, **kwargs) -> None:
+        if path.suffix == ".bak":
+            raise OSError("backup busy")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", keep_backups)
+
+    replace_parquet_set(
+        [(target, pl.DataFrame({"value": [10]}))],
+        journal_path=journal,
+    )
+
+    assert pl.read_parquet(target)["value"].to_list() == [10]
+    assert not journal.exists()
+    assert list(target.parent.glob(".*.bak"))

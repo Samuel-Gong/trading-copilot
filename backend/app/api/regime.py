@@ -192,6 +192,14 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
                 "mainline_rows": 0,
             }
         start = earliest
+    mainline_source_snapshot: pl.DataFrame | None = None
+    if full_recompute:
+        mainline_source_snapshot = market_mainline.capture_mainline_source_snapshot(
+            data_dir,
+            repo,
+            start=start,
+            end=end,
+        )
     new_rows = regime_builder.run_regime_batch(repo, start=start, end=end)
     if full_recompute:
         regime_rows, phase_days = regime_builder.label_phase_history(new_rows)
@@ -220,6 +228,7 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             kind=kind,
         )
     if full_recompute:
+        assert mainline_source_snapshot is not None
         regime_entries = regime_builder.build_regime_history_full_snapshot(
             data_dir,
             regime_rows,
@@ -234,7 +243,15 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
                 repo,
                 start=start,
                 end=end,
+                source_snapshot=mainline_source_snapshot,
             )
+        )
+        market_mainline.assert_mainline_source_unchanged(
+            mainline_source_snapshot,
+            data_dir,
+            repo,
+            start=start,
+            end=end,
         )
         replace_parquet_set([
             *regime_entries,
@@ -382,6 +399,12 @@ def mainline_recompute(request: Request):
         market_mainline.clear_mainline_history(data_dir)
         return {"ok": True, "rows": 0}
     business_today = cn_today()
+    source_snapshot = market_mainline.capture_mainline_source_snapshot(
+        data_dir,
+        repo,
+        start=earliest,
+        end=business_today,
+    )
     results = {}
     for kind in ("concept", "industry"):
         results[kind] = market_mainline.compute_mainline_range(
@@ -393,6 +416,7 @@ def mainline_recompute(request: Request):
         repo,
         start=earliest,
         end=business_today,
+        source_snapshot=source_snapshot,
     )
     return {"ok": True, "rows": rows}
 

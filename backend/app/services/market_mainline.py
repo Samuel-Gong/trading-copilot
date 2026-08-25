@@ -58,6 +58,11 @@ _MAINLINE_COVERAGE_SCHEMA = {
     "membership_version": pl.Utf8,
 }
 
+
+class MainlineSourceChangedError(RuntimeError):
+    """全量主线计算期间行情或 point-in-time 成员来源发生变化。"""
+
+
 # 主线分权重: 概念内涨停家数 / 最高连板 / 梯队档位数 / 二板以上家数
 _SCORE_WEIGHTS = {
     "limit_up_count": 0.35,
@@ -348,6 +353,44 @@ def _mainline_coverage_frame(
             ),
         }))
     return pl.concat(frames).sort(["date", "kind"])
+
+
+def capture_mainline_source_snapshot(
+    data_dir: Path,
+    repo,
+    *,
+    start: date,
+    end: date,
+    kinds: tuple[str, ...] = ("concept", "industry"),
+) -> pl.DataFrame:
+    """捕获全量主线结果对应的交易日、行情与成员版本快照。"""
+    from app.services.regime_builder import enriched_date_set
+
+    covered_dates = {
+        target_date
+        for target_date in enriched_date_set(repo)
+        if start <= target_date <= end
+    }
+    return _mainline_coverage_frame(data_dir, repo, covered_dates, kinds)
+
+
+def assert_mainline_source_unchanged(
+    expected: pl.DataFrame,
+    data_dir: Path,
+    repo,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    """发布前复验完整来源版本，避免把旧结果标记成新 coverage。"""
+    current = capture_mainline_source_snapshot(
+        data_dir,
+        repo,
+        start=start,
+        end=end,
+    )
+    if expected.to_dicts() != current.to_dicts():
+        raise MainlineSourceChangedError("主线计算期间来源已更新，请重试全量重算")
 
 
 def _remove_mainline_dates_processed(
@@ -667,6 +710,7 @@ def build_mainline_history_full_snapshot(
     *,
     start: date,
     end: date,
+    source_snapshot: pl.DataFrame | None = None,
 ) -> tuple[list[tuple[Path, pl.DataFrame]], int]:
     """构建合并概念/行业结果与逐日完整完成水位的全量文件集合。"""
     frames = [frame for frame in rows_by_kind.values() if not frame.is_empty()]
@@ -676,19 +720,15 @@ def build_mainline_history_full_snapshot(
         )
     else:
         combined = pl.DataFrame()
-    from app.services.regime_builder import enriched_date_set
-
-    covered_dates = {
-        target_date
-        for target_date in enriched_date_set(repo)
-        if start <= target_date <= end
-    }
-    coverage = _mainline_coverage_frame(
-        data_dir,
-        repo,
-        covered_dates,
-        tuple(rows_by_kind),
-    )
+    coverage = source_snapshot
+    if coverage is None:
+        coverage = capture_mainline_source_snapshot(
+            data_dir,
+            repo,
+            start=start,
+            end=end,
+            kinds=tuple(rows_by_kind),
+        )
     entries = [
         (mainline_path(data_dir), combined),
         (mainline_coverage_path(data_dir), coverage),
@@ -704,14 +744,24 @@ def replace_mainline_history_full(
     *,
     start: date,
     end: date,
+    source_snapshot: pl.DataFrame | None = None,
 ) -> int:
     """原子发布合并后的概念/行业全量结果及逐日完成水位。"""
+    if source_snapshot is not None:
+        assert_mainline_source_unchanged(
+            source_snapshot,
+            data_dir,
+            repo,
+            start=start,
+            end=end,
+        )
     entries, rows = build_mainline_history_full_snapshot(
         data_dir,
         rows_by_kind,
         repo,
         start=start,
         end=end,
+        source_snapshot=source_snapshot,
     )
     replace_parquet_set(
         entries,

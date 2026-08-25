@@ -6,6 +6,7 @@ from datetime import date
 from types import SimpleNamespace
 
 import polars as pl
+import pytest
 
 from app.api import regime
 from app.services import market_mainline, preferences
@@ -67,7 +68,7 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     monkeypatch.setattr(
         market_mainline,
         "build_mainline_history_full_snapshot",
-        lambda data_dir, rows_by_kind, repo, *, start, end: (
+        lambda data_dir, rows_by_kind, repo, *, start, end, source_snapshot=None: (
             [],
             sum(frame.height for frame in rows_by_kind.values()),
         ),
@@ -178,6 +179,93 @@ def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monke
         "concept",
         "industry",
     }
+
+
+def test_mainline_full_recompute_rejects_source_change_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """计算期间来源版本变化时 fail-closed，不能发布旧结果与新水位。"""
+    target = date(2026, 8, 25)
+    path = market_mainline.mainline_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    pl.DataFrame({
+        "date": [target],
+        "kind": ["concept"],
+        "rank": [1],
+    }).write_parquet(path)
+    snapshots = iter([
+        pl.DataFrame({"version": ["before"]}),
+        pl.DataFrame({"version": ["after"]}),
+    ])
+    monkeypatch.setattr(regime, "cn_today", lambda: target)
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "earliest_enriched_date",
+        lambda repo: target,
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "capture_mainline_source_snapshot",
+        lambda *args, **kwargs: next(snapshots),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+
+    with pytest.raises(
+        market_mainline.MainlineSourceChangedError,
+        match="来源已更新",
+    ):
+        regime.mainline_recompute(_request(tmp_path))
+
+    stored = pl.read_parquet(path)
+    assert stored["rank"].to_list() == [1]
+
+
+def test_regime_full_recompute_rejects_source_change_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """组合全量重算也必须在四文件发布前复验来源版本。"""
+    target = date(2026, 8, 25)
+    snapshots = iter([
+        pl.DataFrame({"version": ["before"]}),
+        pl.DataFrame({"version": ["after"]}),
+    ])
+    published: list[object] = []
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "earliest_enriched_date",
+        lambda repo: target,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "capture_mainline_source_snapshot",
+        lambda *args, **kwargs: next(snapshots),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        regime,
+        "replace_parquet_set",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(market_mainline.MainlineSourceChangedError):
+        regime.regime_recompute(_request(tmp_path), end=target)
+
+    assert published == []
 
 
 def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
