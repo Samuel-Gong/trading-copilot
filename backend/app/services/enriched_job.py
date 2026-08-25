@@ -30,7 +30,9 @@ def _refresh_repository_with_retry(repo) -> None:
     deadline = time.monotonic() + _REPOSITORY_REFRESH_WAIT_SECONDS
     while True:
         try:
-            refreshed_generation = repo.refresh_cache()
+            refreshed_generation = repo.refresh_cache(
+                enriched_wait_timeout=max(deadline - time.monotonic(), 0.0),
+            )
             current_generation = repo.get_matrix_data_generation("stock")
             if (
                 not isinstance(refreshed_generation, str)

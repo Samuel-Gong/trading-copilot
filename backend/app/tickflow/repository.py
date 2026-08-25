@@ -385,7 +385,12 @@ class KlineRepository:
     # Polars 缓存管理
     # ================================================================
 
-    def refresh_cache(self, background: bool = False) -> str | None:
+    def refresh_cache(
+        self,
+        background: bool = False,
+        *,
+        enriched_wait_timeout: float | None = None,
+    ) -> str | None:
         """刷新 Polars 缓存。在 pipeline 完成后、服务启动时调用。
 
         background=True (启动时): instruments/index/ETF 同步刷新 (毫秒级),
@@ -393,6 +398,7 @@ class KlineRepository:
         不阻塞 FastAPI lifespan。预热期间上层走空表降级。
         background=False (盘后管道/手动刷新): 全部同步, 保证数据即时一致。
         同步刷新成功时返回实际装载的 stock generation; 无法确认时返回 None。
+        enriched_wait_timeout 仅限制同步路径等待其他 enriched 刷新的时间。
         """
         started = time.perf_counter()
         logger.info("cache refresh start (background=%s)", background)
@@ -427,7 +433,7 @@ class KlineRepository:
         else:
             step = time.perf_counter()
             logger.info("cache refresh step start: enriched")
-            refreshed_generation = self._refresh_enriched()
+            refreshed_generation = self._refresh_enriched(enriched_wait_timeout)
             logger.info("cache refresh step done: enriched (%.2fs)", time.perf_counter() - step)
             if refreshed_generation is not None:
                 self._notify_refresh_done()
@@ -518,10 +524,23 @@ class KlineRepository:
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
 
-    def _refresh_enriched(self) -> str | None:
+    def _refresh_enriched(
+        self,
+        wait_timeout: float | None = None,
+    ) -> str | None:
         """串行刷新 enriched 内存快照，防止旧预热覆盖较新的同步刷新。"""
-        with self._enriched_refresh_lock:
+        if wait_timeout is None:
+            acquired = self._enriched_refresh_lock.acquire()
+        else:
+            acquired = self._enriched_refresh_lock.acquire(
+                timeout=max(wait_timeout, 0.0),
+            )
+        if not acquired:
+            raise TimeoutError("等待正在执行的 enriched 快照刷新超时")
+        try:
             return self._refresh_enriched_locked()
+        finally:
+            self._enriched_refresh_lock.release()
 
     def _refresh_enriched_locked(self) -> str | None:
         """从 parquet 加载 enriched 最新日到内存 + 构建聚合表。

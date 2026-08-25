@@ -25,7 +25,12 @@ class _Repo:
         assert asset_type == "stock"
         return self.generation
 
-    def refresh_cache(self) -> str:
+    def refresh_cache(
+        self,
+        *,
+        enriched_wait_timeout: float | None = None,
+    ) -> str:
+        assert enriched_wait_timeout is not None
         self.events.append("refresh")
         return self.generation
 
@@ -169,7 +174,8 @@ def test_refresh_exhaustion_keeps_realtime_paused(monkeypatch) -> None:
     quotes = _QuoteService(events)
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 0.0)
 
-    def refresh_cache() -> str:
+    def refresh_cache(*, enriched_wait_timeout: float | None = None) -> str:
+        assert enriched_wait_timeout == 0.0
         events.append("refresh")
         raise OSError("injected refresh failure")
 
@@ -198,8 +204,9 @@ def test_transient_refresh_failure_retries_before_realtime_resumes(
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 1.0)
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_POLL_SECONDS", 0.0)
 
-    def refresh_cache() -> str:
+    def refresh_cache(*, enriched_wait_timeout: float | None = None) -> str:
         nonlocal attempts
+        assert enriched_wait_timeout is not None
         attempts += 1
         events.append("refresh")
         if attempts == 1:
@@ -297,3 +304,31 @@ def test_sync_refresh_waits_for_startup_warmup_before_installing_snapshot(
 
     assert events == ["warmup-start", "warmup-done", "sync-start"]
     assert result == ["generation-b"]
+
+
+def test_refresh_lock_timeout_keeps_realtime_paused(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    repo = KlineRepository(DataStore(tmp_path))
+    quotes = _QuoteService(events)
+    monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(repo, "_refresh_instruments", lambda: None)
+    monkeypatch.setattr(repo, "_refresh_index_instruments", lambda: None)
+    monkeypatch.setattr(repo, "_refresh_etf_instruments", lambda: None)
+    assert repo._enriched_refresh_lock.acquire(blocking=False)
+
+    try:
+        with pytest.raises(EnrichedRepositoryRefreshError) as captured:
+            run_enriched_job_with_repository_refresh(
+                repo,
+                lambda: events.append("publish") or {"rows": 1},
+                quotes,
+            )
+    finally:
+        repo._enriched_refresh_lock.release()
+
+    assert isinstance(captured.value.refresh_error, TimeoutError)
+    assert events == ["pause", "publish"]
+    assert quotes.is_paused is True
