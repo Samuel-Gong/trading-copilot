@@ -14,11 +14,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
 
+from app.enriched_generation import stable_enriched_generation
 from app.market_time import cn_today
 from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
 from app.services.market_environment_lock import (
@@ -38,6 +41,14 @@ def assert_enriched_source_empty(repo) -> None:
     """发布空派生快照前复验 enriched 来源仍为空。"""
     if enriched_date_set(repo):
         raise RegimeSourceChangedError("清理派生数据期间行情来源已出现，请重试")
+
+
+@contextmanager
+def locked_empty_enriched_source(repo) -> Iterator[None]:
+    """从空源复验到派生清理发布持续阻止 enriched generation 切换。"""
+    with stable_enriched_generation(repo.store.data_dir, "stock"):
+        assert_enriched_source_empty(repo)
+        yield
 
 
 # ───────────────────────── 状态分类阈值(可调) ─────────────────────────

@@ -212,6 +212,28 @@ def bump_enriched_generation(data_dir: Path, asset_type: str = "stock") -> str:
         return generation
 
 
+@contextmanager
+def stable_enriched_generation(
+    data_dir: Path,
+    asset_type: str = "stock",
+) -> Iterator[str]:
+    """锁定一个 ready generation，直到依赖该快照的派生发布完成。"""
+    path = _marker_path(data_dir, asset_type)
+    with _exclusive_generation_lock(data_dir, asset_type):
+        payload = _read_marker(path)
+        if payload is None:
+            generation = uuid.uuid4().hex
+            _write_marker(path, _ready_payload(generation))
+        else:
+            state = payload.get("state", "ready")
+            generation = payload.get("generation")
+            if state != "ready" or not isinstance(generation, str) or not generation:
+                raise EnrichedGenerationUnavailableError(
+                    "enriched data is being published; retry after the update finishes"
+                )
+        yield generation
+
+
 class EnrichedPublication:
     """Publish one logical enriched write batch under a stable generation token."""
 

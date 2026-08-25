@@ -10,6 +10,7 @@ import polars as pl
 import pytest
 
 from app.api import regime
+from app.enriched_generation import EnrichedPublication
 from app.services import atomic_parquet, market_mainline, preferences
 from app.services.market_environment_lock import market_environment_snapshot
 
@@ -258,6 +259,55 @@ def test_empty_source_recompute_rejects_new_enriched_partition_before_publish(
             regime.mainline_recompute(_request(tmp_path))
 
     assert published == []
+
+
+@pytest.mark.parametrize("entrypoint", ["regime", "mainline"])
+def test_empty_source_recompute_serializes_validation_and_publish_with_enriched(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+):
+    """复验后的 enriched 首分区发布必须等派生空快照完成后再取得锁。"""
+    target = date(2026, 8, 25)
+    source = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    publication = EnrichedPublication(tmp_path, recover=True)
+    writer_started = threading.Event()
+    writer_claimed = threading.Event()
+    order: list[str] = []
+    errors: list[BaseException] = []
+
+    def publish_enriched() -> None:
+        try:
+            writer_started.set()
+            publication.begin()
+            writer_claimed.set()
+            publication.write_parquet(pl.DataFrame({"date": [target]}), source)
+            publication.commit()
+            order.append("enriched")
+        except BaseException as exc:
+            errors.append(exc)
+
+    writer = threading.Thread(target=publish_enriched)
+
+    def publish_empty_snapshot(*args, **kwargs) -> None:
+        writer.start()
+        assert writer_started.wait(timeout=1)
+        assert not writer_claimed.wait(timeout=0.1)
+        assert not source.exists()
+        order.append("derived")
+
+    monkeypatch.setattr(regime, "replace_parquet_set", publish_empty_snapshot)
+
+    if entrypoint == "regime":
+        regime.regime_recompute(_request(tmp_path))
+    else:
+        regime.mainline_recompute(_request(tmp_path))
+
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+    assert errors == []
+    assert order == ["derived", "enriched"]
+    assert source.exists()
 
 
 def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monkeypatch):
