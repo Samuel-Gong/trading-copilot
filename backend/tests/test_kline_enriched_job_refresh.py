@@ -1,14 +1,17 @@
 """会推进 enriched generation 的长任务必须同步恢复 Repository 快照。"""
 from __future__ import annotations
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from app.jobs import daily_pipeline
 from app.jobs.daily_pipeline import PipelineStageError
-from app.services.enriched_job import run_enriched_job_with_repository_refresh
+from app.services import enriched_job
+from app.services.enriched_job import (
+    EnrichedRepositoryRefreshError,
+    run_enriched_job_with_repository_refresh,
+)
 
 
 class _Repo:
@@ -27,14 +30,15 @@ class _Repo:
 class _QuoteService:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.is_paused = False
 
-    @contextmanager
-    def paused(self):
+    def pause(self) -> None:
         self.events.append("pause")
-        try:
-            yield
-        finally:
-            self.events.append("resume")
+        self.is_paused = True
+
+    def resume(self) -> None:
+        self.events.append("resume")
+        self.is_paused = False
 
 
 def test_enriched_job_refreshes_repository_before_realtime_resumes() -> None:
@@ -124,3 +128,89 @@ def test_scheduled_pipeline_refreshes_before_realtime_resumes(monkeypatch) -> No
         daily_pipeline._run_scheduled_pipeline_with_refresh(repo, object())
 
     assert events == ["pause", "publish", "refresh", "resume"]
+
+
+def test_unknown_generation_refreshes_before_original_error_and_resume(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    repo = _Repo(events)
+    quotes = _QuoteService(events)
+    reads = 0
+
+    def generation(asset_type: str) -> str:
+        nonlocal reads
+        assert asset_type == "stock"
+        reads += 1
+        if reads == 2:
+            raise OSError("temporary generation read failure")
+        return repo.generation
+
+    monkeypatch.setattr(repo, "get_matrix_data_generation", generation)
+
+    def operation() -> dict:
+        events.append("publish")
+        repo.generation = "after"
+        raise PipelineStageError(["compute_regime: injected"])
+
+    with pytest.raises(PipelineStageError, match="compute_regime: injected"):
+        run_enriched_job_with_repository_refresh(repo, operation, quotes)
+
+    assert events == ["pause", "publish", "refresh", "resume"]
+    assert quotes.is_paused is False
+
+
+def test_refresh_exhaustion_keeps_realtime_paused(monkeypatch) -> None:
+    events: list[str] = []
+    repo = _Repo(events)
+    quotes = _QuoteService(events)
+    monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 0.0)
+
+    def refresh_cache() -> None:
+        events.append("refresh")
+        raise OSError("injected refresh failure")
+
+    monkeypatch.setattr(repo, "refresh_cache", refresh_cache)
+
+    def operation() -> dict:
+        events.append("publish")
+        repo.generation = "after"
+        raise PipelineStageError(["compute_mainline: injected"])
+
+    with pytest.raises(EnrichedRepositoryRefreshError) as captured:
+        run_enriched_job_with_repository_refresh(repo, operation, quotes)
+
+    assert isinstance(captured.value.operation_error, PipelineStageError)
+    assert events == ["pause", "publish", "refresh"]
+    assert quotes.is_paused is True
+
+
+def test_transient_refresh_failure_retries_before_realtime_resumes(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    repo = _Repo(events)
+    quotes = _QuoteService(events)
+    attempts = 0
+    monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_POLL_SECONDS", 0.0)
+
+    def refresh_cache() -> None:
+        nonlocal attempts
+        attempts += 1
+        events.append("refresh")
+        if attempts == 1:
+            raise OSError("temporary refresh failure")
+
+    monkeypatch.setattr(repo, "refresh_cache", refresh_cache)
+
+    def operation() -> dict:
+        events.append("publish")
+        repo.generation = "after"
+        return {"rows": 1}
+
+    result = run_enriched_job_with_repository_refresh(repo, operation, quotes)
+
+    assert result == {"rows": 1}
+    assert events == ["pause", "publish", "refresh", "refresh", "resume"]
+    assert quotes.is_paused is False
