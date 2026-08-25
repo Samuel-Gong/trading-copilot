@@ -172,7 +172,8 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
     repo = request.app.state.repo
     data_dir = _data_dir(request)
     end = end or cn_today()
-    if start is None:
+    full_recompute = start is None
+    if full_recompute:
         # 全量: 从 enriched 最早日强制重算到今天
         earliest = regime_builder.earliest_enriched_date(repo)
         if earliest is None:
@@ -187,6 +188,8 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             }
         start = earliest
     new_rows = regime_builder.run_regime_batch(repo, start=start, end=end)
+    if full_recompute:
+        regime_builder.clear_regime_history(data_dir)
     regime_builder.replace_regime_history_range(
         data_dir,
         new_rows,
@@ -201,9 +204,20 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
     )
     phase_days = regime_builder.refresh_phase_labels(data_dir)
 
-    mainline_rows = 0
+    mainline_results = {}
     for kind in ("concept", "industry"):
-        rows = market_mainline.compute_mainline_range(repo, data_dir, start, end, kind=kind)
+        mainline_results[kind] = market_mainline.compute_mainline_range(
+            repo,
+            data_dir,
+            start,
+            end,
+            kind=kind,
+        )
+    if full_recompute:
+        market_mainline.clear_mainline_history(data_dir)
+
+    mainline_rows = 0
+    for kind, rows in mainline_results.items():
         market_mainline.replace_mainline_history_range(
             data_dir,
             rows,
@@ -343,11 +357,15 @@ def mainline_recompute(request: Request):
         market_mainline.clear_mainline_history(data_dir)
         return {"ok": True, "rows": 0}
     business_today = cn_today()
-    rows = 0
+    results = {}
     for kind in ("concept", "industry"):
-        computed = market_mainline.compute_mainline_range(
+        results[kind] = market_mainline.compute_mainline_range(
             repo, data_dir, earliest, business_today, kind=kind
         )
+    market_mainline.clear_mainline_history(data_dir)
+
+    rows = 0
+    for kind, computed in results.items():
         market_mainline.replace_mainline_history_range(
             data_dir,
             computed,

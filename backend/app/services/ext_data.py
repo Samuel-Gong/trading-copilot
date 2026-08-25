@@ -4,7 +4,10 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
+import tempfile
+import threading
 import uuid
 from datetime import date, datetime
 from pathlib import Path
@@ -17,6 +20,17 @@ from app.market_time import cn_today
 logger = logging.getLogger(__name__)
 
 EXT_DATA_GENERATION_FILE = ".generation"
+
+_ext_data_locks: dict[tuple[str, str], threading.RLock] = {}
+_ext_data_locks_guard = threading.Lock()
+
+
+def _ext_data_lock(config_id: str, data_dir: Path) -> threading.RLock:
+    """返回同一数据目录与配置共享的进程内读改写锁。"""
+    key = (str(data_dir.resolve()), config_id)
+    with _ext_data_locks_guard:
+        return _ext_data_locks.setdefault(key, threading.RLock())
+
 
 # ---------------------------------------------------------------------------
 # 配置模型
@@ -531,11 +545,39 @@ def _config_dir(config_id: str, data_dir: Path) -> Path:
     return data_dir / "ext_data" / config_id
 
 
+def _atomic_write_parquet(df, out_path: Path) -> None:
+    """在目标目录写临时文件并原子替换，失败时保留原文件。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.",
+        suffix=".tmp",
+        dir=out_path.parent,
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        df.write_parquet(temp_path)
+        os.replace(temp_path, out_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def _bump_ext_data_generation(config_id: str, data_dir: Path) -> None:
     """更新扩展数据版本标记，供实时消费者以 O(1) 成本判断缓存失效。"""
     marker = _config_dir(config_id, data_dir) / EXT_DATA_GENERATION_FILE
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(uuid.uuid4().hex, encoding="ascii")
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{marker.name}.",
+        suffix=".tmp",
+        dir=marker.parent,
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.write_text(uuid.uuid4().hex, encoding="ascii")
+        os.replace(temp_path, marker)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def write_ext_parquet(
@@ -561,41 +603,42 @@ def write_ext_parquet(
         lookup = build_code_lookup(data_dir)
         df = df.with_columns(normalize_symbol(df["symbol"], lookup))
 
-    if config.mode == "snapshot":
-        # 快照: 与 config.json 同级，直接覆盖
-        cfg_dir.mkdir(parents=True, exist_ok=True)
-        out_path = cfg_dir / "part.parquet"
+    with _ext_data_lock(config.id, data_dir):
+        if config.mode == "snapshot":
+            # 快照: 与 config.json 同级，直接覆盖
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            out_path = cfg_dir / "part.parquet"
 
-        # 如果已有文件，合并去重后覆盖
-        if out_path.exists():
-            try:
-                existing = pl.read_parquet(out_path)
-                key = "symbol" if "symbol" in df.columns else df.columns[0]
-                df = pl.concat([existing, df]).unique(subset=[key], keep="last")
-            except Exception as e:
-                # schema 不一致 (列不同) 时 concat 失败 → 直接用新 df 覆盖。
-                # 记日志而非静默吞掉, 便于排查"数据结构错乱"类问题。
-                logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
-    else:
-        # 时序: timeseries/ 下按日期分区
-        out_dir = cfg_dir / "timeseries" / f"date={snap}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "part.parquet"
+            # 如果已有文件，合并去重后覆盖
+            if out_path.exists():
+                try:
+                    existing = pl.read_parquet(out_path)
+                    key = "symbol" if "symbol" in df.columns else df.columns[0]
+                    df = pl.concat([existing, df]).unique(subset=[key], keep="last")
+                except Exception as e:
+                    # schema 不一致 (列不同) 时 concat 失败 → 直接用新 df 覆盖。
+                    # 记日志而非静默吞掉, 便于排查"数据结构错乱"类问题。
+                    logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
+        else:
+            # 时序: timeseries/ 下按日期分区
+            out_dir = cfg_dir / "timeseries" / f"date={snap}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / "part.parquet"
 
-        # 如果已有文件，合并去重
-        if out_path.exists():
-            try:
-                existing = pl.read_parquet(out_path)
-                key = "symbol" if "symbol" in df.columns else df.columns[0]
-                df = pl.concat([existing, df]).unique(subset=[key], keep="last")
-            except Exception as e:
-                logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
+            # 如果已有文件，合并去重
+            if out_path.exists():
+                try:
+                    existing = pl.read_parquet(out_path)
+                    key = "symbol" if "symbol" in df.columns else df.columns[0]
+                    df = pl.concat([existing, df]).unique(subset=[key], keep="last")
+                except Exception as e:
+                    logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
 
-    df = cast_df_to_schema(df, config.fields)
-    df.write_parquet(out_path)
-    _bump_ext_data_generation(config.id, data_dir)
-    logger.info("扩展表写入: %s → %s (%d 行)", config.id, out_path, len(df))
-    return len(df)
+        df = cast_df_to_schema(df, config.fields)
+        _atomic_write_parquet(df, out_path)
+        _bump_ext_data_generation(config.id, data_dir)
+        logger.info("扩展表写入: %s → %s (%d 行)", config.id, out_path, len(df))
+        return len(df)
 
 
 def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
@@ -604,21 +647,22 @@ def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
     - snapshot: 删除 ext_data/{id}/part.parquet
     - timeseries: 删除 ext_data/{id}/timeseries/ 目录
     """
-    cfg_dir = _config_dir(config_id, data_dir)
-    changed = False
-    # 删除快照文件
-    snap = cfg_dir / "part.parquet"
-    if snap.exists():
-        snap.unlink()
-        changed = True
-    # 删除时序目录
-    ts_dir = cfg_dir / "timeseries"
-    if ts_dir.exists():
-        import shutil
-        shutil.rmtree(ts_dir, ignore_errors=True)
-        changed = True
-    if changed:
-        _bump_ext_data_generation(config_id, data_dir)
+    with _ext_data_lock(config_id, data_dir):
+        cfg_dir = _config_dir(config_id, data_dir)
+        changed = False
+        # 删除快照文件
+        snap = cfg_dir / "part.parquet"
+        if snap.exists():
+            snap.unlink()
+            changed = True
+        # 删除时序目录
+        ts_dir = cfg_dir / "timeseries"
+        if ts_dir.exists():
+            import shutil
+            shutil.rmtree(ts_dir, ignore_errors=True)
+            changed = True
+        if changed:
+            _bump_ext_data_generation(config_id, data_dir)
 
 
 def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
@@ -630,46 +674,52 @@ def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
     Returns:
         修复的文件数。
     """
-    cfg_dir = _config_dir(config.id, data_dir)
-    if not cfg_dir.exists():
-        return 0
+    with _ext_data_lock(config.id, data_dir):
+        cfg_dir = _config_dir(config.id, data_dir)
+        if not cfg_dir.exists():
+            return 0
 
-    # 收集需要扫描的 parquet 文件列表
-    parquet_files: list[Path] = []
-    if config.mode == "snapshot":
-        p = cfg_dir / "part.parquet"
-        if p.exists():
-            parquet_files.append(p)
-    else:
-        ts_dir = cfg_dir / "timeseries"
-        if ts_dir.exists():
-            for part_dir in sorted(ts_dir.iterdir()):
-                if not part_dir.is_dir() or not part_dir.name.startswith("date="):
+        # 收集需要扫描的 parquet 文件列表
+        parquet_files: list[Path] = []
+        if config.mode == "snapshot":
+            p = cfg_dir / "part.parquet"
+            if p.exists():
+                parquet_files.append(p)
+        else:
+            ts_dir = cfg_dir / "timeseries"
+            if ts_dir.exists():
+                for part_dir in sorted(ts_dir.iterdir()):
+                    if not part_dir.is_dir() or not part_dir.name.startswith("date="):
+                        continue
+                    p = part_dir / "part.parquet"
+                    if p.exists():
+                        parquet_files.append(p)
+
+        fixed = 0
+        lookup = build_code_lookup(data_dir)
+        for parquet_path in parquet_files:
+            try:
+                df = pl.read_parquet(parquet_path)
+                if "symbol" not in df.columns:
                     continue
-                p = part_dir / "part.parquet"
-                if p.exists():
-                    parquet_files.append(p)
+                old = df["symbol"].to_list()
+                df = df.with_columns(normalize_symbol(df["symbol"], lookup))
+                new = df["symbol"].to_list()
+                if old != new:
+                    _atomic_write_parquet(df, parquet_path)
+                    fixed += 1
+                    logger.info(
+                        "代码格式修复: %s/%s (%d 行)",
+                        config.id,
+                        parquet_path.parent.name,
+                        len(df),
+                    )
+            except Exception as e:
+                logger.warning("代码格式修复跳过 %s: %s", parquet_path, e)
 
-    fixed = 0
-    lookup = build_code_lookup(data_dir)
-    for parquet_path in parquet_files:
-        try:
-            df = pl.read_parquet(parquet_path)
-            if "symbol" not in df.columns:
-                continue
-            old = df["symbol"].to_list()
-            df = df.with_columns(normalize_symbol(df["symbol"], lookup))
-            new = df["symbol"].to_list()
-            if old != new:
-                df.write_parquet(parquet_path)
-                fixed += 1
-                logger.info("代码格式修复: %s/%s (%d 行)", config.id, parquet_path.parent.name, len(df))
-        except Exception as e:
-            logger.warning("代码格式修复跳过 %s: %s", parquet_path, e)
-
-    if fixed:
-        _bump_ext_data_generation(config.id, data_dir)
-    return fixed
+        if fixed:
+            _bump_ext_data_generation(config.id, data_dir)
+        return fixed
 
 
 def rows_to_parquet(

@@ -100,6 +100,70 @@ def test_full_recompute_clears_derived_history_when_enriched_is_empty(tmp_path):
     )
 
 
+def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monkeypatch):
+    """删除最早来源分区后，全量重算不得保留新起点之前的旧派生日期。"""
+    old_date = date(2026, 1, 1)
+    new_earliest = date(2026, 1, 2)
+    source = tmp_path / "kline_daily_enriched" / f"date={new_earliest}" / "part.parquet"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+    regime.regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [old_date],
+        "state": ["range"],
+        "score": [50],
+    }))
+    pl.DataFrame({
+        "date": [old_date],
+        "source_mtime_ns": [1],
+    }).write_parquet(regime.regime_builder.regime_coverage_path(tmp_path))
+    market_mainline.mainline_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({
+        "date": [old_date],
+        "kind": ["concept"],
+        "rank": [1],
+    }).write_parquet(market_mainline.mainline_path(tmp_path))
+    pl.DataFrame({
+        "date": [old_date],
+        "kind": ["concept"],
+    }).write_parquet(market_mainline.mainline_coverage_path(tmp_path))
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "earliest_enriched_date",
+        lambda _repo: new_earliest,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        lambda _repo, start, end: pl.DataFrame({
+            "date": [new_earliest],
+            "state": ["strong"],
+            "score": [80],
+        }),
+    )
+    monkeypatch.setattr(regime.regime_builder, "refresh_phase_labels", lambda _data_dir: 1)
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda _repo, _data_dir, start, end, *, kind: pl.DataFrame({
+            "date": [new_earliest],
+            "kind": [kind],
+            "rank": [1],
+        }),
+    )
+
+    regime.regime_recompute(_request(tmp_path), end=new_earliest)
+
+    stored_regime = regime.regime_builder.load_regime_history(tmp_path)
+    stored_mainline = market_mainline.load_mainline_history(tmp_path)
+    assert set(stored_regime["date"].to_list()) == {new_earliest}
+    assert set(stored_mainline["date"].to_list()) == {new_earliest}
+    stored_regime_coverage = pl.read_parquet(
+        regime.regime_builder.regime_coverage_path(tmp_path),
+    )
+    assert set(stored_regime_coverage["date"].to_list()) == {new_earliest}
+    assert not market_mainline.mainline_coverage_path(tmp_path).exists()
+
+
 def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
     tmp_path,
     monkeypatch,
