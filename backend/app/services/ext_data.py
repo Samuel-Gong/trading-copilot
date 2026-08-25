@@ -32,6 +32,23 @@ def _ext_data_lock(config_id: str, data_dir: Path) -> threading.RLock:
         return _ext_data_locks.setdefault(key, threading.RLock())
 
 
+def _atomic_write_text(path: Path, content: str, *, encoding: str) -> None:
+    """在同目录完整写入文本后原子替换。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(content, encoding=encoding)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # 配置模型
 # ---------------------------------------------------------------------------
@@ -144,6 +161,7 @@ class ExtConfig:
         "id", "label", "mode", "fields", "description",
         "symbol_map", "code_map",
         "created_at", "updated_at", "pull",
+        "_storage_revision",
     )
 
     def __init__(
@@ -170,6 +188,7 @@ class ExtConfig:
         self.created_at = created_at or datetime.now().isoformat()
         self.updated_at = updated_at or datetime.now().isoformat()
         self.pull = pull
+        self._storage_revision: str | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -263,7 +282,9 @@ class ExtConfigStore:
             if d.is_dir() and cp.exists():
                 try:
                     raw = json.loads(cp.read_text(encoding="utf-8"))
-                    configs.append(ExtConfig.from_dict(raw))
+                    config = ExtConfig.from_dict(raw)
+                    config._storage_revision = config.updated_at
+                    configs.append(config)
                 except Exception as e:
                     logger.warning("扩展表配置解析失败 %s: %s", cp, e)
         if sig is not None and configs:
@@ -280,18 +301,22 @@ class ExtConfigStore:
             return None
         try:
             raw = json.loads(cp.read_text(encoding="utf-8"))
-            return ExtConfig.from_dict(raw)
+            config = ExtConfig.from_dict(raw)
+            config._storage_revision = config.updated_at
+            return config
         except Exception:
             return None
 
     def upsert(self, config: ExtConfig) -> None:
-        config.updated_at = datetime.now().isoformat()
-        cp = self._config_path(config.id)
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text(
-            json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with _ext_data_lock(config.id, self._base.parent):
+            config.updated_at = datetime.now().isoformat()
+            cp = self._config_path(config.id)
+            _atomic_write_text(
+                cp,
+                json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            config._storage_revision = config.updated_at
 
     def delete(self, config_id: str) -> bool:
         import shutil
@@ -299,10 +324,11 @@ class ExtConfigStore:
             cp = self._config_path(config_id)
         except ValueError:
             return False
-        if not cp.exists():
-            return False
-        shutil.rmtree(cp.parent, ignore_errors=True)
-        return True
+        with _ext_data_lock(config_id, self._base.parent):
+            if not cp.exists():
+                return False
+            shutil.rmtree(cp.parent, ignore_errors=True)
+            return True
 
     def _migrate_legacy(self, old_path: Path) -> None:
         """一次性迁移旧版 ext_configs.json 到独立目录结构。"""
@@ -545,6 +571,24 @@ def _config_dir(config_id: str, data_dir: Path) -> Path:
     return data_dir / "ext_data" / config_id
 
 
+class ExtConfigChangedError(RuntimeError):
+    """写入开始前配置已被删除或替换。"""
+
+
+def _assert_current_config(config: ExtConfig, data_dir: Path) -> None:
+    """拒绝已经被删除或更新的持久化配置对象继续写入。"""
+    expected = config._storage_revision
+    if expected is None:
+        return
+    path = _config_dir(config.id, data_dir) / "config.json"
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已删除或不可读") from exc
+    if current.get("updated_at") != expected:
+        raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已更新，请使用最新配置重试")
+
+
 def _atomic_write_parquet(df, out_path: Path) -> None:
     """在目标目录写临时文件并原子替换，失败时保留原文件。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -604,6 +648,7 @@ def write_ext_parquet(
         df = df.with_columns(normalize_symbol(df["symbol"], lookup))
 
     with _ext_data_lock(config.id, data_dir):
+        _assert_current_config(config, data_dir)
         if config.mode == "snapshot":
             # 快照: 与 config.json 同级，直接覆盖
             cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -675,6 +720,7 @@ def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
         修复的文件数。
     """
     with _ext_data_lock(config.id, data_dir):
+        _assert_current_config(config, data_dir)
         cfg_dir = _config_dir(config.id, data_dir)
         if not cfg_dir.exists():
             return 0

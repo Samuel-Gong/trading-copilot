@@ -14,6 +14,7 @@ from fastapi import APIRouter, Query, Request
 
 from app.market_time import cn_today
 from app.services import regime_builder
+from app.services.atomic_parquet import replace_parquet_set
 from app.services.market_environment_lock import serialized_market_environment_update
 
 router = APIRouter(prefix="/api/regime", tags=["regime"])
@@ -189,20 +190,21 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         start = earliest
     new_rows = regime_builder.run_regime_batch(repo, start=start, end=end)
     if full_recompute:
-        regime_builder.clear_regime_history(data_dir)
-    regime_builder.replace_regime_history_range(
-        data_dir,
-        new_rows,
-        start=start,
-        end=end,
-    )
-    regime_builder.mark_regime_range_processed(
-        data_dir,
-        repo,
-        start=start,
-        end=end,
-    )
-    phase_days = regime_builder.refresh_phase_labels(data_dir)
+        regime_rows, phase_days = regime_builder.label_phase_history(new_rows)
+    else:
+        regime_builder.replace_regime_history_range(
+            data_dir,
+            new_rows,
+            start=start,
+            end=end,
+        )
+        regime_builder.mark_regime_range_processed(
+            data_dir,
+            repo,
+            start=start,
+            end=end,
+        )
+        phase_days = regime_builder.refresh_phase_labels(data_dir)
 
     mainline_results = {}
     for kind in ("concept", "industry"):
@@ -214,18 +216,34 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             kind=kind,
         )
     if full_recompute:
-        market_mainline.clear_mainline_history(data_dir)
-
-    mainline_rows = 0
-    for kind, rows in mainline_results.items():
-        market_mainline.replace_mainline_history_range(
+        regime_entries = regime_builder.build_regime_history_full_snapshot(
             data_dir,
-            rows,
+            regime_rows,
+            repo,
             start=start,
             end=end,
-            kind=kind,
         )
-        mainline_rows += rows.height
+        mainline_entries, mainline_rows = (
+            market_mainline.build_mainline_history_full_snapshot(
+                data_dir,
+                mainline_results,
+            )
+        )
+        replace_parquet_set([
+            *regime_entries,
+            *mainline_entries,
+        ])
+    else:
+        mainline_rows = 0
+        for kind, rows in mainline_results.items():
+            market_mainline.replace_mainline_history_range(
+                data_dir,
+                rows,
+                start=start,
+                end=end,
+                kind=kind,
+            )
+            mainline_rows += rows.height
 
     invalidate_regime_cache()
     return {
@@ -362,18 +380,7 @@ def mainline_recompute(request: Request):
         results[kind] = market_mainline.compute_mainline_range(
             repo, data_dir, earliest, business_today, kind=kind
         )
-    market_mainline.clear_mainline_history(data_dir)
-
-    rows = 0
-    for kind, computed in results.items():
-        market_mainline.replace_mainline_history_range(
-            data_dir,
-            computed,
-            start=earliest,
-            end=business_today,
-            kind=kind,
-        )
-        rows += computed.height
+    rows = market_mainline.replace_mainline_history_full(data_dir, results)
     return {"ok": True, "rows": rows}
 
 

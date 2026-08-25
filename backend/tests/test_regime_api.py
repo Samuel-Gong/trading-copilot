@@ -49,9 +49,9 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     )
     monkeypatch.setattr(
         regime.regime_builder,
-        "replace_regime_history_range",
-        lambda data_dir, rows, *, start, end: regime_ranges.append(
-            (start, end, rows.is_empty())
+        "build_regime_history_full_snapshot",
+        lambda data_dir, rows, repo, *, start, end: (
+            regime_ranges.append((start, end, rows.is_empty())) or []
         ),
         raising=False,
     )
@@ -65,9 +65,13 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     )
     monkeypatch.setattr(
         market_mainline,
-        "replace_mainline_history_range",
-        lambda *args, **kwargs: None,
+        "build_mainline_history_full_snapshot",
+        lambda data_dir, rows_by_kind: (
+            [],
+            sum(frame.height for frame in rows_by_kind.values()),
+        ),
     )
+    monkeypatch.setattr(regime, "replace_parquet_set", lambda entries: None)
 
     regime.regime_recompute(_request(tmp_path))
     regime.mainline_recompute(_request(tmp_path))
@@ -161,7 +165,9 @@ def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monke
         regime.regime_builder.regime_coverage_path(tmp_path),
     )
     assert set(stored_regime_coverage["date"].to_list()) == {new_earliest}
-    assert not market_mainline.mainline_coverage_path(tmp_path).exists()
+    assert pl.read_parquet(
+        market_mainline.mainline_coverage_path(tmp_path),
+    ).is_empty()
 
 
 def test_manual_mainline_recompute_waits_for_pipeline_regime_update(

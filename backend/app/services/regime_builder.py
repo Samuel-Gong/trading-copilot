@@ -20,6 +20,7 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import cn_today
+from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
 from app.services.market_environment_lock import serialized_market_environment_update
 
 logger = logging.getLogger(__name__)
@@ -534,6 +535,21 @@ def _enriched_partition_mtime_ns(repo, target_date: date) -> int | None:
         return None
 
 
+def _regime_coverage_frame(repo, *, start: date, end: date) -> pl.DataFrame:
+    dates = sorted(
+        target_date
+        for target_date in enriched_date_set(repo)
+        if start <= target_date <= end
+    )
+    return pl.DataFrame({
+        "date": pl.Series(dates, dtype=pl.Date),
+        "source_mtime_ns": pl.Series(
+            [_enriched_partition_mtime_ns(repo, target_date) for target_date in dates],
+            dtype=pl.Int64,
+        ),
+    })
+
+
 def mark_regime_range_processed(
     data_dir: Path,
     repo,
@@ -551,18 +567,7 @@ def mark_regime_range_processed(
         if not old.is_empty()
         else pl.DataFrame()
     )
-    dates = sorted(
-        target_date
-        for target_date in enriched_date_set(repo)
-        if start <= target_date <= end
-    )
-    incoming = pl.DataFrame({
-        "date": pl.Series(dates, dtype=pl.Date),
-        "source_mtime_ns": pl.Series(
-            [_enriched_partition_mtime_ns(repo, target_date) for target_date in dates],
-            dtype=pl.Int64,
-        ),
-    })
+    incoming = _regime_coverage_frame(repo, start=start, end=end)
     if kept.is_empty():
         combined = incoming
     elif incoming.is_empty():
@@ -570,7 +575,10 @@ def mark_regime_range_processed(
     else:
         combined = pl.concat([kept.select(incoming.columns), incoming])
     path.parent.mkdir(parents=True, exist_ok=True)
-    combined.unique(subset=["date"], keep="last").sort("date").write_parquet(path)
+    write_parquet_atomic(
+        combined.unique(subset=["date"], keep="last").sort("date"),
+        path,
+    )
 
 
 def load_regime_history(data_dir: Path) -> pl.DataFrame:
@@ -585,6 +593,28 @@ def load_regime_history(data_dir: Path) -> pl.DataFrame:
         return pl.DataFrame()
 
 
+def label_phase_history(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
+    """在内存中对全量 regime 时序重标情绪周期阶段。"""
+    from app.services.market_phase import classify_phase_series
+
+    required = {
+        "date",
+        "max_consecutive",
+        "first_board",
+        "ge2_count",
+        "promo_rate",
+        "seal_rate",
+    }
+    if df.is_empty() or not required.issubset(df.columns):
+        return df, 0
+    try:
+        labeled = classify_phase_series(df)
+    except Exception as e:
+        logger.warning("refresh_phase_labels failed: %s", e)
+        return df, 0
+    return labeled, labeled.height
+
+
 @serialized_market_environment_update
 def refresh_phase_labels(data_dir: Path) -> int:
     """对全量 regime 时序重标情绪周期阶段(冰点/启动/主升/高潮/退潮/修复)。
@@ -593,19 +623,11 @@ def refresh_phase_labels(data_dir: Path) -> int:
     因此每次 upsert 后调用本函数整体重标并写回。行数为天数(千级), 开销可忽略。
     返回标注的天数; 阶段列缺失所需指标(旧 schema 未重算)时返回 0。
     """
-    from app.services.market_phase import classify_phase_series
-
     df = load_regime_history(data_dir)
-    required = {"date", "max_consecutive", "first_board", "ge2_count", "promo_rate", "seal_rate"}
-    if df.is_empty() or not required.issubset(df.columns):
-        return 0
-    try:
-        labeled = classify_phase_series(df)
-    except Exception as e:
-        logger.warning("refresh_phase_labels failed: %s", e)
-        return 0
-    labeled.write_parquet(regime_path(data_dir))
-    return labeled.height
+    labeled, days = label_phase_history(df)
+    if days:
+        write_parquet_atomic(labeled, regime_path(data_dir))
+    return days
 
 
 @serialized_market_environment_update
@@ -640,7 +662,50 @@ def upsert_regime_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
         new_rows = new_rows.select(target_cols)
         combined = pl.concat([kept, new_rows], how="vertical_relaxed")
     combined = combined.sort("date").unique(subset=["date"], keep="last")
-    combined.write_parquet(p)
+    write_parquet_atomic(combined, p)
+
+
+def build_regime_history_full_snapshot(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+) -> list[tuple[Path, pl.DataFrame]]:
+    """构建可与主线结果一起发布的全量 regime 文件集合。"""
+    incoming = new_rows
+    if not incoming.is_empty():
+        incoming = (
+            incoming.filter((pl.col("date") >= start) & (pl.col("date") <= end))
+            .sort("date")
+            .unique(subset=["date"], keep="last")
+        )
+    coverage = _regime_coverage_frame(repo, start=start, end=end)
+    return [
+        (regime_path(data_dir), incoming),
+        (regime_coverage_path(data_dir), coverage),
+    ]
+
+
+@serialized_market_environment_update
+def replace_regime_history_full(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    """原子发布全量 regime 历史及其来源版本水位。"""
+    entries = build_regime_history_full_snapshot(
+        data_dir,
+        new_rows,
+        repo,
+        start=start,
+        end=end,
+    )
+    replace_parquet_set(entries)
 
 
 @serialized_market_environment_update
@@ -685,7 +750,10 @@ def replace_regime_history_range(
             )
 
     p.parent.mkdir(parents=True, exist_ok=True)
-    combined.sort("date").unique(subset=["date"], keep="last").write_parquet(p)
+    write_parquet_atomic(
+        combined.sort("date").unique(subset=["date"], keep="last"),
+        p,
+    )
 
 
 def get_regime_coverage(data_dir: Path) -> dict:

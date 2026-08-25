@@ -25,8 +25,9 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import cn_today
-from app.services.market_environment_lock import serialized_market_environment_update
+from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
 from app.services.ext_data import ExtConfigStore
+from app.services.market_environment_lock import serialized_market_environment_update
 from app.services.market_overview_builder import (
     _dimension_field,
     _dimension_values,
@@ -45,6 +46,13 @@ MAINLINE_DIR = "mainline_history"
 _TOP_PER_DAY = 30          # 每日持久化的主线数(按分数截断)
 _INDUSTRY_LEVEL = 2        # 行业主线取前两级(如 计算机-软件开发)
 _MIN_LIMIT_UP = 3          # 单概念当日最少涨停家数(低于此不参与排名)
+
+_MAINLINE_COVERAGE_SCHEMA = {
+    "date": pl.Date,
+    "kind": pl.Utf8,
+    "source_mtime_ns": pl.Int64,
+    "membership_version": pl.Utf8,
+}
 
 # 主线分权重: 概念内涨停家数 / 最高连板 / 梯队档位数 / 二板以上家数
 _SCORE_WEIGHTS = {
@@ -315,9 +323,12 @@ def _mark_mainline_dates_processed(
         [old.select(incoming.columns), incoming],
         how="vertical_relaxed",
     )
-    combined.unique(subset=["date", "kind"], keep="last").sort(
-        ["date", "kind"]
-    ).write_parquet(path)
+    write_parquet_atomic(
+        combined.unique(subset=["date", "kind"], keep="last").sort(
+            ["date", "kind"]
+        ),
+        path,
+    )
 
 
 def _remove_mainline_dates_processed(
@@ -340,7 +351,7 @@ def _remove_mainline_dates_processed(
             & pl.col("date").is_in(sorted(dates))
         )
     )
-    kept.write_parquet(path)
+    write_parquet_atomic(kept, path)
 
 
 _ST_SYMBOLS_CACHE: tuple[float, frozenset[str]] | None = None
@@ -626,7 +637,38 @@ def upsert_mainline_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
         kept = kept.select(keep_exprs)
         combined = pl.concat([kept, new_rows.select(target_cols)], how="vertical_relaxed")
     combined = combined.sort(["date", "kind", "rank"])
-    combined.write_parquet(p)
+    write_parquet_atomic(combined, p)
+
+
+def build_mainline_history_full_snapshot(
+    data_dir: Path,
+    rows_by_kind: dict[str, pl.DataFrame],
+) -> tuple[list[tuple[Path, pl.DataFrame]], int]:
+    """构建合并概念/行业结果与空完成水位的全量文件集合。"""
+    frames = [frame for frame in rows_by_kind.values() if not frame.is_empty()]
+    if frames:
+        combined = pl.concat(frames, how="vertical_relaxed").sort(
+            ["date", "kind", "rank"]
+        )
+    else:
+        combined = pl.DataFrame()
+    coverage = pl.DataFrame(schema=_MAINLINE_COVERAGE_SCHEMA)
+    entries = [
+        (mainline_path(data_dir), combined),
+        (mainline_coverage_path(data_dir), coverage),
+    ]
+    return entries, sum(frame.height for frame in rows_by_kind.values())
+
+
+@serialized_market_environment_update
+def replace_mainline_history_full(
+    data_dir: Path,
+    rows_by_kind: dict[str, pl.DataFrame],
+) -> int:
+    """原子发布合并后的概念/行业全量结果及空完成水位。"""
+    entries, rows = build_mainline_history_full_snapshot(data_dir, rows_by_kind)
+    replace_parquet_set(entries)
+    return rows
 
 
 @serialized_market_environment_update
@@ -680,7 +722,7 @@ def replace_mainline_history_range(
             )
 
     p.parent.mkdir(parents=True, exist_ok=True)
-    combined.sort(["date", "kind", "rank"]).write_parquet(p)
+    write_parquet_atomic(combined.sort(["date", "kind", "rank"]), p)
 
 
 @serialized_market_environment_update

@@ -8,7 +8,12 @@ import polars as pl
 import pytest
 
 from app.services import ext_data
-from app.services.ext_data import ExtConfig, ExtField
+from app.services.ext_data import (
+    ExtConfig,
+    ExtConfigChangedError,
+    ExtConfigStore,
+    ExtField,
+)
 
 
 def _config() -> ExtConfig:
@@ -95,3 +100,21 @@ def test_atomic_parquet_failure_preserves_previous_file(tmp_path) -> None:
         ext_data._atomic_write_parquet(_FailingFrame(), target)
 
     assert target.read_bytes() == b"previous"
+
+
+def test_deleted_config_rejects_stale_scheduler_write(tmp_path) -> None:
+    """删除返回后，旧调度配置不得重新创建孤儿数据目录。"""
+    store = ExtConfigStore(tmp_path)
+    store.upsert(_config())
+    stale = store.get("concurrent")
+    assert stale is not None
+    assert store.delete("concurrent") is True
+
+    with pytest.raises(ExtConfigChangedError, match="已删除"):
+        ext_data.write_ext_parquet(
+            pl.DataFrame({"symbol": ["A"], "value": ["stale"]}),
+            stale,
+            tmp_path,
+        )
+
+    assert not (tmp_path / "ext_data" / "concurrent").exists()

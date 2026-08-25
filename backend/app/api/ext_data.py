@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from app.market_time import cn_today
 from app.services.ext_data import (
     ExtConfig,
+    ExtConfigChangedError,
     ExtConfigStore,
     ExtField,
     PullConfig,
@@ -27,8 +28,8 @@ from app.services.ext_data import (
     fix_symbol_format,
     infer_fields_from_df,
     parse_upload_file,
-    write_ext_parquet,
     rows_to_parquet,
+    write_ext_parquet,
 )
 from app.services.ext_pull import fetch_and_ingest, pull_scheduler
 
@@ -549,7 +550,10 @@ async def upload_data(
     # 解析快照日期
     snap = date.fromisoformat(snapshot_date) if snapshot_date else cn_today()
 
-    rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
+    try:
+        rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
 
     # 刷新 DuckDB 视图
     _refresh_views(request)
@@ -581,7 +585,15 @@ def ingest_data(request: Request, config_id: str, body: IngestReq):
 
     snap = date.fromisoformat(body.date) if body.date else cn_today()
 
-    rows_written = rows_to_parquet(body.rows, config, _data_dir(request), snapshot_date=snap)
+    try:
+        rows_written = rows_to_parquet(
+            body.rows,
+            config,
+            _data_dir(request),
+            snapshot_date=snap,
+        )
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
 
     _refresh_views(request)
 
@@ -720,7 +732,10 @@ def fix_symbol(request: Request, config_id: str):
     if not config:
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
 
-    fixed = fix_symbol_format(config, _data_dir(request))
+    try:
+        fixed = fix_symbol_format(config, _data_dir(request))
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     _refresh_views(request)
     return {"status": "ok", "fixed_files": fixed}
 
