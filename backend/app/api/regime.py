@@ -184,6 +184,12 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         start=start,
         end=end,
     )
+    regime_builder.mark_regime_range_processed(
+        data_dir,
+        repo,
+        start=start,
+        end=end,
+    )
     phase_days = regime_builder.refresh_phase_labels(data_dir)
 
     from app.services import market_mainline

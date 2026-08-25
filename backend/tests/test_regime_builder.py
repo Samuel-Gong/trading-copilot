@@ -331,16 +331,65 @@ def test_detect_stale_dates_by_mtime(tmp_path):
         "date": [date(2026, 1, 1), date(2026, 1, 2)],
         "state": ["range", "range"], "score": [50, 50],
     }))
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        _FakeRepo(),
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 2),
+    )
     # 让 1/2 的 mtime 更新到 future > regime mtime
     future = time.time() + 10
     os.utime(enriched_dir / "date=2026-01-02" / "part.parquet", (future, future))
 
-    class _FakeRepo:
-        class store:
-            data_dir = tmp_path
     stale = regime_builder.detect_stale_dates(tmp_path, _FakeRepo())
     assert date(2026, 1, 2) in stale
     assert date(2026, 1, 1) not in stale  # 1/1 没更新
+
+
+def test_date_source_version_survives_unrelated_partial_recompute(tmp_path):
+    """较晚日期局部重算不得掩盖较早日期已经变化的 enriched 来源。"""
+    d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+    enriched_dir = tmp_path / "kline_daily_enriched"
+    for target in (d1, d2):
+        part = enriched_dir / f"date={target.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True)
+        part.write_bytes(b"source-v1")
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    repo = _FakeRepo()
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2],
+        "state": ["range", "strong"],
+        "score": [50, 80],
+    }))
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        repo,
+        start=d1,
+        end=d2,
+    )
+
+    stale_source = enriched_dir / f"date={d1.isoformat()}" / "part.parquet"
+    stale_source.write_bytes(b"source-v2")
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d2],
+        "state": ["weak"],
+        "score": [20],
+    }))
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        repo,
+        start=d2,
+        end=d2,
+    )
+
+    assert regime_builder.detect_stale_dates(tmp_path, repo) == [d1]
 
 
 def test_compute_incremental_missing_dates(tmp_path):
@@ -409,6 +458,15 @@ def test_compute_incremental_clears_stale_date_when_recompute_is_empty(
         "state": ["range", "strong"],
         "score": [50, 80],
     }))
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        _FakeRepo(),
+        start=d1,
+        end=d2,
+    )
     future = time.time() + 10
     os.utime(
         enriched_dir / f"date={d2.isoformat()}" / "part.parquet",
@@ -419,10 +477,6 @@ def test_compute_incremental_clears_stale_date_when_recompute_is_empty(
         "run_regime_batch",
         lambda repo, start, end: pl.DataFrame(),
     )
-
-    class _FakeRepo:
-        class store:
-            data_dir = tmp_path
 
     result = regime_builder.compute_regime_incremental(
         _FakeRepo(),
@@ -449,16 +503,21 @@ def test_compute_incremental_clears_deleted_enriched_date(
         "state": ["range", "strong"],
         "score": [50, 80],
     }))
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        _FakeRepo(),
+        start=d1,
+        end=d1,
+    )
     calls: list[tuple[date, date]] = []
     monkeypatch.setattr(
         regime_builder,
         "run_regime_batch",
         lambda repo, start, end: calls.append((start, end)) or pl.DataFrame(),
     )
-
-    class _FakeRepo:
-        class store:
-            data_dir = tmp_path
 
     result = regime_builder.compute_regime_incremental(
         _FakeRepo(),

@@ -75,20 +75,30 @@ def build_data_fingerprint(
     request: dict[str, Any],
 ) -> dict[str, Any]:
     """Hash one stable managed generation plus source metadata."""
-    data_dir = Path(repo.store.data_dir)
+    return build_runtime_data_fingerprint(
+        repo,
+        getattr(app_state, "strategy_engine", None),
+        request,
+    )
+
+
+def build_runtime_data_fingerprint(
+    repo: Any,
+    strategy_engine: Any,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """连续两次读取完整来源元数据，返回稳定的挖掘数据指纹。"""
     for _attempt in range(2):
-        fingerprint = _build_data_fingerprint_once(repo, app_state, request)
-        if repo.get_matrix_data_generation(fingerprint["asset_type"]) != fingerprint["generation"]:
-            continue
-        if _financial_metrics_metadata(data_dir, request) != fingerprint["financial_metrics"]:
-            continue
-        return fingerprint
+        first = _build_data_fingerprint_once(repo, strategy_engine, request)
+        second = _build_data_fingerprint_once(repo, strategy_engine, request)
+        if first == second:
+            return second
     raise ValueError("mining source data changed while building the fingerprint")
 
 
 def _build_data_fingerprint_once(
     repo: Any,
-    app_state: Any,
+    strategy_engine: Any,
     request: dict[str, Any],
 ) -> dict[str, Any]:
     data_dir = Path(repo.store.data_dir)
@@ -112,7 +122,7 @@ def _build_data_fingerprint_once(
         "methodology_version": FACTOR_METHODOLOGY_VERSION,
         "implementation": _implementation_metadata(module_root),
         "strategies": _selected_strategy_metadata(
-            app_state,
+            strategy_engine,
             request.get("strategy_ids") or [],
             data_dir,
         ),
@@ -310,18 +320,17 @@ def _enriched_metadata(root: Path) -> dict[str, Any]:
 
 
 def _selected_strategy_metadata(
-    app_state: Any,
+    strategy_engine: Any,
     strategy_ids: list[str],
     data_dir: Path,
 ) -> list[dict[str, Any]]:
     if not strategy_ids:
         return []
-    engine = getattr(app_state, "strategy_engine", None)
-    if engine is None:
+    if strategy_engine is None:
         raise RuntimeError("strategy engine is unavailable for scheduled mining fingerprint")
     metadata: list[dict[str, Any]] = []
     for strategy_id in sorted(strategy_ids):
-        strategy = engine.get(strategy_id)
+        strategy = strategy_engine.get(strategy_id)
         if strategy.execution_backend != "matrix_native":
             raise ValueError(f"scheduled mining strategy is not matrix-native: {strategy_id}")
         source_path = Path(strategy.file_path) if strategy.file_path is not None else None

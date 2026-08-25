@@ -56,7 +56,10 @@ from app.backtest.strategy import (
 )
 from app.services.mining_jobs import MiningRunStore
 from app.services.mining_preflight import enriched_partition_dates
-from app.services.mining_schedule import MINING_ALGORITHM_VERSION
+from app.services.mining_schedule import (
+    MINING_ALGORITHM_VERSION,
+    build_runtime_data_fingerprint,
+)
 from app.strategy import config as strategy_config
 from app.strategy.engine import StrategyEngine
 
@@ -444,6 +447,9 @@ def run_mining_runtime(
     emit = progress_cb or (lambda _message: None)
     request = _decode_runtime_request(payload, data_dir, strategy_engine)
     fingerprint = payload.get("data_fingerprint")
+    raw_request = payload.get("request")
+    if not isinstance(raw_request, Mapping):
+        raise ValueError("mining worker payload is missing its request")
     expected_generation = (
         fingerprint.get("generation")
         if isinstance(fingerprint, Mapping)
@@ -451,6 +457,20 @@ def run_mining_runtime(
     )
     if not isinstance(expected_generation, str) or not expected_generation:
         raise ValueError("mining worker payload is missing its data generation")
+
+    def assert_stable_fingerprint() -> None:
+        current = build_runtime_data_fingerprint(
+            service.engine.repo,
+            strategy_engine,
+            dict(raw_request),
+        )
+        expected_core = {key: fingerprint.get(key) for key in current}
+        if expected_core != current:
+            raise ValueError(
+                "mining data fingerprint changed after the run was queued"
+            )
+
+    assert_stable_fingerprint()
     store = MiningRunStore(data_dir)
     phase_peak_rss_bytes: dict[str, int] = {}
 
@@ -515,6 +535,7 @@ def run_mining_runtime(
     phase_ms: dict[str, float] = {
         "panel": round((time.perf_counter() - panel_started) * 1000.0, 3)
     }
+    assert_stable_fingerprint()
     finish_phase("panel")
     emit({
         "phase": "panel",
@@ -539,6 +560,7 @@ def run_mining_runtime(
     )
     factor_service._assert_data_generation(request.asset_type, generation)
     phase_ms["matrix"] = round((time.perf_counter() - matrix_started) * 1000.0, 3)
+    assert_stable_fingerprint()
     finish_phase("matrix")
     emit({
         "phase": "matrix",
@@ -571,6 +593,7 @@ def run_mining_runtime(
     finish_phase("search")
     if result.cancelled:
         raise MiningRuntimeCancelledError("mining cancelled")
+    assert_stable_fingerprint()
     emit({
         "phase": "search",
         "label": "候选搜索完成",

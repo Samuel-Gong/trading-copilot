@@ -262,13 +262,13 @@ def test_selected_strategy_metadata_changes_with_same_size_source_edit(tmp_path)
     )
 
     first = mining_schedule._selected_strategy_metadata(
-        state,
+        state.strategy_engine,
         ["demo"],
         tmp_path,
     )
     source.write_text("VALUE = 2\n", encoding="utf-8")
     second = mining_schedule._selected_strategy_metadata(
-        state,
+        state.strategy_engine,
         ["demo"],
         tmp_path,
     )

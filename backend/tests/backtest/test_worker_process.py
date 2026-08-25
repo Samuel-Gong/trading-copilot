@@ -14,8 +14,12 @@ from app.backtest.optimizer import OptimizeConfig
 from app.backtest.strategy import StrategyBacktestConfig
 from app.backtest.walkforward import WalkForwardConfig
 from app.backtest.worker import BacktestWorkerError, make_worker_task, run_worker_task
-from app.enriched_generation import bump_enriched_generation, get_enriched_generation
+from app.enriched_generation import bump_enriched_generation
+from app.services import mining_schedule
 from app.services.mining_jobs import MiningRunStore
+from app.strategy import config as strategy_config
+from app.strategy.engine import StrategyEngine
+from app.tickflow.repository import DataStore, KlineRepository
 
 
 def _write_worker_strategy(data_dir) -> None:
@@ -139,6 +143,19 @@ def _write_mining_market_data(
     }).write_parquet(instruments_dir / "part.parquet")
 
 
+def _mining_fingerprint(data_dir, request: dict) -> dict:
+    repo = KlineRepository(DataStore(data_dir))
+    strategy_engine = StrategyEngine(
+        strategy_dirs=worker_module._strategy_dirs(data_dir),
+        override_loader=lambda sid: strategy_config.load_override(data_dir, sid),
+    )
+    return mining_schedule.build_data_fingerprint(
+        repo,
+        SimpleNamespace(strategy_engine=strategy_engine),
+        request,
+    )
+
+
 def test_spawn_worker_returns_compact_result_and_memory_metrics(tmp_path):
     start = date(2024, 1, 1)
     data_dir = tmp_path / "data"
@@ -243,26 +260,27 @@ def test_spawn_mining_writes_four_artifacts_and_returns_compact_summary(tmp_path
     data_dir = tmp_path / "data"
     _write_mining_market_data(data_dir, start)
     store = MiningRunStore(data_dir)
+    request = {
+        "factor_names": ["turnover_rate"],
+        "strategy_ids": [],
+        "symbols": None,
+        "asset_type": "stock",
+        "start": (start - timedelta(days=7)).isoformat(),
+        "end": (start + timedelta(days=225)).isoformat(),
+        "budget_profile": "exploratory",
+        "forward_horizon": 1,
+        "commission_pct": 0.0,
+        "stamp_tax_pct": 0.0,
+        "slippage_bps": 0.0,
+        "correlation_threshold": 0.75,
+        "max_combination_factors": 1,
+        "beam_width": 2,
+        "max_finalists": 2,
+        "require_regime": False,
+    }
     manifest = store.create(
-        {
-            "factor_names": ["turnover_rate"],
-            "strategy_ids": [],
-            "symbols": None,
-            "asset_type": "stock",
-            "start": (start - timedelta(days=7)).isoformat(),
-            "end": (start + timedelta(days=225)).isoformat(),
-            "budget_profile": "exploratory",
-            "forward_horizon": 1,
-            "commission_pct": 0.0,
-            "stamp_tax_pct": 0.0,
-            "slippage_bps": 0.0,
-            "correlation_threshold": 0.75,
-            "max_combination_factors": 1,
-            "beam_width": 2,
-            "max_finalists": 2,
-            "require_regime": False,
-        },
-        {"generation": get_enriched_generation(data_dir, "stock")},
+        request,
+        _mining_fingerprint(data_dir, request),
         run_id="spawn_mining",
     )
     payload = {
@@ -297,26 +315,27 @@ def test_spawn_mining_benchmarks_strategy_on_every_outer_fold(tmp_path):
     data_dir = tmp_path / "data"
     _write_mining_market_data(data_dir, start)
     store = MiningRunStore(data_dir)
+    request = {
+        "factor_names": ["turnover_rate"],
+        "strategy_ids": ["low_volatility_leader"],
+        "symbols": None,
+        "asset_type": "stock",
+        "start": (start - timedelta(days=7)).isoformat(),
+        "end": (start + timedelta(days=225)).isoformat(),
+        "budget_profile": "exploratory",
+        "forward_horizon": 1,
+        "commission_pct": 0.0,
+        "stamp_tax_pct": 0.0,
+        "slippage_bps": 0.0,
+        "correlation_threshold": 0.75,
+        "max_combination_factors": 1,
+        "beam_width": 2,
+        "max_finalists": 2,
+        "require_regime": False,
+    }
     manifest = store.create(
-        {
-            "factor_names": ["turnover_rate"],
-            "strategy_ids": ["low_volatility_leader"],
-            "symbols": None,
-            "asset_type": "stock",
-            "start": (start - timedelta(days=7)).isoformat(),
-            "end": (start + timedelta(days=225)).isoformat(),
-            "budget_profile": "exploratory",
-            "forward_horizon": 1,
-            "commission_pct": 0.0,
-            "stamp_tax_pct": 0.0,
-            "slippage_bps": 0.0,
-            "correlation_threshold": 0.75,
-            "max_combination_factors": 1,
-            "beam_width": 2,
-            "max_finalists": 2,
-            "require_regime": False,
-        },
-        {"generation": get_enriched_generation(data_dir, "stock")},
+        request,
+        _mining_fingerprint(data_dir, request),
         run_id="spawn_mining_benchmark",
     )
     payload = {
@@ -354,27 +373,27 @@ def test_spawn_mining_rejects_generation_change_after_queue(tmp_path):
     data_dir = tmp_path / "data"
     _write_mining_market_data(data_dir, start)
     store = MiningRunStore(data_dir)
-    queued_generation = get_enriched_generation(data_dir, "stock")
+    request = {
+        "factor_names": ["turnover_rate"],
+        "strategy_ids": [],
+        "symbols": None,
+        "asset_type": "stock",
+        "start": (start - timedelta(days=7)).isoformat(),
+        "end": (start + timedelta(days=225)).isoformat(),
+        "budget_profile": "exploratory",
+        "forward_horizon": 1,
+        "commission_pct": 0.0,
+        "stamp_tax_pct": 0.0,
+        "slippage_bps": 0.0,
+        "correlation_threshold": 0.75,
+        "max_combination_factors": 1,
+        "beam_width": 2,
+        "max_finalists": 2,
+        "require_regime": False,
+    }
     manifest = store.create(
-        {
-            "factor_names": ["turnover_rate"],
-            "strategy_ids": [],
-            "symbols": None,
-            "asset_type": "stock",
-            "start": (start - timedelta(days=7)).isoformat(),
-            "end": (start + timedelta(days=225)).isoformat(),
-            "budget_profile": "exploratory",
-            "forward_horizon": 1,
-            "commission_pct": 0.0,
-            "stamp_tax_pct": 0.0,
-            "slippage_bps": 0.0,
-            "correlation_threshold": 0.75,
-            "max_combination_factors": 1,
-            "beam_width": 2,
-            "max_finalists": 2,
-            "require_regime": False,
-        },
-        {"generation": queued_generation},
+        request,
+        _mining_fingerprint(data_dir, request),
         run_id="stale_generation_mining",
     )
     bump_enriched_generation(data_dir, "stock")
@@ -392,6 +411,54 @@ def test_spawn_mining_rejects_generation_change_after_queue(tmp_path):
         run_worker_task(make_worker_task("mining", data_dir, payload))
 
     assert store.get("stale_generation_mining")["artifacts"] == {}  # type: ignore[index]
+
+
+def test_spawn_mining_rejects_financial_snapshot_change_after_queue(tmp_path):
+    start = date(2023, 1, 2)
+    data_dir = tmp_path / "data"
+    _write_mining_market_data(data_dir, start)
+    metrics = data_dir / "financials" / "metrics" / "part.parquet"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_bytes(b"financial-v1")
+    request = {
+        "factor_names": ["roe_latest"],
+        "strategy_ids": [],
+        "symbols": None,
+        "asset_type": "stock",
+        "start": (start - timedelta(days=7)).isoformat(),
+        "end": (start + timedelta(days=225)).isoformat(),
+        "budget_profile": "exploratory",
+        "forward_horizon": 1,
+        "commission_pct": 0.0,
+        "stamp_tax_pct": 0.0,
+        "slippage_bps": 0.0,
+        "correlation_threshold": 0.75,
+        "max_combination_factors": 1,
+        "beam_width": 2,
+        "max_finalists": 2,
+        "require_regime": False,
+    }
+    store = MiningRunStore(data_dir)
+    manifest = store.create(
+        request,
+        _mining_fingerprint(data_dir, request),
+        run_id="stale_financial_mining",
+    )
+    metrics.write_bytes(b"financial-v2")
+    payload = {
+        "run_id": manifest["run_id"],
+        "request": manifest["request"],
+        "data_fingerprint": manifest["data_fingerprint"],
+        "source": "manual",
+    }
+
+    with pytest.raises(
+        BacktestWorkerError,
+        match="fingerprint changed after the run was queued",
+    ):
+        run_worker_task(make_worker_task("mining", data_dir, payload))
+
+    assert store.get("stale_financial_mining")["artifacts"] == {}  # type: ignore[index]
 
 
 def test_worker_terminates_child_after_cancel_grace(monkeypatch, tmp_path):

@@ -486,6 +486,87 @@ def regime_path(data_dir: Path) -> Path:
     return data_dir / REGIME_DIR / "part.parquet"
 
 
+def regime_coverage_path(data_dir: Path) -> Path:
+    """保存每个 regime 日期处理时对应的 enriched 来源版本。"""
+    return data_dir / REGIME_DIR / "coverage.parquet"
+
+
+def _load_regime_coverage(data_dir: Path) -> pl.DataFrame:
+    path = regime_coverage_path(data_dir)
+    if not path.exists():
+        return pl.DataFrame()
+    try:
+        frame = pl.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("load regime coverage failed: %s", exc)
+        return pl.DataFrame()
+    if not {"date", "source_mtime_ns"}.issubset(frame.columns):
+        return pl.DataFrame()
+    return frame.select([
+        pl.col("date").cast(pl.Date),
+        pl.col("source_mtime_ns").cast(pl.Int64),
+    ])
+
+
+def _processed_regime_dates(data_dir: Path) -> set[date]:
+    coverage = _load_regime_coverage(data_dir)
+    if coverage.is_empty():
+        return set()
+    return set(coverage["date"].to_list())
+
+
+def _enriched_partition_mtime_ns(repo, target_date: date) -> int | None:
+    path = (
+        repo.store.data_dir
+        / "kline_daily_enriched"
+        / f"date={target_date.isoformat()}"
+        / "part.parquet"
+    )
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def mark_regime_range_processed(
+    data_dir: Path,
+    repo,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    """以当前 enriched 版本完整替换指定日期范围的完成水位。"""
+    if start > end:
+        return
+    path = regime_coverage_path(data_dir)
+    old = _load_regime_coverage(data_dir)
+    kept = (
+        old.filter((pl.col("date") < start) | (pl.col("date") > end))
+        if not old.is_empty()
+        else pl.DataFrame()
+    )
+    dates = sorted(
+        target_date
+        for target_date in enriched_date_set(repo)
+        if start <= target_date <= end
+    )
+    incoming = pl.DataFrame({
+        "date": pl.Series(dates, dtype=pl.Date),
+        "source_mtime_ns": pl.Series(
+            [_enriched_partition_mtime_ns(repo, target_date) for target_date in dates],
+            dtype=pl.Int64,
+        ),
+    })
+    if kept.is_empty():
+        combined = incoming
+    elif incoming.is_empty():
+        combined = kept
+    else:
+        combined = pl.concat([kept.select(incoming.columns), incoming])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    combined.unique(subset=["date"], keep="last").sort("date").write_parquet(path)
+
+
 def load_regime_history(data_dir: Path) -> pl.DataFrame:
     """读取全部 regime 时序; 不存在返回空 DataFrame。"""
     p = regime_path(data_dir)
@@ -614,37 +695,29 @@ def get_regime_coverage(data_dir: Path) -> dict:
 
 
 def detect_stale_dates(data_dir: Path, repo) -> list[date]:
-    """检测 regime 已有但需要重算的天(enriched 被覆写)。
-
-    用 mtime 比对: enriched 分区 parquet 的 mtime > regime parquet 的 mtime
-    → 该日 enriched 更新过, regime 需重算。
-    """
-    regime_p = regime_path(data_dir)
-    if not regime_p.exists():
-        return []
-    regime_mtime = regime_p.stat().st_mtime
-    enriched_dir = repo.store.data_dir / "kline_daily_enriched"
-    if not enriched_dir.exists():
-        return []
-    stale: list[date] = []
+    """检测每个已处理日期的 enriched 来源版本是否发生变化。"""
     existing = load_regime_history(data_dir)
-    if existing.is_empty():
+    existing_dates = (
+        set(existing["date"].to_list())
+        if not existing.is_empty() and "date" in existing.columns
+        else set()
+    )
+    completed_dates = existing_dates | _processed_regime_dates(data_dir)
+    if not completed_dates:
         return []
-    existing_dates = set(existing["date"].to_list())
-    for part in enriched_dir.glob("date=*/part.parquet"):
-        try:
-            ds = part.parent.name.replace("date=", "")
-            d = date.fromisoformat(ds)
-        except (ValueError, OSError):
-            continue
-        if d not in existing_dates:
-            continue
-        try:
-            if part.stat().st_mtime > regime_mtime:
-                stale.append(d)
-        except OSError:
-            continue
-    return sorted(stale)
+    coverage = _load_regime_coverage(data_dir)
+    recorded = {
+        row["date"]: row["source_mtime_ns"]
+        for row in coverage.iter_rows(named=True)
+    }
+    return sorted(
+        target_date
+        for target_date in completed_dates
+        if (
+            (current := _enriched_partition_mtime_ns(repo, target_date)) is not None
+            and recorded.get(target_date) != current
+        )
+    )
 
 
 def latest_phase_transition(data_dir: Path) -> tuple[str, str, str] | None:
@@ -677,11 +750,13 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
     # 缺口: enriched 有哪些天, regime 缺哪些
     enriched_dates = enriched_date_set(repo)
     existing_dates = set(existing["date"].to_list()) if not existing.is_empty() else set()
-    missing = sorted(d for d in enriched_dates if d not in existing_dates and d <= today)
+    processed_dates = _processed_regime_dates(data_dir)
+    completed_dates = existing_dates | processed_dates
+    missing = sorted(d for d in enriched_dates if d not in completed_dates and d <= today)
 
     # stale: enriched 覆写过；removed: 已有历史对应的来源分区被删除。
-    stale = detect_stale_dates(data_dir, repo)
-    removed = sorted(d for d in existing_dates - enriched_dates if d <= today)
+    stale = sorted(d for d in detect_stale_dates(data_dir, repo) if d <= today)
+    removed = sorted(d for d in completed_dates - enriched_dates if d <= today)
 
     to_compute = sorted(set(missing) | set(stale) | set(removed))
     if not to_compute:
@@ -694,6 +769,12 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
     replace_regime_history_range(
         data_dir,
         new_rows,
+        start=to_compute[0],
+        end=to_compute[-1],
+    )
+    mark_regime_range_processed(
+        data_dir,
+        repo,
         start=to_compute[0],
         end=to_compute[-1],
     )
