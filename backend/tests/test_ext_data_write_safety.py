@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime
 
 import polars as pl
 import pytest
@@ -160,3 +161,26 @@ def test_stale_update_cannot_overwrite_newer_config(tmp_path) -> None:
         store.update(stale)
 
     assert store.get("concurrent").label == "最新配置"
+
+
+def test_cas_revision_changes_when_wall_clock_is_frozen(tmp_path, monkeypatch) -> None:
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 8, 25, 12, 0, 0)
+            return value.replace(tzinfo=tz) if tz is not None else value
+
+    monkeypatch.setattr(ext_data, "datetime", _FrozenDateTime)
+    store = ExtConfigStore(tmp_path)
+    store.create(_config())
+    stale = store.get("concurrent")
+    current = store.get("concurrent")
+    assert stale is not None and current is not None
+    original_revision = current._storage_revision
+    current.label = "固定时钟下的新配置"
+    store.update(current)
+
+    assert current.updated_at == stale.updated_at
+    assert current._storage_revision != original_revision
+    with pytest.raises(ExtConfigChangedError, match="已更新"):
+        store.update(stale)

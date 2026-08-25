@@ -277,6 +277,10 @@ async def fetch_preset(config_id: str, data_dir: Path) -> int:
             if config is None:
                 raise
 
+    # 内置入口始终使用发行版固定的 URL/schema；磁盘对象只提供 CAS 修订号。
+    preset._storage_revision = config._storage_revision
+    config = preset
+
     n = await _seed_one(config, flatten, data_dir)
     logger.info("内置扩展表 %s 手动拉取成功: %d 行", config_id, n)
     return n

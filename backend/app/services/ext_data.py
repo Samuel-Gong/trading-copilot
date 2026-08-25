@@ -283,7 +283,7 @@ class ExtConfigStore:
                 try:
                     raw = json.loads(cp.read_text(encoding="utf-8"))
                     config = ExtConfig.from_dict(raw)
-                    config._storage_revision = config.updated_at
+                    config._storage_revision = raw.get("_revision") or config.updated_at
                     configs.append(config)
                 except Exception as e:
                     logger.warning("扩展表配置解析失败 %s: %s", cp, e)
@@ -302,20 +302,23 @@ class ExtConfigStore:
         try:
             raw = json.loads(cp.read_text(encoding="utf-8"))
             config = ExtConfig.from_dict(raw)
-            config._storage_revision = config.updated_at
+            config._storage_revision = raw.get("_revision") or config.updated_at
             return config
         except Exception:
             return None
 
     def _write_locked(self, config: ExtConfig) -> None:
         config.updated_at = datetime.now().isoformat()
+        revision = uuid.uuid4().hex
+        payload = config.to_dict()
+        payload["_revision"] = revision
         cp = self._config_path(config.id)
         _atomic_write_text(
             cp,
-            json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        config._storage_revision = config.updated_at
+        config._storage_revision = revision
 
     def create(self, config: ExtConfig) -> None:
         """仅在 id 尚不存在时创建配置。"""
@@ -611,7 +614,8 @@ def _assert_current_config(config: ExtConfig, data_dir: Path) -> None:
         current = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已删除或不可读") from exc
-    if current.get("updated_at") != expected:
+    current_revision = current.get("_revision") or current.get("updated_at")
+    if current_revision != expected:
         raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已更新，请使用最新配置重试")
 
 
