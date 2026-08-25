@@ -1275,11 +1275,17 @@ function MainlineFilterPanel({ filter, onDone }: {
   }
 
   const save = async () => {
+    const effectiveMinMembers = Math.max(1, Number(minMembers) || 4)
+    const effectiveMaxMembers = Math.max(50, Number(maxMembers) || 600)
+    if (effectiveMinMembers > effectiveMaxMembers) {
+      toast('成员数下限不能大于上限', 'error')
+      return
+    }
     setSaving(true)
     try {
       await api.mainlineFilterUpdate({
-        min_members: Math.max(1, Number(minMembers) || 4),
-        max_members: Math.max(50, Number(maxMembers) || 600),
+        min_members: effectiveMinMembers,
+        max_members: effectiveMaxMembers,
         blacklist,
       })
       await api.regimeMainlineRecompute()

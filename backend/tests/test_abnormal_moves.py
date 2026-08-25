@@ -558,6 +558,38 @@ def test_build_overview_missing_exchange_benchmark_fails_closed() -> None:
     assert result["rows"] == []
 
 
+def test_build_overview_missing_all_benchmarks_reports_unavailable() -> None:
+    """全部基准实时行情缺失时，摘要不得伪装成指数平盘。"""
+    with _hist_cache_lock:
+        _hist_cache.clear()
+
+    class _TodayRepo(_FakeRepo):
+        def get_enriched_latest(self):
+            return self._df, cn_today()
+
+    class _MissingBenchmarks:
+        def get_index_quotes(self):
+            return pl.DataFrame()
+
+    frame = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "name": ["沪股"],
+        "close": [10.0],
+        "change_pct": [0.01],
+        "deviate_3d": [0.20],
+        "deviate_10d": [None],
+        "deviate_30d": [None],
+    })
+
+    result = build_overview(
+        _TodayRepo(frame),
+        _MissingBenchmarks(),
+        min_closeness=0.0,
+    )
+
+    assert result["bench_rt_pct"] is None
+
+
 def test_build_overview_negative_side_stricter_threshold() -> None:
     """严重异动负向阈值更严 (10日-50%/30日-70%), 跌方向更早触发。"""
     with _hist_cache_lock:

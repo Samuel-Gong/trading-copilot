@@ -51,3 +51,14 @@ test('缺少时点化风险警示数据时不展示无效 ST 过滤开关', asyn
   assert.doesNotMatch(panel[0], /excludeSt|统计剔除 ST 股|主线与情绪周期已全量重算/)
   assert.doesNotMatch(api, /mainlineFilterUpdate: \(payload: \{[^}]*exclude_st/)
 })
+
+
+test('主线过滤设置不提交下限高于上限的矛盾配置', async () => {
+  const regime = await readFile(new URL('../src/pages/Regime.tsx', import.meta.url), 'utf8')
+  const panel = regime.match(/function MainlineFilterPanel[\s\S]*?function CustomDaysModal/)
+
+  assert.ok(panel, '应能定位主线过滤设置面板')
+  assert.match(panel[0], /if \(effectiveMinMembers > effectiveMaxMembers\)/)
+  assert.match(panel[0], /成员数下限不能大于上限/)
+  assert.match(panel[0], /return/)
+})

@@ -285,14 +285,17 @@ def build_overview(
         _STATUS_EDGE: sum(1 for r in out_rows if r["status"] == _STATUS_EDGE),
         _STATUS_WATCH: sum(1 for r in out_rows if r["status"] == _STATUS_WATCH),
     }
+    available_bench_rt_pcts = [
+        value for value in bench_rt_by_exchange.values() if value is not None
+    ]
     return {
         "asof": time.time(),
         "cache_date": cache_date,
         # 保留既有标量响应契约, 仅用于页面摘要; 逐标的计算使用上面的交易所映射。
-        "bench_rt_pct": round(
-            sum(value for value in bench_rt_by_exchange.values() if value is not None)
-            / max(sum(value is not None for value in bench_rt_by_exchange.values()), 1),
-            4,
+        "bench_rt_pct": (
+            round(sum(available_bench_rt_pcts) / len(available_bench_rt_pcts), 4)
+            if available_bench_rt_pcts
+            else None
         ),
         "includes_today": includes_today,
         "rules": RULES_META,

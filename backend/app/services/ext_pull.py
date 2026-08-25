@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from app.market_time import CN_TZ
 from app.services.ext_data import (
     ExtConfig,
     ExtConfigStore,
@@ -17,24 +18,34 @@ from app.services.ext_data import (
 logger = logging.getLogger(__name__)
 
 
-def _in_time_window(start: str | None, end: str | None) -> bool:
-    """检查当前本地时间是否在每日时间窗口内。
+def _in_time_window(
+    start: str | None,
+    end: str | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """检查当前北京时间是否在每日时间窗口内。
 
     start/end 为 "HH:MM" 格式。两者都为 None 时不限制(返回 True)。
     支持跨午夜窗口(如 22:00-02:00)。
     """
     if not start or not end:
         return True
-    now = datetime.now().strftime("%H:%M")
+    current = now or datetime.now(CN_TZ)
+    if current.tzinfo is not None:
+        current = current.astimezone(CN_TZ)
+    current_hm = current.strftime("%H:%M")
     if start <= end:
-        return start <= now < end
+        return start <= current_hm < end
     # 跨午夜: 如 22:00-02:00
-    return now >= start or now < end
+    return current_hm >= start or current_hm < end
 
 
 def _seconds_until_window_start(start: str, *, now: datetime | None = None) -> float | None:
-    """返回本地当前时刻到下一个每日窗口起点的秒数; 格式非法时返回 None。"""
-    current = now or datetime.now()
+    """返回北京时间当前时刻到下一个每日窗口起点的秒数; 格式非法时返回 None。"""
+    current = now or datetime.now(CN_TZ)
+    if current.tzinfo is not None:
+        current = current.astimezone(CN_TZ)
     try:
         hour, minute = (int(part) for part in start.split(":", 1))
         target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)

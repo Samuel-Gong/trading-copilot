@@ -261,7 +261,11 @@ export function AbnormalMoves() {
               <span className="text-[10px] text-muted">
                 数据截至 {data?.cache_date ?? '—'}
                 {data?.includes_today ? ' (含今日收盘)' : ' · 已叠加今日实时涨跌'}
-                {data ? ` · 基准指数今日 ${(data.bench_rt_pct * 100).toFixed(2)}%` : ''}
+                {data
+                  ? data.bench_rt_pct == null
+                    ? ' · 基准指数今日不可用'
+                    : ` · 基准指数今日 ${(data.bench_rt_pct * 100).toFixed(2)}%`
+                  : ''}
               </span>
             )}
           </div>

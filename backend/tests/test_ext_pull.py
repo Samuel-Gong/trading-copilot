@@ -30,7 +30,7 @@ async def test_scheduler_waits_until_window_start_after_skip(monkeypatch, tmp_pa
         @classmethod
         def now(cls, tz=None):
             if tz is not None:
-                return cls(2026, 8, 24, 2, 0, 0, tzinfo=UTC)
+                return cls(2026, 8, 24, 2, 0, 0, tzinfo=UTC).astimezone(tz)
             return cls(2026, 8, 24, 10, 0, 0)
 
     class _Store:
@@ -66,3 +66,11 @@ def test_seconds_until_window_start_handles_cross_midnight_and_invalid_value() -
     now = datetime(2026, 8, 24, 3, 0, 0)
     assert ext_pull._seconds_until_window_start("22:00", now=now) == 19 * 60 * 60
     assert ext_pull._seconds_until_window_start("invalid", now=now) is None
+
+
+def test_pull_window_uses_beijing_time_for_aware_clock() -> None:
+    """部署主机为 UTC 时，配置窗口仍须按北京时间判断和等待。"""
+    now = datetime(2026, 8, 24, 7, 30, 0, tzinfo=UTC)
+
+    assert ext_pull._in_time_window("15:00", "16:00", now=now) is True
+    assert ext_pull._seconds_until_window_start("16:00", now=now) == 30 * 60

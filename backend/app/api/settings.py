@@ -1024,6 +1024,11 @@ def update_mainline_filter(req: MainlineFilterIn) -> dict:
             status_code=409,
             detail="历史风险警示状态尚无 point-in-time 数据，暂不支持修改 ST 过滤口径",
         )
+    current = preferences.get_mainline_filter_config()
+    min_members = req.min_members if req.min_members is not None else current["min_members"]
+    max_members = req.max_members if req.max_members is not None else current["max_members"]
+    if min_members > max_members:
+        raise HTTPException(status_code=422, detail="成员数下限不能大于上限")
     payload = req.model_dump(exclude={"exclude_st"})
     return preferences.set_mainline_filter_config(payload)
 

@@ -1255,7 +1255,7 @@ export interface AbnormalRow {
 export interface AbnormalOverview {
   asof: number
   cache_date: string | null
-  bench_rt_pct: number
+  bench_rt_pct: number | null
   includes_today: boolean
   rules: Array<{
     board: string
