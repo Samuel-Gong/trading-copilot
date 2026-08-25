@@ -533,12 +533,36 @@ def set_sentiment_exclude_st(v: bool) -> bool:
 
 
 def get_mainline_filter_config() -> dict:
-    """主线过滤配置汇总(供 API 返回与计算读取)。"""
+    """一次加载并规范化主线过滤配置，避免并发保存产生混合快照。"""
+    values = load()
+    try:
+        min_members = max(
+            _MAINLINE_MIN_MEMBERS_MIN,
+            min(_MAINLINE_MIN_MEMBERS_MAX, int(values.get("mainline_min_members", 4))),
+        )
+    except (TypeError, ValueError):
+        min_members = 4
+    try:
+        max_members = max(
+            _MAINLINE_MAX_MEMBERS_MIN,
+            min(_MAINLINE_MAX_MEMBERS_MAX, int(values.get("mainline_max_members", 600))),
+        )
+    except (TypeError, ValueError):
+        max_members = 600
+    blacklist = values.get("mainline_blacklist", [])
+    if isinstance(blacklist, str):
+        blacklist = [
+            part for part in re.split(r"[,，、;；\s]+", blacklist) if part
+        ]  # noqa: RUF001
+    if not isinstance(blacklist, list):
+        blacklist = []
     return {
-        "min_members": get_mainline_min_members(),
-        "max_members": get_mainline_max_members(),
-        "blacklist": get_mainline_blacklist(),
-        "exclude_st": get_sentiment_exclude_st(),
+        "min_members": min_members,
+        "max_members": max_members,
+        "blacklist": [
+            str(item).strip() for item in blacklist if str(item).strip()
+        ],
+        "exclude_st": bool(values.get("sentiment_exclude_st", True)),
     }
 
 

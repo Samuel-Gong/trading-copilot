@@ -156,6 +156,14 @@ class TestComputeMainline:
         cfg = {"min_members": 4, "max_members": 600, "blacklist": []}
         first = market_mainline.compute_mainline_range(repo, tmp_path, d1, d1, kind="concept", filter_cfg=cfg)
         market_mainline.upsert_mainline_history(tmp_path, first)
+        filter_config = market_mainline.load_mainline_filter_config()
+        market_mainline._mark_mainline_dates_processed(
+            tmp_path,
+            repo,
+            "concept",
+            {d1},
+            filter_version=market_mainline._mainline_filter_version(filter_config),
+        )
         new = market_mainline.compute_mainline_incremental(repo, tmp_path, kind="concept")
         assert not new.is_empty()
         assert set(new["date"].to_list()) == {d2}
@@ -184,6 +192,61 @@ class TestComputeMainline:
         ).is_empty()
 
         assert calls == [(d1, d2, "concept")]
+
+    def test_incremental_recomputes_after_filter_config_change(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """过滤配置版本变化后，所有已处理日期都必须重新计算。"""
+        d1, d2 = date(2024, 1, 2), date(2024, 1, 3)
+        repo = _fake_repo(tmp_path)
+        calls: list[tuple[date, date, str]] = []
+        current_config = {
+            "min_members": 4,
+            "max_members": 600,
+            "blacklist": [],
+            "exclude_st": True,
+        }
+        monkeypatch.setattr(
+            "app.services.regime_builder.enriched_date_set",
+            lambda current_repo: {d1, d2},
+        )
+        monkeypatch.setattr(
+            market_mainline,
+            "load_mainline_filter_config",
+            lambda: current_config.copy(),
+        )
+
+        def compute(current_repo, data_dir, start, end, kind="concept", **kwargs):
+            calls.append((start, end, kind))
+            return pl.DataFrame()
+
+        monkeypatch.setattr(market_mainline, "compute_mainline_range", compute)
+        market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+        market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+        current_config["min_members"] = 5
+        market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+
+        assert calls == [
+            (d1, d2, "concept"),
+            (d1, d2, "concept"),
+        ]
 
     def test_full_snapshot_records_all_no_result_dates(self, tmp_path, monkeypatch):
         """全量发布也要为两个维度记录空结果日期的完成水位。"""
@@ -617,6 +680,30 @@ class TestComputeMainline:
 
 
 class TestMainlineFilterPreferences:
+    def test_filter_config_uses_one_preferences_snapshot(self, monkeypatch):
+        """汇总读取不得拼接多次 load 的不同版本。"""
+        calls = 0
+
+        def load_once():
+            nonlocal calls
+            calls += 1
+            return {
+                "mainline_min_members": 7,
+                "mainline_max_members": 800,
+                "mainline_blacklist": "标签甲,标签乙",
+                "sentiment_exclude_st": False,
+            }
+
+        monkeypatch.setattr(preferences, "load", load_once)
+
+        assert preferences.get_mainline_filter_config() == {
+            "min_members": 7,
+            "max_members": 800,
+            "blacklist": ["标签甲", "标签乙"],
+            "exclude_st": False,
+        }
+        assert calls == 1
+
     def test_blacklist_string_parsing_and_clamp(self, tmp_path, monkeypatch):
         path = tmp_path / "preferences.json"
         monkeypatch.setattr(preferences, "_path", lambda: path)

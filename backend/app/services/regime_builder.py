@@ -29,6 +29,11 @@ from app.services.market_environment_lock import (
 
 logger = logging.getLogger(__name__)
 
+
+class RegimeSourceChangedError(RuntimeError):
+    """全量环境计算期间个股或指数行情来源发生变化。"""
+
+
 # ───────────────────────── 状态分类阈值(可调) ─────────────────────────
 # 评分模型对齐看板情绪分(market_overview_builder): 采用 _score(low,high) 归一化
 # (比多点插值简洁、不易设错), 4 个轻量维度(赚钱/投机/抗跌/趋势), 阈值与看板统一。
@@ -492,7 +497,7 @@ def regime_path(data_dir: Path) -> Path:
 
 
 def regime_coverage_path(data_dir: Path) -> Path:
-    """保存每个 regime 日期处理时对应的 enriched 来源版本。"""
+    """保存每个 regime 日期处理时对应的个股与指数 enriched 来源版本。"""
     return data_dir / REGIME_DIR / "coverage.parquet"
 
 
@@ -516,6 +521,16 @@ def _load_regime_coverage(data_dir: Path) -> pl.DataFrame:
     return frame.select([
         pl.col("date").cast(pl.Date),
         pl.col("source_mtime_ns").cast(pl.Int64),
+        (
+            pl.col("index_source_mtime_ns").cast(pl.Int64)
+            if "index_source_mtime_ns" in frame.columns
+            else pl.lit(None).cast(pl.Int64).alias("index_source_mtime_ns")
+        ),
+        (
+            pl.col("index_source_size").cast(pl.Int64)
+            if "index_source_size" in frame.columns
+            else pl.lit(None).cast(pl.Int64).alias("index_source_size")
+        ),
     ])
 
 
@@ -539,19 +554,60 @@ def _enriched_partition_mtime_ns(repo, target_date: date) -> int | None:
         return None
 
 
+def _index_partition_version(repo, target_date: date) -> tuple[int | None, int | None]:
+    path = (
+        repo.store.data_dir
+        / "kline_index_enriched"
+        / f"date={target_date.isoformat()}"
+        / "part.parquet"
+    )
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, None
+    return stat.st_mtime_ns, stat.st_size
+
+
 def _regime_coverage_frame(repo, *, start: date, end: date) -> pl.DataFrame:
     dates = sorted(
         target_date
         for target_date in enriched_date_set(repo)
         if start <= target_date <= end
     )
+    index_versions = [_index_partition_version(repo, target_date) for target_date in dates]
     return pl.DataFrame({
         "date": pl.Series(dates, dtype=pl.Date),
         "source_mtime_ns": pl.Series(
             [_enriched_partition_mtime_ns(repo, target_date) for target_date in dates],
             dtype=pl.Int64,
         ),
+        "index_source_mtime_ns": pl.Series(
+            [version[0] for version in index_versions],
+            dtype=pl.Int64,
+        ),
+        "index_source_size": pl.Series(
+            [version[1] for version in index_versions],
+            dtype=pl.Int64,
+        ),
     })
+
+
+def capture_regime_source_snapshot(repo, *, start: date, end: date) -> pl.DataFrame:
+    """捕获全量环境结果对应的个股 enriched 与指数 enriched 来源版本。"""
+    return _regime_coverage_frame(repo, start=start, end=end)
+
+
+def assert_regime_source_unchanged(
+    expected: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    """发布前复验环境计算使用的完整行情来源版本。"""
+    current = capture_regime_source_snapshot(repo, start=start, end=end)
+    if expected.to_dicts() != current.to_dicts():
+        raise RegimeSourceChangedError("环境计算期间行情来源已更新，请重试全量重算")
 
 
 def mark_regime_range_processed(
@@ -561,7 +617,7 @@ def mark_regime_range_processed(
     start: date,
     end: date,
 ) -> None:
-    """以当前 enriched 版本完整替换指定日期范围的完成水位。"""
+    """以当前个股与指数 enriched 版本完整替换指定日期范围的完成水位。"""
     if start > end:
         return
     path = regime_coverage_path(data_dir)
@@ -677,6 +733,7 @@ def build_regime_history_full_snapshot(
     *,
     start: date,
     end: date,
+    source_snapshot: pl.DataFrame | None = None,
 ) -> list[tuple[Path, pl.DataFrame]]:
     """构建可与主线结果一起发布的全量 regime 文件集合。"""
     incoming = new_rows
@@ -686,7 +743,9 @@ def build_regime_history_full_snapshot(
             .sort("date")
             .unique(subset=["date"], keep="last")
         )
-    coverage = _regime_coverage_frame(repo, start=start, end=end)
+    coverage = source_snapshot
+    if coverage is None:
+        coverage = capture_regime_source_snapshot(repo, start=start, end=end)
     return [
         (regime_path(data_dir), incoming),
         (regime_coverage_path(data_dir), coverage),
@@ -701,14 +760,23 @@ def replace_regime_history_full(
     *,
     start: date,
     end: date,
+    source_snapshot: pl.DataFrame | None = None,
 ) -> None:
     """原子发布全量 regime 历史及其来源版本水位。"""
+    if source_snapshot is not None:
+        assert_regime_source_unchanged(
+            source_snapshot,
+            repo,
+            start=start,
+            end=end,
+        )
     entries = build_regime_history_full_snapshot(
         data_dir,
         new_rows,
         repo,
         start=start,
         end=end,
+        source_snapshot=source_snapshot,
     )
     replace_parquet_set(
         entries,
@@ -777,7 +845,7 @@ def get_regime_coverage(data_dir: Path) -> dict:
 
 
 def detect_stale_dates(data_dir: Path, repo) -> list[date]:
-    """检测每个已处理日期的 enriched 来源版本是否发生变化。"""
+    """检测每个已处理日期的个股或指数 enriched 来源版本是否发生变化。"""
     existing = load_regime_history(data_dir)
     existing_dates = (
         set(existing["date"].to_list())
@@ -789,7 +857,11 @@ def detect_stale_dates(data_dir: Path, repo) -> list[date]:
         return []
     coverage = _load_regime_coverage(data_dir)
     recorded = {
-        row["date"]: row["source_mtime_ns"]
+        row["date"]: (
+            row["source_mtime_ns"],
+            row["index_source_mtime_ns"],
+            row["index_source_size"],
+        )
         for row in coverage.iter_rows(named=True)
     }
     return sorted(
@@ -797,7 +869,15 @@ def detect_stale_dates(data_dir: Path, repo) -> list[date]:
         for target_date in completed_dates
         if (
             (current := _enriched_partition_mtime_ns(repo, target_date)) is not None
-            and recorded.get(target_date) != current
+            and (
+                target_date not in recorded
+                or recorded[target_date][0] != current
+            )
+        )
+        or (
+            target_date in recorded
+            and recorded[target_date][1:]
+            != _index_partition_version(repo, target_date)
         )
     )
 

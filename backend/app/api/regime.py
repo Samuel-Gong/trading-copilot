@@ -192,14 +192,23 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
                 "mainline_rows": 0,
             }
         start = earliest
-    mainline_source_snapshot: pl.DataFrame | None = None
+    regime_source_snapshot: pl.DataFrame | None = None
+    mainline_source_snapshot: market_mainline.MainlineSourceSnapshot | None = None
     if full_recompute:
+        regime_source_snapshot = regime_builder.capture_regime_source_snapshot(
+            repo,
+            start=start,
+            end=end,
+        )
         mainline_source_snapshot = market_mainline.capture_mainline_source_snapshot(
             data_dir,
             repo,
             start=start,
             end=end,
         )
+        mainline_filter_config = mainline_source_snapshot.filter_config
+    else:
+        mainline_filter_config = market_mainline.load_mainline_filter_config()
     new_rows = regime_builder.run_regime_batch(repo, start=start, end=end)
     if full_recompute:
         regime_rows, phase_days = regime_builder.label_phase_history(new_rows)
@@ -226,8 +235,10 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             start,
             end,
             kind=kind,
+            filter_cfg=mainline_filter_config,
         )
     if full_recompute:
+        assert regime_source_snapshot is not None
         assert mainline_source_snapshot is not None
         regime_entries = regime_builder.build_regime_history_full_snapshot(
             data_dir,
@@ -235,6 +246,7 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             repo,
             start=start,
             end=end,
+            source_snapshot=regime_source_snapshot,
         )
         mainline_entries, mainline_rows = (
             market_mainline.build_mainline_history_full_snapshot(
@@ -249,6 +261,12 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         market_mainline.assert_mainline_source_unchanged(
             mainline_source_snapshot,
             data_dir,
+            repo,
+            start=start,
+            end=end,
+        )
+        regime_builder.assert_regime_source_unchanged(
+            regime_source_snapshot,
             repo,
             start=start,
             end=end,
@@ -408,7 +426,12 @@ def mainline_recompute(request: Request):
     results = {}
     for kind in ("concept", "industry"):
         results[kind] = market_mainline.compute_mainline_range(
-            repo, data_dir, earliest, business_today, kind=kind
+            repo,
+            data_dir,
+            earliest,
+            business_today,
+            kind=kind,
+            filter_cfg=source_snapshot.filter_config,
         )
     rows = market_mainline.replace_mainline_history_full(
         data_dir,

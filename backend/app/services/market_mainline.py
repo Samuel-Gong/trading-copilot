@@ -19,6 +19,7 @@ import json
 import logging
 import time
 from bisect import bisect_right
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -56,11 +57,21 @@ _MAINLINE_COVERAGE_SCHEMA = {
     "kind": pl.Utf8,
     "source_mtime_ns": pl.Int64,
     "membership_version": pl.Utf8,
+    "filter_version": pl.Utf8,
 }
 
 
 class MainlineSourceChangedError(RuntimeError):
-    """全量主线计算期间行情或 point-in-time 成员来源发生变化。"""
+    """全量主线计算期间行情、point-in-time 成员或过滤配置发生变化。"""
+
+
+@dataclass(frozen=True)
+class MainlineSourceSnapshot:
+    """主线全量计算固定使用的来源水位与筛选配置。"""
+
+    coverage: pl.DataFrame
+    filter_config: dict
+    filter_version: str
 
 
 # 主线分权重: 概念内涨停家数 / 最高连板 / 梯队档位数 / 二板以上家数
@@ -91,6 +102,34 @@ def _resolve_filter_config(filter_cfg: dict | None) -> dict:
         }
     except Exception:
         return {"min_members": 4, "max_members": 600, "blacklist": set()}
+
+
+def load_mainline_filter_config() -> dict:
+    """一次性读取并规范化本轮主线计算使用的过滤配置。"""
+    try:
+        from app.services import preferences
+
+        raw = preferences.get_mainline_filter_config()
+        resolved = _resolve_filter_config(raw)
+        exclude_st = bool(raw.get("exclude_st", True))
+    except Exception:
+        resolved = {"min_members": 4, "max_members": 600, "blacklist": set()}
+        exclude_st = True
+    return {
+        "min_members": resolved["min_members"],
+        "max_members": resolved["max_members"],
+        "blacklist": sorted(resolved["blacklist"]),
+        "exclude_st": exclude_st,
+    }
+
+
+def _mainline_filter_version(filter_config: dict) -> str:
+    return json.dumps(
+        filter_config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def mainline_path(data_dir: Path) -> Path:
@@ -228,11 +267,14 @@ def _stale_mainline_dates(
     repo,
     kind: str,
     completed_dates: set[date],
+    *,
+    current_filter_version: str | None = None,
 ) -> set[date]:
-    """返回行情或成分快照版本与完成水位不一致的已处理日期。"""
+    """返回行情、成分快照或过滤配置与完成水位不一致的已处理日期。"""
     path = mainline_coverage_path(data_dir)
     versions: dict[date, int | None] = {}
     membership_versions: dict[date, str | None] = {}
+    filter_versions: dict[date, str | None] = {}
     if path.exists():
         try:
             frame = pl.read_parquet(path)
@@ -250,6 +292,13 @@ def _stale_mainline_dates(
                     .select(["date", "membership_version"])
                     .iter_rows(named=True)
                 }
+            if {"date", "kind", "filter_version"}.issubset(frame.columns):
+                filter_versions = {
+                    row["date"]: row["filter_version"]
+                    for row in frame.filter(pl.col("kind") == kind)
+                    .select(["date", "filter_version"])
+                    .iter_rows(named=True)
+                }
         except Exception as exc:  # noqa: BLE001
             logger.warning("load mainline coverage versions failed: %s", exc)
 
@@ -265,6 +314,10 @@ def _stale_mainline_dates(
         kind,
         completed_dates,
     )
+    if current_filter_version is None:
+        current_filter_version = _mainline_filter_version(
+            load_mainline_filter_config(),
+        )
     stale: set[date] = set()
     for target_date in completed_dates:
         source_mtime_ns = _enriched_partition_mtime_ns(repo, target_date)
@@ -294,6 +347,8 @@ def _stale_mainline_dates(
             and membership_mtime_ns > legacy_mtime_ns
         ):
             stale.add(target_date)
+        if filter_versions.get(target_date) != current_filter_version:
+            stale.add(target_date)
     return stale
 
 
@@ -302,18 +357,30 @@ def _mark_mainline_dates_processed(
     repo,
     kind: str,
     dates: set[date],
+    *,
+    filter_version: str,
 ) -> None:
     if not dates:
         return
     path = mainline_coverage_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    incoming = _mainline_coverage_frame(data_dir, repo, dates, (kind,))
+    incoming = _mainline_coverage_frame(
+        data_dir,
+        repo,
+        dates,
+        (kind,),
+        filter_version=filter_version,
+    )
     old = pl.read_parquet(path) if path.exists() else pl.DataFrame()
     if not old.is_empty() and "source_mtime_ns" not in old.columns:
         old = old.with_columns(pl.lit(None).cast(pl.Int64).alias("source_mtime_ns"))
     if not old.is_empty() and "membership_version" not in old.columns:
         old = old.with_columns(
             pl.lit(None).cast(pl.Utf8).alias("membership_version"),
+        )
+    if not old.is_empty() and "filter_version" not in old.columns:
+        old = old.with_columns(
+            pl.lit(None).cast(pl.Utf8).alias("filter_version"),
         )
     combined = incoming if old.is_empty() else pl.concat(
         [old.select(incoming.columns), incoming],
@@ -332,6 +399,8 @@ def _mainline_coverage_frame(
     repo,
     dates: set[date],
     kinds: tuple[str, ...],
+    *,
+    filter_version: str,
 ) -> pl.DataFrame:
     """构建指定交易日及维度的完整来源/成员版本水位。"""
     if not dates or not kinds:
@@ -351,6 +420,10 @@ def _mainline_coverage_frame(
                 [membership_versions[item][0] for item in ordered_dates],
                 dtype=pl.Utf8,
             ),
+            "filter_version": pl.Series(
+                [filter_version] * len(ordered_dates),
+                dtype=pl.Utf8,
+            ),
         }))
     return pl.concat(frames).sort(["date", "kind"])
 
@@ -362,20 +435,32 @@ def capture_mainline_source_snapshot(
     start: date,
     end: date,
     kinds: tuple[str, ...] = ("concept", "industry"),
-) -> pl.DataFrame:
-    """捕获全量主线结果对应的交易日、行情与成员版本快照。"""
+) -> MainlineSourceSnapshot:
+    """捕获全量主线结果对应的行情、成员版本与过滤配置快照。"""
     from app.services.regime_builder import enriched_date_set
 
+    filter_config = load_mainline_filter_config()
+    filter_version = _mainline_filter_version(filter_config)
     covered_dates = {
         target_date
         for target_date in enriched_date_set(repo)
         if start <= target_date <= end
     }
-    return _mainline_coverage_frame(data_dir, repo, covered_dates, kinds)
+    return MainlineSourceSnapshot(
+        coverage=_mainline_coverage_frame(
+            data_dir,
+            repo,
+            covered_dates,
+            kinds,
+            filter_version=filter_version,
+        ),
+        filter_config=filter_config,
+        filter_version=filter_version,
+    )
 
 
 def assert_mainline_source_unchanged(
-    expected: pl.DataFrame,
+    expected: MainlineSourceSnapshot,
     data_dir: Path,
     repo,
     *,
@@ -389,7 +474,10 @@ def assert_mainline_source_unchanged(
         start=start,
         end=end,
     )
-    if expected.to_dicts() != current.to_dicts():
+    if (
+        expected.coverage.to_dicts() != current.coverage.to_dicts()
+        or expected.filter_version != current.filter_version
+    ):
         raise MainlineSourceChangedError("主线计算期间来源已更新，请重试全量重算")
 
 
@@ -710,7 +798,7 @@ def build_mainline_history_full_snapshot(
     *,
     start: date,
     end: date,
-    source_snapshot: pl.DataFrame | None = None,
+    source_snapshot: MainlineSourceSnapshot | None = None,
 ) -> tuple[list[tuple[Path, pl.DataFrame]], int]:
     """构建合并概念/行业结果与逐日完整完成水位的全量文件集合。"""
     frames = [frame for frame in rows_by_kind.values() if not frame.is_empty()]
@@ -720,9 +808,9 @@ def build_mainline_history_full_snapshot(
         )
     else:
         combined = pl.DataFrame()
-    coverage = source_snapshot
-    if coverage is None:
-        coverage = capture_mainline_source_snapshot(
+    snapshot = source_snapshot
+    if snapshot is None:
+        snapshot = capture_mainline_source_snapshot(
             data_dir,
             repo,
             start=start,
@@ -731,7 +819,7 @@ def build_mainline_history_full_snapshot(
         )
     entries = [
         (mainline_path(data_dir), combined),
-        (mainline_coverage_path(data_dir), coverage),
+        (mainline_coverage_path(data_dir), snapshot.coverage),
     ]
     return entries, sum(frame.height for frame in rows_by_kind.values())
 
@@ -744,7 +832,7 @@ def replace_mainline_history_full(
     *,
     start: date,
     end: date,
-    source_snapshot: pl.DataFrame | None = None,
+    source_snapshot: MainlineSourceSnapshot | None = None,
 ) -> int:
     """原子发布合并后的概念/行业全量结果及逐日完成水位。"""
     if source_snapshot is not None:
@@ -836,9 +924,17 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
     existing_dates = set(existing["date"].to_list()) if not existing.is_empty() else set()
     processed_dates = _processed_mainline_dates(data_dir, kind)
     completed_dates = existing_dates | processed_dates
+    filter_config = load_mainline_filter_config()
+    filter_version = _mainline_filter_version(filter_config)
     missing = sorted(d for d in enriched_dates if d not in completed_dates and d <= today)
     stale = sorted(
-        d for d in _stale_mainline_dates(data_dir, repo, kind, completed_dates)
+        d for d in _stale_mainline_dates(
+            data_dir,
+            repo,
+            kind,
+            completed_dates,
+            current_filter_version=filter_version,
+        )
         if d in enriched_dates and d <= today
     )
     removed = sorted(
@@ -861,6 +957,7 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         to_compute[0],
         to_compute[-1],
         kind=kind,
+        filter_cfg=filter_config,
     )
     replace_mainline_history_range(
         data_dir,
@@ -875,5 +972,6 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         repo,
         kind,
         set(to_compute) & enriched_dates,
+        filter_version=filter_version,
     )
     return new_rows

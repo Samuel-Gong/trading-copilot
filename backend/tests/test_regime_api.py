@@ -23,6 +23,20 @@ def _request(tmp_path):
     )
 
 
+def _mainline_snapshot(version: str, *, min_members: int = 4):
+    config = {
+        "min_members": min_members,
+        "max_members": 600,
+        "blacklist": [],
+        "exclude_st": True,
+    }
+    return market_mainline.MainlineSourceSnapshot(
+        coverage=pl.DataFrame({"version": ["coverage"]}),
+        filter_config=config,
+        filter_version=version,
+    )
+
+
 def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     tmp_path,
     monkeypatch,
@@ -52,7 +66,7 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     monkeypatch.setattr(
         regime.regime_builder,
         "build_regime_history_full_snapshot",
-        lambda data_dir, rows, repo, *, start, end: (
+        lambda data_dir, rows, repo, *, start, end, source_snapshot=None: (
             regime_ranges.append((start, end, rows.is_empty())) or []
         ),
         raising=False,
@@ -61,7 +75,7 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     monkeypatch.setattr(
         market_mainline,
         "compute_mainline_range",
-        lambda repo, data_dir, start, end, *, kind: (
+        lambda repo, data_dir, start, end, *, kind, filter_cfg: (
             mainline_ranges.append((kind, start, end)) or pl.DataFrame()
         ),
     )
@@ -154,7 +168,7 @@ def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monke
     monkeypatch.setattr(
         market_mainline,
         "compute_mainline_range",
-        lambda _repo, _data_dir, start, end, *, kind: pl.DataFrame({
+        lambda _repo, _data_dir, start, end, *, kind, filter_cfg: pl.DataFrame({
             "date": [new_earliest],
             "kind": [kind],
             "rank": [1],
@@ -194,10 +208,10 @@ def test_mainline_full_recompute_rejects_source_change_before_publish(
         "kind": ["concept"],
         "rank": [1],
     }).write_parquet(path)
-    snapshots = iter([
-        pl.DataFrame({"version": ["before"]}),
-        pl.DataFrame({"version": ["after"]}),
-    ])
+    before = _mainline_snapshot("before", min_members=4)
+    after = _mainline_snapshot("after", min_members=5)
+    snapshots = iter([before, after])
+    used_configs: list[dict] = []
     monkeypatch.setattr(regime, "cn_today", lambda: target)
     monkeypatch.setattr(
         regime.regime_builder,
@@ -212,7 +226,9 @@ def test_mainline_full_recompute_rejects_source_change_before_publish(
     monkeypatch.setattr(
         market_mainline,
         "compute_mainline_range",
-        lambda *args, **kwargs: pl.DataFrame(),
+        lambda *args, **kwargs: (
+            used_configs.append(kwargs["filter_cfg"]) or pl.DataFrame()
+        ),
     )
 
     with pytest.raises(
@@ -223,6 +239,7 @@ def test_mainline_full_recompute_rejects_source_change_before_publish(
 
     stored = pl.read_parquet(path)
     assert stored["rank"].to_list() == [1]
+    assert used_configs == [before.filter_config, before.filter_config]
 
 
 def test_regime_full_recompute_rejects_source_change_before_publish(
@@ -232,8 +249,8 @@ def test_regime_full_recompute_rejects_source_change_before_publish(
     """组合全量重算也必须在四文件发布前复验来源版本。"""
     target = date(2026, 8, 25)
     snapshots = iter([
-        pl.DataFrame({"version": ["before"]}),
-        pl.DataFrame({"version": ["after"]}),
+        _mainline_snapshot("before"),
+        _mainline_snapshot("after"),
     ])
     published: list[object] = []
     monkeypatch.setattr(
@@ -263,6 +280,51 @@ def test_regime_full_recompute_rejects_source_change_before_publish(
     )
 
     with pytest.raises(market_mainline.MainlineSourceChangedError):
+        regime.regime_recompute(_request(tmp_path), end=target)
+
+    assert published == []
+
+
+def test_regime_full_recompute_rejects_index_source_change_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """指数 enriched 在计算期间变化时，不得发布旧 regime 与新水位。"""
+    target = date(2026, 8, 25)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    index = tmp_path / "kline_index_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    index.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    index.write_bytes(b"index-v1")
+    published: list[object] = []
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "earliest_enriched_date",
+        lambda repo: target,
+    )
+
+    def change_index_during_compute(*args, **kwargs):
+        index.write_bytes(b"index-version-two")
+        return pl.DataFrame()
+
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        change_index_during_compute,
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        regime,
+        "replace_parquet_set",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(regime.regime_builder.RegimeSourceChangedError):
         regime.regime_recompute(_request(tmp_path), end=target)
 
     assert published == []

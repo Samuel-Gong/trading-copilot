@@ -392,6 +392,38 @@ def test_date_source_version_survives_unrelated_partial_recompute(tmp_path):
     assert regime_builder.detect_stale_dates(tmp_path, repo) == [d1]
 
 
+def test_index_source_version_marks_regime_date_stale(tmp_path):
+    """指数 enriched 覆写后，即使个股 enriched 未变也必须重算 regime。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    index = tmp_path / "kline_index_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    index.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    index.write_bytes(b"index-v1")
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    repo = _FakeRepo()
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [target],
+        "state": ["range"],
+        "score": [50],
+    }))
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        repo,
+        start=target,
+        end=target,
+    )
+
+    index.write_bytes(b"index-version-two")
+
+    assert regime_builder.detect_stale_dates(tmp_path, repo) == [target]
+
+
 def test_compute_incremental_missing_dates(tmp_path):
     """enriched 有但 regime 没有 → 补算缺口。"""
     # regime 只有 1/1
