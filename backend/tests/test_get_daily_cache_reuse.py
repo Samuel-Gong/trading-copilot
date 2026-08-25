@@ -11,7 +11,11 @@ from datetime import date, timedelta
 import polars as pl
 from polars.testing import assert_frame_equal
 
-from app.enriched_generation import bump_enriched_generation, get_enriched_generation
+from app.enriched_generation import (
+    EnrichedPublication,
+    bump_enriched_generation,
+    get_enriched_generation,
+)
 from app.tickflow.repository import KlineRepository
 
 SYM = "600001.SH"
@@ -132,3 +136,20 @@ def test_get_daily_falls_back_after_enriched_generation_changes(tmp_path):
     expected_close = raw.filter(pl.col("date") == dates[-2])["close"].item()
     actual_close = result.filter(pl.col("date") == dates[-2])["close"].item()
     assert actual_close == expected_close
+
+
+def test_get_daily_fails_closed_while_enriched_is_being_published(tmp_path):
+    """publication 中间态不得扫描正在逐分区替换的 enriched 文件集。"""
+    raw = _raw_frame()
+    dates = raw["date"].to_list()
+    repo, calls = _bare_repo(raw)
+    repo.store = type("Store", (), {"data_dir": tmp_path})()
+    publication = EnrichedPublication(tmp_path, recover=True)
+    publication.begin()
+    try:
+        result = repo.get_daily(SYM, dates[-2], dates[-1])
+    finally:
+        publication.abandon()
+
+    assert result.is_empty()
+    assert calls["scan"] == 0

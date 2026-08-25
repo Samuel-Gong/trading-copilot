@@ -31,6 +31,7 @@ from app.enriched_generation import (
     EnrichedPublication,
     bump_enriched_generation,
     get_enriched_generation,
+    stable_enriched_generation,
 )
 from app.market_time import cn_today
 from app.parquet import scan_enriched_parquet
@@ -1389,6 +1390,23 @@ class KlineRepository:
     # ================================================================
 
     def get_daily(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame:
+        """在同一个 ready generation 内读取单股日 K。"""
+        data_dir = getattr(getattr(self, "store", None), "data_dir", None)
+        if data_dir is None:
+            return self._get_daily_stable(symbol, start, end, columns)
+        try:
+            with stable_enriched_generation(data_dir, "stock"):
+                return self._get_daily_stable(symbol, start, end, columns)
+        except EnrichedGenerationUnavailableError:
+            return pl.DataFrame()
+
+    def _get_daily_stable(
         self,
         symbol: str,
         start: date,

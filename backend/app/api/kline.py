@@ -20,6 +20,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/kline", tags=["kline"])
 
 
+def _run_enriched_job_with_repository_refresh(
+    repo,
+    operation,
+    quote_service=None,
+):
+    """暂停实时写入执行 enriched 任务，并在成功后重建 Repository 快照。"""
+    def run():
+        result = operation()
+        if not isinstance(result, dict) or "error" not in result:
+            repo.refresh_cache()
+        return result
+
+    if quote_service is None:
+        return run()
+    with quote_service.paused():
+        return run()
+
+
 def _minute_allowed(capset) -> bool:
     """是否有分钟K权限 (TickFlow Pro+ 或 custom minute 源)。"""
     from app.tickflow.capabilities import Cap
@@ -1133,6 +1151,7 @@ async def extend_history(request: Request):
         from app.services.extend_history import run_extend_history
         from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
+        qs = getattr(request.app.state, "quote_service", None)
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1153,7 +1172,17 @@ async def extend_history(request: Request):
                 job_store.start(job_id)
                 result = await loop.run_in_executor(
                     _long_task_executor,
-                    lambda: run_extend_history(repo, capset, value, unit, on_progress=progress),
+                    lambda: _run_enriched_job_with_repository_refresh(
+                        repo,
+                        lambda: run_extend_history(
+                            repo,
+                            capset,
+                            value,
+                            unit,
+                            on_progress=progress,
+                        ),
+                        qs,
+                    ),
                 )
                 if "error" in result:
                     job_store.fail(job_id, result["error"])
@@ -1230,11 +1259,16 @@ async def repair_daily(request: Request):
                                    stage_pct=stage_pct, skip_log=skip_log)
 
             def _run() -> dict:
-                # 修正运行期间暂停实时行情, 防止覆写同一批 parquet 竞态
-                if qs:
-                    with qs.paused():
-                        return run_repair_daily(repo, capset, start_date, on_progress=progress)
-                return run_repair_daily(repo, capset, start_date, on_progress=progress)
+                return _run_enriched_job_with_repository_refresh(
+                    repo,
+                    lambda: run_repair_daily(
+                        repo,
+                        capset,
+                        start_date,
+                        on_progress=progress,
+                    ),
+                    qs,
+                )
 
             try:
                 job_store.start(job_id)
@@ -1272,6 +1306,7 @@ async def rebuild_enriched(request: Request):
 
         from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
+        qs = getattr(request.app.state, "quote_service", None)
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1301,7 +1336,11 @@ async def rebuild_enriched(request: Request):
 
                 written = await loop.run_in_executor(
                     _long_task_executor,
-                    lambda: run_pipeline(on_batch_done=_batch_progress),
+                    lambda: _run_enriched_job_with_repository_refresh(
+                        repo,
+                        lambda: run_pipeline(on_batch_done=_batch_progress),
+                        qs,
+                    ),
                 )
 
                 enriched_dir = repo.store.data_dir / "kline_daily_enriched"
