@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
-from app.api.kline import _run_enriched_job_with_repository_refresh
+from app.jobs import daily_pipeline
 from app.jobs.daily_pipeline import PipelineStageError
+from app.services.enriched_job import run_enriched_job_with_repository_refresh
 
 
 class _Repo:
@@ -40,7 +42,7 @@ def test_enriched_job_refreshes_repository_before_realtime_resumes() -> None:
     repo = _Repo(events)
     quotes = _QuoteService(events)
 
-    result = _run_enriched_job_with_repository_refresh(
+    result = run_enriched_job_with_repository_refresh(
         repo,
         lambda: events.append("publish") or {"rows": 1},
         quotes,
@@ -54,7 +56,7 @@ def test_failed_enriched_job_without_publication_does_not_replace_snapshot() -> 
     events: list[str] = []
     repo = _Repo(events)
 
-    result = _run_enriched_job_with_repository_refresh(
+    result = run_enriched_job_with_repository_refresh(
         repo,
         lambda: events.append("failed") or {"error": "injected"},
     )
@@ -72,7 +74,7 @@ def test_error_result_refreshes_snapshot_after_partial_publication() -> None:
         repo.generation = "after"
         return {"error": "later stage failed"}
 
-    result = _run_enriched_job_with_repository_refresh(repo, operation)
+    result = run_enriched_job_with_repository_refresh(repo, operation)
 
     assert result == {"error": "later stage failed"}
     assert events == ["publish", "refresh"]
@@ -89,6 +91,36 @@ def test_pipeline_stage_error_refreshes_partial_publication_before_resume() -> N
         raise PipelineStageError(["compute_regime: injected"])
 
     with pytest.raises(PipelineStageError, match="compute_regime: injected"):
-        _run_enriched_job_with_repository_refresh(repo, operation, quotes)
+        run_enriched_job_with_repository_refresh(repo, operation, quotes)
+
+    assert events == ["pause", "publish", "refresh", "resume"]
+
+
+def test_scheduled_pipeline_refreshes_before_realtime_resumes(monkeypatch) -> None:
+    events: list[str] = []
+    repo = _Repo(events)
+    quotes = _QuoteService(events)
+    live_capset = object()
+    monkeypatch.setattr(
+        daily_pipeline,
+        "_get_app_state",
+        lambda: SimpleNamespace(
+            capabilities=live_capset,
+            quote_service=quotes,
+        ),
+    )
+
+    def run_now(repo_arg, capset_arg, on_progress=None) -> dict:
+        assert repo_arg is repo
+        assert capset_arg is live_capset
+        assert on_progress is None
+        events.append("publish")
+        repo.generation = "after"
+        raise PipelineStageError(["compute_mainline: injected"])
+
+    monkeypatch.setattr(daily_pipeline, "run_now", run_now)
+
+    with pytest.raises(PipelineStageError, match="compute_mainline: injected"):
+        daily_pipeline._run_scheduled_pipeline_with_refresh(repo, object())
 
     assert events == ["pause", "publish", "refresh", "resume"]

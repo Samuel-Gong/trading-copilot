@@ -24,6 +24,7 @@ from app.indicators.pipeline import run_pipeline
 from app.config import settings
 from app.market_time import cn_today
 from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
+from app.services.enriched_job import run_enriched_job_with_repository_refresh
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
 from app.tickflow.repository import KlineRepository
@@ -111,7 +112,7 @@ def run_now(
     repo: KlineRepository,
     capset: CapabilitySet,
     on_progress: ProgressCb | None = None,
-    override_start_date: _date | None = None,
+    override_start_date: date | None = None,
 ) -> dict:
     """立即执行一次盘后管道,支持进度回调。
 
@@ -951,6 +952,22 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
     )
 
 
+def _run_scheduled_pipeline_with_refresh(
+    repo: KlineRepository,
+    fallback_capset: CapabilitySet,
+    on_progress: ProgressCb | None = None,
+) -> dict:
+    """在暂停实时行情的同一边界内运行定时管道并恢复 Repository。"""
+    app_state = _get_app_state()
+    capset_live = getattr(app_state, "capabilities", None) or fallback_capset
+    quote_service = getattr(app_state, "quote_service", None)
+    return run_enriched_job_with_repository_refresh(
+        repo,
+        lambda: run_now(repo, capset_live, on_progress=on_progress),
+        quote_service,
+    )
+
+
 def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOScheduler:
     """启动调度器。
 
@@ -988,22 +1005,7 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         # 整体少算一档 (仅手动触发或重启才会刷缓存, cron 调度路径此前漏了这步)。
         # 用 app.state 上的**实时** capset(周期重探会热更新它), 而非启动时捕获的
         # 旧 capset —— 否则 Key 中途过期/续费后, 调度管道仍按旧档位打端点。
-        app_state = _get_app_state()
-        capset_live = getattr(app_state, "capabilities", None) or capset
-        # 管道运行期间暂停实时行情取数, 防止覆写同一批 parquet 竞态
-        qs = getattr(app_state, "quote_service", None)
-        try:
-            if qs:
-                with qs.paused():
-                    result = run_now(repo, capset_live, on_progress=on_progress)
-            else:
-                result = run_now(repo, capset_live, on_progress=on_progress)
-        finally:
-            # 即便有阶段软失败(run_now 末尾抛 PipelineStageError), 已落盘的日K/enriched
-            # 仍需刷进内存缓存, 否则 live_agg 基准列停留在旧交易日。放 finally 保证部分
-            # 成功也生效; 随后异常继续上抛, 由 _run_tracked 标记任务 failed。
-            repo.refresh_cache()
-        return result
+        return _run_scheduled_pipeline_with_refresh(repo, capset, on_progress)
 
     scheduler.add_job(
         lambda: _scheduled_pipeline_task(_pipeline_then_refresh),

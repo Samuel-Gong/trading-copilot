@@ -14,52 +14,11 @@ from app.market_time import cn_now, cn_today
 from app.price_limits import is_risk_warning_name, price_limit_pct
 from app.db_safe import is_valid_ext_ident
 from app.services import kline_sync
+from app.services.enriched_job import run_enriched_job_with_repository_refresh
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/kline", tags=["kline"])
-
-
-def _run_enriched_job_with_repository_refresh(
-    repo,
-    operation,
-    quote_service=None,
-):
-    """暂停实时写入执行 enriched 任务，并恢复已发布 generation 的快照。"""
-    def generation() -> str | None:
-        try:
-            return repo.get_matrix_data_generation("stock")
-        except Exception:  # noqa: BLE001
-            logger.warning("read enriched generation failed", exc_info=True)
-            return None
-
-    def refresh_after_partial_publication(before: str | None) -> None:
-        after = generation()
-        if after is not None and after != before:
-            repo.refresh_cache()
-
-    def run():
-        before = generation()
-        try:
-            result = operation()
-        except Exception:  # noqa: BLE001
-            try:
-                refresh_after_partial_publication(before)
-            except Exception:  # noqa: BLE001
-                # 保留原任务异常；刷新失败会记录，任务仍由上层标记为 failed。
-                logger.exception("refresh repository after partial publication failed")
-            raise
-
-        after = generation()
-        succeeded = not isinstance(result, dict) or "error" not in result
-        if succeeded or (after is not None and after != before):
-            repo.refresh_cache()
-        return result
-
-    if quote_service is None:
-        return run()
-    with quote_service.paused():
-        return run()
 
 
 def _minute_allowed(capset) -> bool:
@@ -1196,7 +1155,7 @@ async def extend_history(request: Request):
                 job_store.start(job_id)
                 result = await loop.run_in_executor(
                     _long_task_executor,
-                    lambda: _run_enriched_job_with_repository_refresh(
+                    lambda: run_enriched_job_with_repository_refresh(
                         repo,
                         lambda: run_extend_history(
                             repo,
@@ -1283,7 +1242,7 @@ async def repair_daily(request: Request):
                                    stage_pct=stage_pct, skip_log=skip_log)
 
             def _run() -> dict:
-                return _run_enriched_job_with_repository_refresh(
+                return run_enriched_job_with_repository_refresh(
                     repo,
                     lambda: run_repair_daily(
                         repo,
@@ -1360,7 +1319,7 @@ async def rebuild_enriched(request: Request):
 
                 written = await loop.run_in_executor(
                     _long_task_executor,
-                    lambda: _run_enriched_job_with_repository_refresh(
+                    lambda: run_enriched_job_with_repository_refresh(
                         repo,
                         lambda: run_pipeline(on_batch_done=_batch_progress),
                         qs,
