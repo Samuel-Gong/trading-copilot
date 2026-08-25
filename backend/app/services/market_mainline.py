@@ -930,6 +930,104 @@ def replace_mainline_history_range(
     write_parquet_atomic(combined.sort(["date", "kind", "rank"]), p)
 
 
+def build_mainline_history_range_snapshot(
+    data_dir: Path,
+    rows_by_kind: dict[str, pl.DataFrame],
+    *,
+    start: date,
+    end: date,
+    source_snapshot: MainlineSourceSnapshot,
+) -> tuple[list[tuple[Path, pl.DataFrame]], int]:
+    """构建区间重算后的合并主线历史与来源水位，不提前写盘。"""
+    kinds = tuple(rows_by_kind)
+    old = (
+        pl.read_parquet(mainline_path(data_dir))
+        if mainline_path(data_dir).exists()
+        else pl.DataFrame()
+    )
+    frames = [
+        frame.filter(
+            (pl.col("date") >= start)
+            & (pl.col("date") <= end)
+            & (pl.col("kind") == kind),
+        )
+        for kind, frame in rows_by_kind.items()
+        if not frame.is_empty()
+    ]
+    incoming = (
+        pl.concat(frames, how="vertical_relaxed")
+        if frames
+        else pl.DataFrame()
+    )
+    if old.is_empty():
+        combined = incoming
+    else:
+        kept = old.filter(
+            ~(
+                (pl.col("date") >= start)
+                & (pl.col("date") <= end)
+                & pl.col("kind").is_in(kinds)
+            ),
+        )
+        if incoming.is_empty():
+            combined = kept
+        else:
+            target_cols = incoming.columns
+            kept = kept.select([
+                pl.col(column)
+                if column in kept.columns
+                else pl.lit(None).alias(column)
+                for column in target_cols
+            ])
+            combined = pl.concat(
+                [kept, incoming.select(target_cols)],
+                how="vertical_relaxed",
+            )
+    if not combined.is_empty():
+        combined = combined.sort(["date", "kind", "rank"])
+
+    coverage_path = mainline_coverage_path(data_dir)
+    old_coverage = (
+        pl.read_parquet(coverage_path)
+        if coverage_path.exists()
+        else pl.DataFrame()
+    )
+    incoming_coverage = source_snapshot.coverage.filter(
+        (pl.col("date") >= start)
+        & (pl.col("date") <= end)
+        & pl.col("kind").is_in(kinds),
+    )
+    if old_coverage.is_empty():
+        combined_coverage = incoming_coverage
+    else:
+        for column, dtype in _MAINLINE_COVERAGE_SCHEMA.items():
+            if column not in old_coverage.columns:
+                old_coverage = old_coverage.with_columns(
+                    pl.lit(None).cast(dtype).alias(column),
+                )
+        kept_coverage = old_coverage.select(incoming_coverage.columns).filter(
+            ~(
+                (pl.col("date") >= start)
+                & (pl.col("date") <= end)
+                & pl.col("kind").is_in(kinds)
+            ),
+        )
+        combined_coverage = pl.concat(
+            [kept_coverage, incoming_coverage],
+            how="vertical_relaxed",
+        )
+    if not combined_coverage.is_empty():
+        combined_coverage = combined_coverage.unique(
+            subset=["date", "kind"],
+            keep="last",
+        ).sort(["date", "kind"])
+
+    return [
+        (mainline_path(data_dir), combined),
+        (coverage_path, combined_coverage),
+    ], sum(frame.height for frame in rows_by_kind.values())
+
+
 @serialized_market_environment_update
 def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = None,
                                  kind: str = "concept") -> pl.DataFrame:

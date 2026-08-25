@@ -661,7 +661,11 @@ def load_regime_history(data_dir: Path) -> pl.DataFrame:
             return pl.DataFrame()
 
 
-def label_phase_history(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
+def label_phase_history(
+    df: pl.DataFrame,
+    *,
+    strict: bool = False,
+) -> tuple[pl.DataFrame, int]:
     """在内存中对全量 regime 时序重标情绪周期阶段。"""
     from app.services.market_phase import classify_phase_series
 
@@ -678,6 +682,8 @@ def label_phase_history(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
     try:
         labeled = classify_phase_series(df)
     except Exception as e:
+        if strict:
+            raise
         logger.warning("refresh_phase_labels failed: %s", e)
         return df, 0
     return labeled, labeled.height
@@ -839,6 +845,85 @@ def replace_regime_history_range(
     )
 
 
+def build_regime_history_range_snapshot(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+    source_snapshot: pl.DataFrame | None = None,
+) -> tuple[list[tuple[Path, pl.DataFrame]], int]:
+    """构建区间重算后的最终阶段历史与完成水位，不提前写盘。"""
+    old = load_regime_history(data_dir)
+    incoming = new_rows
+    if not incoming.is_empty():
+        incoming = incoming.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end),
+        )
+
+    if old.is_empty():
+        combined = incoming
+    else:
+        kept = old.filter(~((pl.col("date") >= start) & (pl.col("date") <= end)))
+        if incoming.is_empty():
+            combined = kept
+        else:
+            target_cols = incoming.columns
+            kept = kept.select([
+                pl.col(column)
+                if column in kept.columns
+                else pl.lit(None).alias(column)
+                for column in target_cols
+            ])
+            combined = pl.concat(
+                [kept, incoming.select(target_cols)],
+                how="vertical_relaxed",
+            )
+    if not combined.is_empty():
+        combined = combined.sort("date").unique(subset=["date"], keep="last")
+    labeled, phase_days = label_phase_history(combined, strict=True)
+
+    old_coverage = _load_regime_coverage(data_dir)
+    kept_coverage = (
+        old_coverage.filter(
+            (pl.col("date") < start) | (pl.col("date") > end),
+        )
+        if not old_coverage.is_empty()
+        else pl.DataFrame()
+    )
+    incoming_coverage = source_snapshot
+    if incoming_coverage is None:
+        incoming_coverage = capture_regime_source_snapshot(
+            repo,
+            start=start,
+            end=end,
+        )
+    elif not incoming_coverage.is_empty():
+        incoming_coverage = incoming_coverage.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end),
+        )
+    if kept_coverage.is_empty():
+        combined_coverage = incoming_coverage
+    elif incoming_coverage.is_empty():
+        combined_coverage = kept_coverage
+    else:
+        combined_coverage = pl.concat([
+            kept_coverage.select(incoming_coverage.columns),
+            incoming_coverage,
+        ])
+    if not combined_coverage.is_empty():
+        combined_coverage = combined_coverage.unique(
+            subset=["date"],
+            keep="last",
+        ).sort("date")
+
+    return [
+        (regime_path(data_dir), labeled),
+        (regime_coverage_path(data_dir), combined_coverage),
+    ], phase_days
+
+
 def get_regime_coverage(data_dir: Path) -> dict:
     """返回 regime 时序的覆盖元信息(供数据画像/API)。"""
     df = load_regime_history(data_dir)
@@ -940,26 +1025,24 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
         end=to_compute[-1],
     )
     new_rows = run_regime_batch(repo, start=to_compute[0], end=to_compute[-1])
+    entries, _phase_days = build_regime_history_range_snapshot(
+        data_dir,
+        new_rows,
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
+        source_snapshot=source_snapshot,
+    )
     assert_regime_source_unchanged(
         source_snapshot,
         repo,
         start=to_compute[0],
         end=to_compute[-1],
     )
-    replace_regime_history_range(
-        data_dir,
-        new_rows,
-        start=to_compute[0],
-        end=to_compute[-1],
+    replace_parquet_set(
+        entries,
+        journal_path=market_environment_journal_path(data_dir),
     )
-    mark_regime_range_processed(
-        data_dir,
-        repo,
-        start=to_compute[0],
-        end=to_compute[-1],
-        source_snapshot=source_snapshot,
-    )
-    refresh_phase_labels(data_dir)
     return new_rows
 
 

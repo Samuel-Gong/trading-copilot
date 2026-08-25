@@ -197,41 +197,19 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         start=start,
         end=end,
     )
-    mainline_source_snapshot: market_mainline.MainlineSourceSnapshot | None = None
-    if full_recompute:
-        mainline_source_snapshot = market_mainline.capture_mainline_source_snapshot(
-            data_dir,
-            repo,
-            start=start,
-            end=end,
-        )
-        mainline_filter_config = mainline_source_snapshot.filter_config
-    else:
-        mainline_filter_config = market_mainline.load_mainline_filter_config()
+    mainline_source_snapshot = market_mainline.capture_mainline_source_snapshot(
+        data_dir,
+        repo,
+        start=start,
+        end=end,
+    )
+    mainline_filter_config = mainline_source_snapshot.filter_config
     new_rows = regime_builder.run_regime_batch(repo, start=start, end=end)
     if full_recompute:
-        regime_rows, phase_days = regime_builder.label_phase_history(new_rows)
-    else:
-        regime_builder.assert_regime_source_unchanged(
-            regime_source_snapshot,
-            repo,
-            start=start,
-            end=end,
-        )
-        regime_builder.replace_regime_history_range(
-            data_dir,
+        regime_rows, phase_days = regime_builder.label_phase_history(
             new_rows,
-            start=start,
-            end=end,
+            strict=True,
         )
-        regime_builder.mark_regime_range_processed(
-            data_dir,
-            repo,
-            start=start,
-            end=end,
-            source_snapshot=regime_source_snapshot,
-        )
-        phase_days = regime_builder.refresh_phase_labels(data_dir)
 
     mainline_results = {}
     for kind in ("concept", "industry"):
@@ -244,7 +222,6 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             filter_cfg=mainline_filter_config,
         )
     if full_recompute:
-        assert mainline_source_snapshot is not None
         regime_entries = regime_builder.build_regime_history_full_snapshot(
             data_dir,
             regime_rows,
@@ -281,16 +258,42 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             *mainline_entries,
         ], journal_path=market_environment_journal_path(data_dir))
     else:
-        mainline_rows = 0
-        for kind, rows in mainline_results.items():
-            market_mainline.replace_mainline_history_range(
+        regime_entries, phase_days = (
+            regime_builder.build_regime_history_range_snapshot(
                 data_dir,
-                rows,
+                new_rows,
+                repo,
                 start=start,
                 end=end,
-                kind=kind,
+                source_snapshot=regime_source_snapshot,
             )
-            mainline_rows += rows.height
+        )
+        mainline_entries, mainline_rows = (
+            market_mainline.build_mainline_history_range_snapshot(
+                data_dir,
+                mainline_results,
+                start=start,
+                end=end,
+                source_snapshot=mainline_source_snapshot,
+            )
+        )
+        market_mainline.assert_mainline_source_unchanged(
+            mainline_source_snapshot,
+            data_dir,
+            repo,
+            start=start,
+            end=end,
+        )
+        regime_builder.assert_regime_source_unchanged(
+            regime_source_snapshot,
+            repo,
+            start=start,
+            end=end,
+        )
+        replace_parquet_set([
+            *regime_entries,
+            *mainline_entries,
+        ], journal_path=market_environment_journal_path(data_dir))
 
     invalidate_regime_cache()
     return {

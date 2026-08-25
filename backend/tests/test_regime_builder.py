@@ -565,6 +565,111 @@ def test_compute_incremental_rejects_source_change_before_publish(
     assert not regime_builder.regime_coverage_path(tmp_path).exists()
 
 
+def test_compute_incremental_publishes_labeled_history_and_coverage_together(
+    tmp_path,
+    monkeypatch,
+):
+    """增量结果先在内存重标，再与完成水位作为同一文件集提交。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    published: list[list[tuple[object, pl.DataFrame]]] = []
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda *args, **kwargs: pl.DataFrame({
+            "date": [target],
+            "state": ["range"],
+            "max_consecutive": [2],
+            "first_board": [10],
+            "ge2_count": [3],
+            "promo_rate": [0.1],
+            "seal_rate": [0.5],
+        }),
+    )
+    monkeypatch.setattr(
+        regime_builder,
+        "replace_parquet_set",
+        lambda entries, **kwargs: published.append(entries),
+    )
+
+    result = regime_builder.compute_regime_incremental(
+        _FakeRepo(),
+        tmp_path,
+        today=target,
+    )
+
+    assert result.height == 1
+    assert len(published) == 1
+    entries = dict(published[0])
+    assert set(entries) == {
+        regime_builder.regime_path(tmp_path),
+        regime_builder.regime_coverage_path(tmp_path),
+    }
+    assert entries[regime_builder.regime_path(tmp_path)]["phase"].to_list() == ["ice"]
+    assert entries[regime_builder.regime_coverage_path(tmp_path)]["date"].to_list() == [
+        target,
+    ]
+    assert not regime_builder.regime_path(tmp_path).exists()
+    assert not regime_builder.regime_coverage_path(tmp_path).exists()
+
+
+def test_compute_incremental_phase_label_failure_keeps_old_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """阶段重标失败必须发生在事务发布前，不能留下新水位。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    published: list[object] = []
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda *args, **kwargs: pl.DataFrame({
+            "date": [target],
+            "state": ["range"],
+            "max_consecutive": [2],
+            "first_board": [10],
+            "ge2_count": [3],
+            "promo_rate": [0.1],
+            "seal_rate": [0.5],
+        }),
+    )
+    monkeypatch.setattr(
+        "app.services.market_phase.classify_phase_series",
+        lambda _frame: (_ for _ in ()).throw(RuntimeError("phase failed")),
+    )
+    monkeypatch.setattr(
+        regime_builder,
+        "replace_parquet_set",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(RuntimeError, match="phase failed"):
+        regime_builder.compute_regime_incremental(
+            _FakeRepo(),
+            tmp_path,
+            today=target,
+        )
+
+    assert published == []
+    assert not regime_builder.regime_path(tmp_path).exists()
+    assert not regime_builder.regime_coverage_path(tmp_path).exists()
+
+
 def test_compute_incremental_clears_deleted_enriched_date(
     tmp_path,
     monkeypatch,

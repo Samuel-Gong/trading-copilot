@@ -37,6 +37,31 @@ def _mainline_snapshot(version: str, *, min_members: int = 4):
     )
 
 
+def _mainline_range_snapshot(
+    target: date,
+    version: str,
+    *,
+    min_members: int = 4,
+):
+    config = {
+        "min_members": min_members,
+        "max_members": 600,
+        "blacklist": [],
+        "exclude_st": True,
+    }
+    return market_mainline.MainlineSourceSnapshot(
+        coverage=pl.DataFrame({
+            "date": [target, target],
+            "kind": ["concept", "industry"],
+            "source_mtime_ns": [1, 1],
+            "membership_version": [version, version],
+            "filter_version": [version, version],
+        }),
+        filter_config=config,
+        filter_version=version,
+    )
+
+
 def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     tmp_path,
     monkeypatch,
@@ -367,6 +392,129 @@ def test_regime_range_recompute_rejects_source_change_before_publish(
         )
 
     assert published == []
+
+
+def test_regime_range_recompute_rejects_mainline_source_change_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """区间重算期间主线来源变化时，四个派生文件都不得发布。"""
+    target = date(2026, 8, 25)
+    before = _mainline_range_snapshot(target, "before")
+    after = _mainline_range_snapshot(target, "after", min_members=5)
+    snapshots = iter([before, after])
+    published: list[object] = []
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "capture_regime_source_snapshot",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "assert_regime_source_unchanged",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "capture_mainline_source_snapshot",
+        lambda *args, **kwargs: next(snapshots),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        regime,
+        "replace_parquet_set",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(market_mainline.MainlineSourceChangedError):
+        regime.regime_recompute(
+            _request(tmp_path),
+            start=target,
+            end=target,
+        )
+
+    assert published == []
+
+
+def test_regime_range_recompute_publishes_mainline_coverage_in_one_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    """区间重算必须把两类主线结果、水位和 regime 文件一次提交。"""
+    target = date(2026, 8, 25)
+    snapshot = _mainline_range_snapshot(target, "fixed")
+    published: list[list[tuple[object, pl.DataFrame]]] = []
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "capture_regime_source_snapshot",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "assert_regime_source_unchanged",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        lambda *args, **kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "capture_mainline_source_snapshot",
+        lambda *args, **kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "assert_mainline_source_unchanged",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        market_mainline,
+        "compute_mainline_range",
+        lambda _repo, _data_dir, _start, _end, *, kind, filter_cfg: pl.DataFrame({
+            "date": [target],
+            "kind": [kind],
+            "rank": [1],
+        }),
+    )
+    monkeypatch.setattr(
+        regime,
+        "replace_parquet_set",
+        lambda entries, **kwargs: published.append(entries),
+    )
+
+    result = regime.regime_recompute(
+        _request(tmp_path),
+        start=target,
+        end=target,
+    )
+
+    assert result["mainline_rows"] == 2
+    assert len(published) == 1
+    entries = dict(published[0])
+    assert set(entries) == {
+        regime.regime_builder.regime_path(tmp_path),
+        regime.regime_builder.regime_coverage_path(tmp_path),
+        market_mainline.mainline_path(tmp_path),
+        market_mainline.mainline_coverage_path(tmp_path),
+    }
+    assert set(entries[market_mainline.mainline_path(tmp_path)]["kind"].to_list()) == {
+        "concept",
+        "industry",
+    }
+    assert set(
+        entries[market_mainline.mainline_coverage_path(tmp_path)]["kind"].to_list(),
+    ) == {"concept", "industry"}
 
 
 def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
