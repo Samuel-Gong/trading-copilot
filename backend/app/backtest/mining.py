@@ -1220,8 +1220,8 @@ class MiningService:
                 break
 
         if not cancelled and evaluator is not None:
-            winner_union: dict[str, MiningCandidate] = {}
-            for fold in fold_results:
+            winner_union: dict[str, tuple[MiningCandidate, int]] = {}
+            for fold_position, fold in enumerate(fold_results):
                 if fold.selected_candidate_id is None:
                     continue
                 if fold.selected_candidate_id in winner_union:
@@ -1235,13 +1235,17 @@ class MiningService:
                     None,
                 )
                 if winner is not None:
-                    winner_union[winner.candidate_id] = winner
+                    winner_union[winner.candidate_id] = (winner, fold_position)
             if len(winner_union) > 1:
                 extended_folds: list[FoldMiningResult] = []
-                for nested, fold in zip(nested_folds, fold_results, strict=False):
+                for fold_position, (nested, fold) in enumerate(
+                    zip(nested_folds, fold_results, strict=False)
+                ):
                     cross: list[tuple[str, CandidateEvaluation]] = []
-                    for candidate_id, candidate in winner_union.items():
+                    for candidate_id, (candidate, selected_position) in winner_union.items():
                         if candidate_id == fold.selected_candidate_id:
+                            continue
+                        if selected_position >= fold_position:
                             continue
                         if trials_used >= request.budget.max_trials:
                             cross.append((
