@@ -427,7 +427,11 @@ def mainline_recompute(request: Request):
     data_dir = _data_dir(request)
     earliest = regime_builder.earliest_enriched_date(repo)
     if earliest is None:
-        market_mainline.clear_mainline_history(data_dir)
+        empty = pl.DataFrame()
+        replace_parquet_set([
+            (market_mainline.mainline_path(data_dir), empty),
+            (market_mainline.mainline_coverage_path(data_dir), empty),
+        ], journal_path=market_environment_journal_path(data_dir))
         return {"ok": True, "rows": 0}
     business_today = cn_today()
     source_snapshot = market_mainline.capture_mainline_source_snapshot(

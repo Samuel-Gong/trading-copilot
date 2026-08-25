@@ -181,6 +181,51 @@ def test_full_recompute_empty_source_publish_failure_restores_all_files(
     assert not regime.market_environment_journal_path(tmp_path).exists()
 
 
+def test_mainline_recompute_clears_empty_source_in_one_transaction(tmp_path):
+    """独立主线无来源清理必须同时发布空 history 与 coverage。"""
+    paths = [
+        market_mainline.mainline_path(tmp_path),
+        market_mainline.mainline_coverage_path(tmp_path),
+    ]
+    for index, path in enumerate(paths):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"value": [index]}).write_parquet(path)
+
+    result = regime.mainline_recompute(_request(tmp_path))
+
+    assert result == {"ok": True, "rows": 0}
+    assert all(path.exists() and pl.read_parquet(path).is_empty() for path in paths)
+
+
+def test_mainline_recompute_empty_source_failure_restores_both_files(
+    tmp_path,
+    monkeypatch,
+):
+    """独立主线空源事务失败时不得留下 history/coverage 半提交。"""
+    paths = [
+        market_mainline.mainline_path(tmp_path),
+        market_mainline.mainline_coverage_path(tmp_path),
+    ]
+    for index, path in enumerate(paths):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"value": [index]}).write_parquet(path)
+    original_replace = atomic_parquet.os.replace
+
+    def fail_coverage_publish(source, target):
+        if Path(target) == paths[1] and Path(source).suffix == ".tmp":
+            raise OSError("coverage busy")
+        original_replace(source, target)
+
+    monkeypatch.setattr(atomic_parquet.os, "replace", fail_coverage_publish)
+
+    with pytest.raises(OSError, match="coverage busy"):
+        regime.mainline_recompute(_request(tmp_path))
+
+    for index, path in enumerate(paths):
+        assert pl.read_parquet(path)["value"].to_list() == [index]
+    assert not regime.market_environment_journal_path(tmp_path).exists()
+
+
 def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monkeypatch):
     """删除最早来源分区后，全量重算不得保留新起点之前的旧派生日期。"""
     old_date = date(2026, 1, 1)
