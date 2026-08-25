@@ -5,6 +5,7 @@ import os
 from datetime import date
 
 import polars as pl
+import pytest
 
 from app.services import market_mainline, preferences
 from app.services.ext_data import ExtConfig, ExtConfigStore, ExtField
@@ -361,6 +362,47 @@ class TestComputeMainline:
             (d1, d2, "concept"),
             (d2, d2, "concept"),
         ]
+
+    def test_incremental_rejects_source_change_before_publish(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """增量主线计算期间来源变化时不得发布旧结果或新水位。"""
+        repo, d1, d2 = self._setup(tmp_path, monkeypatch)
+        overwritten = (
+            tmp_path
+            / "kline_daily_enriched"
+            / f"date={d2.isoformat()}"
+            / "part.parquet"
+        )
+        published: list[object] = []
+
+        def change_source_during_compute(*args, **kwargs):
+            overwritten.write_bytes(b"new-source-version")
+            return pl.DataFrame()
+
+        monkeypatch.setattr(
+            market_mainline,
+            "compute_mainline_range",
+            change_source_during_compute,
+        )
+        monkeypatch.setattr(
+            market_mainline,
+            "replace_mainline_history_range",
+            lambda *args, **kwargs: published.append(args),
+        )
+
+        with pytest.raises(market_mainline.MainlineSourceChangedError):
+            market_mainline.compute_mainline_incremental(
+                repo,
+                tmp_path,
+                today=d2,
+                kind="concept",
+            )
+
+        assert published == []
+        assert not market_mainline.mainline_coverage_path(tmp_path).exists()
 
     def test_incremental_recomputes_dates_affected_by_new_membership_snapshot(
         self,

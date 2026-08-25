@@ -330,6 +330,45 @@ def test_regime_full_recompute_rejects_index_source_change_before_publish(
     assert published == []
 
 
+def test_regime_range_recompute_rejects_source_change_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """带 start 的区间重算也必须复验并沿用计算前来源快照。"""
+    target = date(2026, 8, 25)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    index = tmp_path / "kline_index_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    index.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    index.write_bytes(b"index-v1")
+    published: list[object] = []
+
+    def change_index_during_compute(*args, **kwargs):
+        index.write_bytes(b"index-version-two")
+        return pl.DataFrame()
+
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "run_regime_batch",
+        change_index_during_compute,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "replace_regime_history_range",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(regime.regime_builder.RegimeSourceChangedError):
+        regime.regime_recompute(
+            _request(tmp_path),
+            start=target,
+            end=target,
+        )
+
+    assert published == []
+
+
 def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
     tmp_path,
     monkeypatch,

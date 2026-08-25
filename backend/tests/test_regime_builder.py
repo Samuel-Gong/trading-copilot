@@ -521,6 +521,50 @@ def test_compute_incremental_clears_stale_date_when_recompute_is_empty(
     assert set(stored["date"].to_list()) == {d1}
 
 
+def test_compute_incremental_rejects_source_change_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """增量计算期间行情来源变化时不得发布旧结果或新水位。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    index = tmp_path / "kline_index_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    index.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    index.write_bytes(b"index-v1")
+    published: list[object] = []
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    def change_source_during_compute(*args, **kwargs):
+        index.write_bytes(b"index-version-two")
+        return pl.DataFrame({
+            "date": [target],
+            "state": ["range"],
+            "score": [50],
+        })
+
+    monkeypatch.setattr(regime_builder, "run_regime_batch", change_source_during_compute)
+    monkeypatch.setattr(
+        regime_builder,
+        "replace_regime_history_range",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(regime_builder.RegimeSourceChangedError):
+        regime_builder.compute_regime_incremental(
+            _FakeRepo(),
+            tmp_path,
+            today=target,
+        )
+
+    assert published == []
+    assert not regime_builder.regime_coverage_path(tmp_path).exists()
+
+
 def test_compute_incremental_clears_deleted_enriched_date(
     tmp_path,
     monkeypatch,

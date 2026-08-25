@@ -616,6 +616,7 @@ def mark_regime_range_processed(
     *,
     start: date,
     end: date,
+    source_snapshot: pl.DataFrame | None = None,
 ) -> None:
     """以当前个股与指数 enriched 版本完整替换指定日期范围的完成水位。"""
     if start > end:
@@ -627,7 +628,13 @@ def mark_regime_range_processed(
         if not old.is_empty()
         else pl.DataFrame()
     )
-    incoming = _regime_coverage_frame(repo, start=start, end=end)
+    incoming = source_snapshot
+    if incoming is None:
+        incoming = capture_regime_source_snapshot(repo, start=start, end=end)
+    elif not incoming.is_empty():
+        incoming = incoming.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end),
+        )
     if kept.is_empty():
         combined = incoming
     elif incoming.is_empty():
@@ -927,7 +934,18 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
 
     logger.info("regime incremental: compute %d days (missing=%d, stale=%d, removed=%d)",
                 len(to_compute), len(missing), len(stale), len(removed))
+    source_snapshot = capture_regime_source_snapshot(
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
+    )
     new_rows = run_regime_batch(repo, start=to_compute[0], end=to_compute[-1])
+    assert_regime_source_unchanged(
+        source_snapshot,
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
+    )
     replace_regime_history_range(
         data_dir,
         new_rows,
@@ -939,6 +957,7 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
         repo,
         start=to_compute[0],
         end=to_compute[-1],
+        source_snapshot=source_snapshot,
     )
     refresh_phase_labels(data_dir)
     return new_rows

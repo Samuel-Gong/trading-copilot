@@ -192,14 +192,13 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
                 "mainline_rows": 0,
             }
         start = earliest
-    regime_source_snapshot: pl.DataFrame | None = None
+    regime_source_snapshot = regime_builder.capture_regime_source_snapshot(
+        repo,
+        start=start,
+        end=end,
+    )
     mainline_source_snapshot: market_mainline.MainlineSourceSnapshot | None = None
     if full_recompute:
-        regime_source_snapshot = regime_builder.capture_regime_source_snapshot(
-            repo,
-            start=start,
-            end=end,
-        )
         mainline_source_snapshot = market_mainline.capture_mainline_source_snapshot(
             data_dir,
             repo,
@@ -213,6 +212,12 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
     if full_recompute:
         regime_rows, phase_days = regime_builder.label_phase_history(new_rows)
     else:
+        regime_builder.assert_regime_source_unchanged(
+            regime_source_snapshot,
+            repo,
+            start=start,
+            end=end,
+        )
         regime_builder.replace_regime_history_range(
             data_dir,
             new_rows,
@@ -224,6 +229,7 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             repo,
             start=start,
             end=end,
+            source_snapshot=regime_source_snapshot,
         )
         phase_days = regime_builder.refresh_phase_labels(data_dir)
 
@@ -238,7 +244,6 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             filter_cfg=mainline_filter_config,
         )
     if full_recompute:
-        assert regime_source_snapshot is not None
         assert mainline_source_snapshot is not None
         regime_entries = regime_builder.build_regime_history_full_snapshot(
             data_dir,

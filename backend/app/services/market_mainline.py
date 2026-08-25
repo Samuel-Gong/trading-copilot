@@ -72,6 +72,7 @@ class MainlineSourceSnapshot:
     coverage: pl.DataFrame
     filter_config: dict
     filter_version: str
+    kinds: tuple[str, ...] = ("concept", "industry")
 
 
 # 主线分权重: 概念内涨停家数 / 最高连板 / 梯队档位数 / 二板以上家数
@@ -358,19 +359,26 @@ def _mark_mainline_dates_processed(
     kind: str,
     dates: set[date],
     *,
-    filter_version: str,
+    filter_version: str | None = None,
+    source_snapshot: MainlineSourceSnapshot | None = None,
 ) -> None:
     if not dates:
         return
     path = mainline_coverage_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    incoming = _mainline_coverage_frame(
-        data_dir,
-        repo,
-        dates,
-        (kind,),
-        filter_version=filter_version,
-    )
+    if source_snapshot is None:
+        assert filter_version is not None
+        incoming = _mainline_coverage_frame(
+            data_dir,
+            repo,
+            dates,
+            (kind,),
+            filter_version=filter_version,
+        )
+    else:
+        incoming = source_snapshot.coverage.filter(
+            (pl.col("kind") == kind) & pl.col("date").is_in(sorted(dates)),
+        )
     old = pl.read_parquet(path) if path.exists() else pl.DataFrame()
     if not old.is_empty() and "source_mtime_ns" not in old.columns:
         old = old.with_columns(pl.lit(None).cast(pl.Int64).alias("source_mtime_ns"))
@@ -435,11 +443,19 @@ def capture_mainline_source_snapshot(
     start: date,
     end: date,
     kinds: tuple[str, ...] = ("concept", "industry"),
+    filter_config: dict | None = None,
 ) -> MainlineSourceSnapshot:
-    """捕获全量主线结果对应的行情、成员版本与过滤配置快照。"""
+    """捕获主线结果对应的行情、成员版本与过滤配置快照。"""
     from app.services.regime_builder import enriched_date_set
 
-    filter_config = load_mainline_filter_config()
+    filter_config = (
+        load_mainline_filter_config()
+        if filter_config is None
+        else {
+            **filter_config,
+            "blacklist": list(filter_config.get("blacklist") or []),
+        }
+    )
     filter_version = _mainline_filter_version(filter_config)
     covered_dates = {
         target_date
@@ -456,6 +472,7 @@ def capture_mainline_source_snapshot(
         ),
         filter_config=filter_config,
         filter_version=filter_version,
+        kinds=kinds,
     )
 
 
@@ -473,12 +490,13 @@ def assert_mainline_source_unchanged(
         repo,
         start=start,
         end=end,
+        kinds=expected.kinds,
     )
     if (
         expected.coverage.to_dicts() != current.coverage.to_dicts()
         or expected.filter_version != current.filter_version
     ):
-        raise MainlineSourceChangedError("主线计算期间来源已更新，请重试全量重算")
+        raise MainlineSourceChangedError("主线计算期间来源已更新，请重试")
 
 
 def _remove_mainline_dates_processed(
@@ -951,13 +969,28 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         len(stale),
         len(removed),
     )
+    source_snapshot = capture_mainline_source_snapshot(
+        data_dir,
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
+        kinds=(kind,),
+        filter_config=filter_config,
+    )
     new_rows = compute_mainline_range(
         repo,
         data_dir,
         to_compute[0],
         to_compute[-1],
         kind=kind,
-        filter_cfg=filter_config,
+        filter_cfg=source_snapshot.filter_config,
+    )
+    assert_mainline_source_unchanged(
+        source_snapshot,
+        data_dir,
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
     )
     replace_mainline_history_range(
         data_dir,
@@ -971,7 +1004,7 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         data_dir,
         repo,
         kind,
-        set(to_compute) & enriched_dates,
-        filter_version=filter_version,
+        set(source_snapshot.coverage["date"].to_list()),
+        source_snapshot=source_snapshot,
     )
     return new_rows
