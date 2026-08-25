@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import threading
 from datetime import date
+from pathlib import Path
 from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
 from app.api import regime
-from app.services import market_mainline, preferences
+from app.services import atomic_parquet, market_mainline, preferences
 from app.services.market_environment_lock import market_environment_snapshot
 
 
@@ -144,9 +145,40 @@ def test_full_recompute_clears_derived_history_when_enriched_is_empty(tmp_path):
 
     assert result == {"ok": True, "computed": 0, "phase_days": 0, "mainline_rows": 0}
     assert all(
-        not path.exists()
+        path.exists() and pl.read_parquet(path).is_empty()
         for path in (regime_part, regime_coverage, mainline_part, mainline_coverage)
     )
+
+
+def test_full_recompute_empty_source_publish_failure_restores_all_files(
+    tmp_path,
+    monkeypatch,
+):
+    """无来源清理的任一文件发布失败时，四文件必须完整回滚。"""
+    paths = [
+        regime.regime_builder.regime_path(tmp_path),
+        regime.regime_builder.regime_coverage_path(tmp_path),
+        market_mainline.mainline_path(tmp_path),
+        market_mainline.mainline_coverage_path(tmp_path),
+    ]
+    for index, path in enumerate(paths):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"value": [index]}).write_parquet(path)
+    original_replace = atomic_parquet.os.replace
+
+    def fail_mainline_publish(source, target):
+        if Path(target) == paths[2] and Path(source).suffix == ".tmp":
+            raise OSError("mainline busy")
+        original_replace(source, target)
+
+    monkeypatch.setattr(atomic_parquet.os, "replace", fail_mainline_publish)
+
+    with pytest.raises(OSError, match="mainline busy"):
+        regime.regime_recompute(_request(tmp_path))
+
+    for index, path in enumerate(paths):
+        assert pl.read_parquet(path)["value"].to_list() == [index]
+    assert not regime.market_environment_journal_path(tmp_path).exists()
 
 
 def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monkeypatch):

@@ -182,8 +182,13 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         # 全量: 从 enriched 最早日强制重算到今天
         earliest = regime_builder.earliest_enriched_date(repo)
         if earliest is None:
-            regime_builder.clear_regime_history(data_dir)
-            market_mainline.clear_mainline_history(data_dir)
+            empty = pl.DataFrame()
+            replace_parquet_set([
+                (regime_builder.regime_path(data_dir), empty),
+                (regime_builder.regime_coverage_path(data_dir), empty),
+                (market_mainline.mainline_path(data_dir), empty),
+                (market_mainline.mainline_coverage_path(data_dir), empty),
+            ], journal_path=market_environment_journal_path(data_dir))
             invalidate_regime_cache()
             return {
                 "ok": True,
