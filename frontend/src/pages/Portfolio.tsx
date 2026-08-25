@@ -691,7 +691,7 @@ export function Portfolio() {
               <SortableContext items={visibleTrades.map(trade => trade.id)} strategy={verticalListSortingStrategy}>
                 <div className="overflow-x-auto">
                   <table className="w-full min-w-[900px] text-left text-xs">
-                    <thead className="bg-elevated/50 text-muted"><tr><th className="w-7" /><th className="px-4 py-2 font-medium">交易日</th><th className="px-3 py-2 font-medium">标的 / 账户</th><th className="px-3 py-2 font-medium">方向</th><th className="px-3 py-2 text-right font-medium">数量 × 成交价</th><th className="px-3 py-2 text-right font-medium">费用 / 税费</th><th className="px-3 py-2 font-medium">备注</th><th className="px-4 py-2 text-right font-medium">操作</th></tr></thead>
+                    <thead className="bg-elevated/50 text-muted"><tr><th className="w-7" /><th className="px-4 py-2 font-medium">交易日</th><th className="px-3 py-2 font-medium">标的 / 账户</th><th className="px-3 py-2 font-medium">方向</th><th className="px-3 py-2 text-right font-medium">成交价 × 数量</th><th className="px-3 py-2 text-right font-medium">费用 / 税费</th><th className="px-3 py-2 font-medium">备注</th><th className="px-4 py-2 text-right font-medium">操作</th></tr></thead>
                     <tbody className="divide-y divide-border/70">
                       {visibleTrades.map(trade => (
                         <SortableTradeRow key={trade.id} id={trade.id} busy={reorderBusy}>
@@ -890,28 +890,14 @@ function TradeExecutionCell({
   if (editing) {
     return (
       <div className="inline-flex items-center justify-end gap-1">
-        <input
-          aria-label="成交数量"
-          type="number"
-          step="any"
-          min="0"
-          value={quantityValue}
-          autoFocus
-          disabled={busy}
-          onChange={event => setQuantityValue(event.target.value)}
-          onKeyDown={event => {
-            if (event.key === 'Enter') save()
-            if (event.key === 'Escape') setEditing(false)
-          }}
-          className={`${INPUT_CLASS} !w-16 !px-1 !py-0.5 text-right font-mono`}
-        />
-        <span>× ¥</span>
+        <span>¥</span>
         <input
           aria-label="成交价"
           type="number"
           step="0.001"
           min="0"
           value={priceValue}
+          autoFocus
           disabled={busy}
           onChange={event => setPriceValue(event.target.value)}
           onKeyDown={event => {
@@ -919,6 +905,21 @@ function TradeExecutionCell({
             if (event.key === 'Escape') setEditing(false)
           }}
           className={`${INPUT_CLASS} !w-20 !px-1 !py-0.5 text-right font-mono`}
+        />
+        <span>×</span>
+        <input
+          aria-label="成交数量"
+          type="number"
+          step="any"
+          min="0"
+          value={quantityValue}
+          disabled={busy}
+          onChange={event => setQuantityValue(event.target.value)}
+          onKeyDown={event => {
+            if (event.key === 'Enter') save()
+            if (event.key === 'Escape') setEditing(false)
+          }}
+          className={`${INPUT_CLASS} !w-16 !px-1 !py-0.5 text-right font-mono`}
         />
         <button type="button" onClick={save} disabled={busy} className="rounded-btn p-0.5 text-accent hover:bg-accent/10" title="保存数量和成交价"><Check className="h-3 w-3" /></button>
         <button type="button" onClick={() => setEditing(false)} disabled={busy} className="rounded-btn p-0.5 text-muted hover:bg-elevated hover:text-foreground" title="取消修改"><X className="h-3 w-3" /></button>
@@ -928,7 +929,7 @@ function TradeExecutionCell({
 
   return (
     <span className="inline-flex items-center justify-end gap-1">
-      <span>{formatQuantity(trade.quantity)} × ¥ {formatPrice(trade.price)}</span>
+      <span>¥ {formatPrice(trade.price)} × {formatQuantity(trade.quantity)}</span>
       <button type="button" onClick={open} disabled={busy} className="rounded-btn p-0.5 text-muted hover:text-foreground" title="修改成交数量和成交价"><Pencil className="h-3 w-3" /></button>
     </span>
   )
@@ -966,7 +967,7 @@ function TradeRowCells({ trade, onDelete, onEditCost, onUpdateExecution, tradeEd
   return (
     <>
       <td className="px-3 py-3"><TradeSide side={trade.side} migrated={trade.migration_source === 'legacy_position'} /></td>
-      <td className="px-3 py-3 text-right font-mono">{onUpdateExecution ? <TradeExecutionCell trade={trade} busy={editingDisabled} onSave={onUpdateExecution} /> : <>{formatQuantity(trade.quantity)} × ¥ {formatPrice(trade.price)}</>}</td>
+      <td className="px-3 py-3 text-right font-mono">{onUpdateExecution ? <TradeExecutionCell trade={trade} busy={editingDisabled} onSave={onUpdateExecution} /> : <>¥ {formatPrice(trade.price)} × {formatQuantity(trade.quantity)}</>}</td>
       <td className="px-3 py-3 text-right font-mono">¥ {formatMoney(trade.fee)} / ¥ {formatMoney(trade.tax)}<CostSourceChip source={trade.cost_source} />{onEditCost && <button onClick={() => onEditCost(trade)} disabled={interactionDisabled} className="ml-0.5 rounded-btn p-1 align-middle text-muted hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40" title="修改费用/税费"><Edit3 className="h-3 w-3" /></button>}</td>
       <td className="max-w-xs truncate px-3 py-3 text-secondary">{trade.note || '—'}</td>
       <td className="px-4 py-3 text-right">
@@ -1245,7 +1246,7 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
               <th className="px-3 py-2 font-medium">账户</th>
             )}
             <th className="px-3 py-2 font-medium">方向</th>
-            <th className="px-3 py-2 text-right font-medium">数量 × 成交价</th>
+            <th className="px-3 py-2 text-right font-medium">成交价 × 数量</th>
             <th className="px-3 py-2 text-right font-medium">费用 / 税费</th>
             <th className="px-3 py-2 font-medium">备注</th>
             <th className="px-4 py-2 text-right font-medium">操作</th>
@@ -1338,29 +1339,30 @@ function InlineTradeDraftRow({ draft, mode, accountName, busy, onChange, onSave,
       </td>
       <td className="px-3 py-2.5">
         <div className="flex items-center justify-end gap-1 font-mono">
-          <input
-            aria-label="新交易数量"
-            type="number"
-            step="any"
-            min="0"
-            value={draft.quantity}
-            autoFocus
-            disabled={busy}
-            onChange={event => onChange({ ...draft, quantity: event.target.value })}
-            onKeyDown={saveOnEnter}
-            className={`${INPUT_CLASS} !w-20 !py-1.5 text-right font-mono`}
-          />
-          <span className="text-muted">× ¥</span>
+          <span className="text-muted">¥</span>
           <input
             aria-label="新交易成交价"
             type="number"
             step="0.001"
             min="0"
             value={draft.price}
+            autoFocus
             disabled={busy}
             onChange={event => onChange({ ...draft, price: event.target.value })}
             onKeyDown={saveOnEnter}
             className={`${INPUT_CLASS} !w-24 !py-1.5 text-right font-mono`}
+          />
+          <span className="text-muted">×</span>
+          <input
+            aria-label="新交易数量"
+            type="number"
+            step="any"
+            min="0"
+            value={draft.quantity}
+            disabled={busy}
+            onChange={event => onChange({ ...draft, quantity: event.target.value })}
+            onKeyDown={saveOnEnter}
+            className={`${INPUT_CLASS} !w-20 !py-1.5 text-right font-mono`}
           />
         </div>
       </td>
@@ -1486,7 +1488,7 @@ function TradeDialog({ accounts, draft, busy, tradingDates, earliestTradingDate,
           <Field label="交易日" hint={draft.insertBeforeTradeId ? '已按所选位置预填；改日后追加到当日' : '仅可选择本地已有行情的交易日'} htmlFor="trade-date">
             <DatePicker buttonId="trade-date" value={draft.tradeDate} onChange={tradeDate => updateDraftContext({ tradeDate })} min={earliestTradingDate ?? undefined} max={latestTradingDate ?? localDateIso()} availableDates={tradingDates.length > 0 ? tradingDates : undefined} align="left" className="w-full" buttonClassName="h-9 w-full justify-start rounded-btn px-2.5 font-mono" />
           </Field>
-          <div className="grid grid-cols-2 gap-3"><Field label="成交数量" htmlFor="trade-quantity"><input id="trade-quantity" type="number" min="0" step="any" value={draft.quantity} onChange={event => onChange({ ...draft, quantity: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field><Field label="成交价格" htmlFor="trade-price"><input id="trade-price" type="number" min="0" step="any" value={draft.price} onChange={event => onChange({ ...draft, price: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field></div>
+          <div className="grid grid-cols-2 gap-3"><Field label="成交价格" htmlFor="trade-price"><input id="trade-price" type="number" min="0" step="any" value={draft.price} onChange={event => onChange({ ...draft, price: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field><Field label="成交数量" htmlFor="trade-quantity"><input id="trade-quantity" type="number" min="0" step="any" value={draft.quantity} onChange={event => onChange({ ...draft, quantity: event.target.value })} className={`${INPUT_CLASS} font-mono`} /></Field></div>
           <div className="flex items-center justify-between rounded-btn border border-border bg-elevated/40 px-3 py-2">
             <span className="text-[11px] text-muted">按「设置 → 交易费率」估算本次费用/税费</span>
             <button onClick={estimate} disabled={!canEstimate || busy || estimateBusy} className="flex h-7 shrink-0 items-center gap-1 rounded-btn border border-accent/25 bg-accent/5 px-2.5 text-[11px] text-accent hover:bg-accent/10 disabled:opacity-40">
