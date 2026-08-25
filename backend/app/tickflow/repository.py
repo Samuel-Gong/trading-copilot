@@ -383,13 +383,14 @@ class KlineRepository:
     # Polars 缓存管理
     # ================================================================
 
-    def refresh_cache(self, background: bool = False) -> None:
+    def refresh_cache(self, background: bool = False) -> str | None:
         """刷新 Polars 缓存。在 pipeline 完成后、服务启动时调用。
 
         background=True (启动时): instruments/index/ETF 同步刷新 (毫秒级),
         enriched 的重计算 (compute_indicators, 107万行) 推到 daemon 线程,
         不阻塞 FastAPI lifespan。预热期间上层走空表降级。
         background=False (盘后管道/手动刷新): 全部同步, 保证数据即时一致。
+        同步刷新成功时返回实际装载的 stock generation; 无法确认时返回 None。
         """
         started = time.perf_counter()
         logger.info("cache refresh start (background=%s)", background)
@@ -417,17 +418,20 @@ class KlineRepository:
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
 
+        refreshed_generation: str | None = None
         if background:
             logger.info("cache refresh: enriched 推后台线程预热")
             self._start_enriched_warmup()
         else:
             step = time.perf_counter()
             logger.info("cache refresh step start: enriched")
-            self._refresh_enriched()
+            refreshed_generation = self._refresh_enriched()
             logger.info("cache refresh step done: enriched (%.2fs)", time.perf_counter() - step)
-            self._notify_refresh_done()
+            if refreshed_generation is not None:
+                self._notify_refresh_done()
 
         logger.info("cache refresh done (%.2fs)", time.perf_counter() - started)
+        return refreshed_generation
 
     def _start_enriched_warmup(self) -> None:
         """启动后台 daemon 线程预热 enriched 缓存 (compute_indicators)。
@@ -445,9 +449,10 @@ class KlineRepository:
             t0 = time.perf_counter()
             try:
                 logger.info("enriched warmup thread started")
-                self._refresh_enriched()
+                refreshed_generation = self._refresh_enriched()
                 logger.info("enriched warmup thread done (%.1fs)", time.perf_counter() - t0)
-                self._notify_refresh_done()
+                if refreshed_generation is not None:
+                    self._notify_refresh_done()
             except Exception:  # noqa: BLE001
                 logger.exception("enriched warmup thread failed")
             finally:
@@ -511,7 +516,7 @@ class KlineRepository:
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
 
-    def _refresh_enriched(self) -> None:
+    def _refresh_enriched(self) -> str | None:
         """从 parquet 加载 enriched 最新日到内存 + 构建聚合表。
 
         enriched parquet 仅存 14 列基础数据。启动时读入历史数据并即时计算完整指标，
@@ -533,7 +538,9 @@ class KlineRepository:
                 # (清数据后看板仍显示旧数据的根因)
                 self.clear_cache()
                 logger.info("enriched refresh skipped: no latest date (%.2fs)", time.perf_counter() - started)
-                return
+                if self.get_matrix_data_generation("stock") != refresh_generation:
+                    return None
+                return refresh_generation
 
             # Step 1: 直接读最新日期的分区文件 (仅 14 列)
             enriched_dir = self.store.data_dir / "kline_daily_enriched"
@@ -646,13 +653,20 @@ class KlineRepository:
                             df_today = repaired_today
                         logger.info("enriched 缓存已计算: %d 只, 日期 %s (即时计算)", len(df_today), latest)
                         logger.info("enriched refresh done (%.2fs)", time.perf_counter() - started)
-                        return
+                        if self.get_matrix_data_generation("stock") != refresh_generation:
+                            return None
+                        return refresh_generation
             except EnrichedGenerationUnavailableError:
                 raise
             except Exception as e:  # noqa: BLE001
                 logger.warning("enriched 即时计算失败, 使用原始 14 列缓存: %s", e)
 
             # 降级: 直接使用 14 列数据 + 构建 live_agg
+            # 丢弃可能来自旧 generation 或本轮半成品的历史缓存, 避免 latest 读路径
+            # 因 generation 不匹配而拒绝刚装载的原始缓存。
+            self._enriched_history_cache = None
+            self._enriched_history_start = None
+            self._enriched_history_generation = None
             self._enriched_cache = df_latest
             self._enriched_cache_date = latest
             step = time.perf_counter()
@@ -662,8 +676,12 @@ class KlineRepository:
 
             logger.info("enriched 缓存已加载: %d 只, 日期 %s", len(df_latest), latest)
             logger.info("enriched refresh done fallback (%.2fs)", time.perf_counter() - started)
+            if self.get_matrix_data_generation("stock") != refresh_generation:
+                return None
+            return refresh_generation
         except Exception as e:  # noqa: BLE001
             logger.warning("enriched 缓存刷新失败: %s", e)
+            return None
 
     def _restore_missing_latest_rows(
         self,

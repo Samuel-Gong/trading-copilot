@@ -12,6 +12,7 @@ from app.services.enriched_job import (
     EnrichedRepositoryRefreshError,
     run_enriched_job_with_repository_refresh,
 )
+from app.tickflow.repository import DataStore, KlineRepository
 
 
 class _Repo:
@@ -23,8 +24,9 @@ class _Repo:
         assert asset_type == "stock"
         return self.generation
 
-    def refresh_cache(self) -> None:
+    def refresh_cache(self) -> str:
         self.events.append("refresh")
+        return self.generation
 
 
 class _QuoteService:
@@ -166,7 +168,7 @@ def test_refresh_exhaustion_keeps_realtime_paused(monkeypatch) -> None:
     quotes = _QuoteService(events)
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 0.0)
 
-    def refresh_cache() -> None:
+    def refresh_cache() -> str:
         events.append("refresh")
         raise OSError("injected refresh failure")
 
@@ -195,12 +197,13 @@ def test_transient_refresh_failure_retries_before_realtime_resumes(
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 1.0)
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_POLL_SECONDS", 0.0)
 
-    def refresh_cache() -> None:
+    def refresh_cache() -> str:
         nonlocal attempts
         attempts += 1
         events.append("refresh")
         if attempts == 1:
             raise OSError("temporary refresh failure")
+        return repo.generation
 
     monkeypatch.setattr(repo, "refresh_cache", refresh_cache)
 
@@ -214,3 +217,31 @@ def test_transient_refresh_failure_retries_before_realtime_resumes(
     assert result == {"rows": 1}
     assert events == ["pause", "publish", "refresh", "refresh", "resume"]
     assert quotes.is_paused is False
+
+
+def test_swallowed_repository_refresh_failure_keeps_realtime_paused(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    repo = KlineRepository(DataStore(tmp_path))
+    quotes = _QuoteService(events)
+    monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 0.0)
+
+    def fail_latest_date():
+        raise OSError("injected swallowed refresh failure")
+
+    monkeypatch.setattr(repo, "_latest_enriched_date_duckdb", fail_latest_date)
+
+    with pytest.raises(EnrichedRepositoryRefreshError) as captured:
+        run_enriched_job_with_repository_refresh(
+            repo,
+            lambda: events.append("publish") or {"rows": 1},
+            quotes,
+        )
+
+    assert "未确认装载当前 ready enriched generation" in str(
+        captured.value.refresh_error
+    )
+    assert events == ["pause", "publish"]
+    assert quotes.is_paused is True

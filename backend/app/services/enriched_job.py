@@ -30,7 +30,15 @@ def _refresh_repository_with_retry(repo) -> None:
     deadline = time.monotonic() + _REPOSITORY_REFRESH_WAIT_SECONDS
     while True:
         try:
-            repo.refresh_cache()
+            refreshed_generation = repo.refresh_cache()
+            current_generation = repo.get_matrix_data_generation("stock")
+            if (
+                not isinstance(refreshed_generation, str)
+                or refreshed_generation != current_generation
+            ):
+                raise RuntimeError(
+                    "Repository 未确认装载当前 ready enriched generation"
+                )
             return
         except Exception as exc:  # noqa: BLE001
             remaining = deadline - time.monotonic()
