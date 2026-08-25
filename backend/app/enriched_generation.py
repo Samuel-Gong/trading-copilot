@@ -23,6 +23,8 @@ _WRITER_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _ACTIVE_PUBLICATIONS: weakref.WeakValueDictionary[str, EnrichedPublication] = (
     weakref.WeakValueDictionary()
 )
+_GENERATION_LOCK_WAIT_SECONDS = 30.0
+_GENERATION_LOCK_POLL_SECONDS = 0.01
 
 
 def _marker_path(data_dir: Path, asset_type: str) -> Path:
@@ -109,8 +111,26 @@ def _try_lock_file(stream: BinaryIO) -> None:
         ) from exc
 
 
+def _lock_file_with_timeout(stream: BinaryIO, wait_timeout: float) -> None:
+    deadline = time.monotonic() + max(wait_timeout, 0.0)
+    while True:
+        try:
+            _try_lock_file(stream)
+            return
+        except EnrichedGenerationUnavailableError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(_GENERATION_LOCK_POLL_SECONDS, remaining))
+
+
 @contextmanager
-def _exclusive_generation_lock(data_dir: Path, asset_type: str) -> Iterator[None]:
+def _exclusive_generation_lock(
+    data_dir: Path,
+    asset_type: str,
+    *,
+    wait_timeout: float = 0.0,
+) -> Iterator[None]:
     lock_path = Path(data_dir) / f".matrix_generation_{asset_type}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with (
@@ -121,7 +141,7 @@ def _exclusive_generation_lock(data_dir: Path, asset_type: str) -> Iterator[None
         if stream.tell() == 0:
             stream.write(b"0")
             stream.flush()
-        _try_lock_file(stream)
+        _lock_file_with_timeout(stream, wait_timeout)
         try:
             yield
         finally:
@@ -201,7 +221,11 @@ def enriched_publication_incomplete(
 
 def bump_enriched_generation(data_dir: Path, asset_type: str = "stock") -> str:
     path = _marker_path(data_dir, asset_type)
-    with _exclusive_generation_lock(data_dir, asset_type):
+    with _exclusive_generation_lock(
+        data_dir,
+        asset_type,
+        wait_timeout=_GENERATION_LOCK_WAIT_SECONDS,
+    ):
         current = _read_marker(path)
         if current is not None and current.get("state", "ready") != "ready":
             raise EnrichedGenerationUnavailableError(
@@ -253,7 +277,11 @@ class EnrichedPublication:
         self._publication_id = uuid.uuid4().hex
 
     def begin(self) -> None:
-        with _exclusive_generation_lock(self.data_dir, self.asset_type):
+        with _exclusive_generation_lock(
+            self.data_dir,
+            self.asset_type,
+            wait_timeout=_GENERATION_LOCK_WAIT_SECONDS,
+        ):
             self._claim_or_verify()
 
     def mark_changed(self) -> None:
@@ -265,7 +293,11 @@ class EnrichedPublication:
         if not self._publishing or self._changed:
             return
         path = _marker_path(self.data_dir, self.asset_type)
-        with _exclusive_generation_lock(self.data_dir, self.asset_type):
+        with _exclusive_generation_lock(
+            self.data_dir,
+            self.asset_type,
+            wait_timeout=_GENERATION_LOCK_WAIT_SECONDS,
+        ):
             current = _read_marker(path)
             if current is not None and current.get("publication_id") == self._publication_id:
                 _write_marker(path, _ready_payload(str(self._base_generation)))
@@ -279,7 +311,11 @@ class EnrichedPublication:
             with temporary.open("r+b") as stream:
                 stream.flush()
                 os.fsync(stream.fileno())
-            with _exclusive_generation_lock(self.data_dir, self.asset_type):
+            with _exclusive_generation_lock(
+                self.data_dir,
+                self.asset_type,
+                wait_timeout=_GENERATION_LOCK_WAIT_SECONDS,
+            ):
                 self._claim_or_verify()
                 os.replace(temporary, out)
                 _fsync_directory(out.parent)
@@ -291,7 +327,11 @@ class EnrichedPublication:
         if not self._changed:
             return None
         path = _marker_path(self.data_dir, self.asset_type)
-        with _exclusive_generation_lock(self.data_dir, self.asset_type):
+        with _exclusive_generation_lock(
+            self.data_dir,
+            self.asset_type,
+            wait_timeout=_GENERATION_LOCK_WAIT_SECONDS,
+        ):
             current = _read_marker(path)
             if current is None or current.get("publication_id") != self._publication_id:
                 raise EnrichedGenerationUnavailableError(

@@ -1,6 +1,7 @@
 """市场环境 API 的时间窗口契约回归测试。"""
 from __future__ import annotations
 
+import multiprocessing
 import threading
 from datetime import date
 from pathlib import Path
@@ -23,6 +24,26 @@ def _request(tmp_path):
             ),
         ),
     )
+
+
+def _publish_enriched_in_process(
+    data_dir: str,
+    target_iso: str,
+    started,
+    claimed,
+    finished,
+) -> None:
+    target = date.fromisoformat(target_iso)
+    source = Path(data_dir) / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    publication = EnrichedPublication(Path(data_dir), recover=True)
+    started.set()
+    try:
+        publication.begin()
+        claimed.set()
+        publication.write_parquet(pl.DataFrame({"date": [target]}), source)
+        publication.commit()
+    finally:
+        finished.set()
 
 
 def _mainline_snapshot(version: str, *, min_members: int = 4):
@@ -267,34 +288,30 @@ def test_empty_source_recompute_serializes_validation_and_publish_with_enriched(
     monkeypatch,
     entrypoint,
 ):
-    """复验后的 enriched 首分区发布必须等派生空快照完成后再取得锁。"""
+    """跨进程 enriched 首分区发布必须等派生空快照完成后再取得文件锁。"""
     target = date(2026, 8, 25)
     source = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
-    publication = EnrichedPublication(tmp_path, recover=True)
-    writer_started = threading.Event()
-    writer_claimed = threading.Event()
-    order: list[str] = []
-    errors: list[BaseException] = []
-
-    def publish_enriched() -> None:
-        try:
-            writer_started.set()
-            publication.begin()
-            writer_claimed.set()
-            publication.write_parquet(pl.DataFrame({"date": [target]}), source)
-            publication.commit()
-            order.append("enriched")
-        except BaseException as exc:
-            errors.append(exc)
-
-    writer = threading.Thread(target=publish_enriched)
+    process_context = multiprocessing.get_context("spawn")
+    writer_started = process_context.Event()
+    writer_claimed = process_context.Event()
+    writer_finished = process_context.Event()
+    writer = process_context.Process(
+        target=_publish_enriched_in_process,
+        args=(
+            str(tmp_path),
+            target.isoformat(),
+            writer_started,
+            writer_claimed,
+            writer_finished,
+        ),
+    )
 
     def publish_empty_snapshot(*args, **kwargs) -> None:
         writer.start()
-        assert writer_started.wait(timeout=1)
-        assert not writer_claimed.wait(timeout=0.1)
+        assert writer_started.wait(timeout=10)
+        assert not writer_claimed.wait(timeout=0.2)
+        assert not writer_finished.wait(timeout=0.2)
         assert not source.exists()
-        order.append("derived")
 
     monkeypatch.setattr(regime, "replace_parquet_set", publish_empty_snapshot)
 
@@ -303,10 +320,11 @@ def test_empty_source_recompute_serializes_validation_and_publish_with_enriched(
     else:
         regime.mainline_recompute(_request(tmp_path))
 
-    writer.join(timeout=2)
+    assert writer_claimed.wait(timeout=10)
+    assert writer_finished.wait(timeout=10)
+    writer.join(timeout=10)
     assert not writer.is_alive()
-    assert errors == []
-    assert order == ["derived", "enriched"]
+    assert writer.exitcode == 0
     assert source.exists()
 
 
