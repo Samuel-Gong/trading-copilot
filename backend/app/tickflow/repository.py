@@ -313,6 +313,8 @@ class KlineRepository:
         # 序列化 parquet 分区的读-改-写: 实时轮询线程、手动 refresh、盘后管道
         # 可能并发 merge/flush 同一分区文件, 无锁会互相覆盖丢数据
         self._write_lock = threading.Lock()
+        # 启动预热、同步刷新与请求懒加载必须依次安装 enriched 内存快照。
+        self._enriched_refresh_lock = threading.Lock()
 
         # ---- Polars 缓存 ----
         self._enriched_cache: pl.DataFrame | None = None       # 最新一天 (~5500行)
@@ -517,6 +519,11 @@ class KlineRepository:
         self._index_enriched_cache_date = None
 
     def _refresh_enriched(self) -> str | None:
+        """串行刷新 enriched 内存快照，防止旧预热覆盖较新的同步刷新。"""
+        with self._enriched_refresh_lock:
+            return self._refresh_enriched_locked()
+
+    def _refresh_enriched_locked(self) -> str | None:
         """从 parquet 加载 enriched 最新日到内存 + 构建聚合表。
 
         enriched parquet 仅存 14 列基础数据。启动时读入历史数据并即时计算完整指标，

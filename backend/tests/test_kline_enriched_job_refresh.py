@@ -1,6 +1,7 @@
 """会推进 enriched generation 的长任务必须同步恢复 Repository 快照。"""
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -245,3 +246,54 @@ def test_swallowed_repository_refresh_failure_keeps_realtime_paused(
     )
     assert events == ["pause", "publish"]
     assert quotes.is_paused is True
+
+
+def test_sync_refresh_waits_for_startup_warmup_before_installing_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repo = KlineRepository(DataStore(tmp_path))
+    events: list[str] = []
+    warmup_started = threading.Event()
+    release_warmup = threading.Event()
+    sync_attempted = threading.Event()
+    sync_entered = threading.Event()
+
+    monkeypatch.setattr(repo, "_refresh_instruments", lambda: None)
+    monkeypatch.setattr(repo, "_refresh_index_instruments", lambda: None)
+    monkeypatch.setattr(repo, "_refresh_etf_instruments", lambda: None)
+
+    def refresh_locked() -> str:
+        if threading.current_thread().name == "enriched-warmup":
+            events.append("warmup-start")
+            warmup_started.set()
+            assert release_warmup.wait(timeout=1.0)
+            events.append("warmup-done")
+            return "generation-a"
+        events.append("sync-start")
+        sync_entered.set()
+        return "generation-b"
+
+    monkeypatch.setattr(repo, "_refresh_enriched_locked", refresh_locked)
+    repo._start_enriched_warmup()
+    assert warmup_started.wait(timeout=1.0)
+
+    result: list[str | None] = []
+
+    def sync_refresh() -> None:
+        sync_attempted.set()
+        result.append(repo.refresh_cache())
+
+    sync_thread = threading.Thread(target=sync_refresh)
+    sync_thread.start()
+    assert sync_attempted.wait(timeout=1.0)
+    assert not sync_entered.wait(timeout=0.05)
+
+    release_warmup.set()
+    sync_thread.join(timeout=1.0)
+    assert not sync_thread.is_alive()
+    assert repo._warmup_thread is not None
+    repo._warmup_thread.join(timeout=1.0)
+
+    assert events == ["warmup-start", "warmup-done", "sync-start"]
+    assert result == ["generation-b"]
