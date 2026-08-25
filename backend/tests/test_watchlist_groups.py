@@ -1,4 +1,5 @@
 """自选分组持久化与 API 契约。"""
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -8,7 +9,7 @@ from fastapi import HTTPException
 
 from app.api import watchlist as watchlist_api
 from app.config import settings
-from app.services import watchlist
+from app.services import atomic_parquet, watchlist
 
 
 def _request():
@@ -47,6 +48,37 @@ def test_group_lifecycle_preserves_watchlist_entries(monkeypatch, tmp_path):
     assert remaining == []
     assert {row["symbol"] for row in rows} == {"600000.SH", "000001.SZ"}
     assert all(row["group_ids"] == [] for row in rows)
+
+
+def test_delete_group_rolls_back_both_user_files_on_publish_failure(
+    monkeypatch,
+    tmp_path,
+):
+    """分组 JSON 发布失败时，已切换的成员关系必须恢复。"""
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    _, created = watchlist.create_group("事务分组")
+    watchlist.add("600000.SH", group_id=created["id"])
+    entries_path = tmp_path / "user_data" / "watchlist.parquet"
+    groups_path = tmp_path / "user_data" / "watchlist_groups.json"
+    original_entries = entries_path.read_bytes()
+    original_groups = groups_path.read_bytes()
+    original_revision = watchlist.revision()
+    original_replace = atomic_parquet.os.replace
+
+    def fail_groups_publish(source, target) -> None:
+        if Path(target) == groups_path and Path(source).suffix == ".tmp":
+            raise OSError("groups publish denied")
+        original_replace(source, target)
+
+    monkeypatch.setattr(atomic_parquet.os, "replace", fail_groups_publish)
+    with pytest.raises(OSError, match="groups publish denied"):
+        watchlist.delete_group(created["id"])
+
+    assert entries_path.read_bytes() == original_entries
+    assert groups_path.read_bytes() == original_groups
+    assert watchlist.revision() == original_revision
+    assert watchlist.list_symbols()[0]["group_ids"] == [created["id"]]
+    assert watchlist.list_groups()[0]["id"] == created["id"]
 
 
 def test_group_validation_and_assignment_errors(monkeypatch, tmp_path):

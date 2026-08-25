@@ -185,6 +185,53 @@ class TestComputeMainline:
 
         assert calls == [(d1, d2, "concept")]
 
+    def test_full_snapshot_records_all_no_result_dates(self, tmp_path, monkeypatch):
+        """全量发布也要为两个维度记录空结果日期的完成水位。"""
+        d1, d2 = date(2024, 1, 2), date(2024, 1, 3)
+        _write_enriched(
+            tmp_path,
+            _mk_rows(d1, [("S1.SH", 0, 1e8)])
+            + _mk_rows(d2, [("S1.SH", 0, 1e8)]),
+        )
+        repo = _fake_repo(tmp_path)
+        results = {"concept": pl.DataFrame(), "industry": pl.DataFrame()}
+
+        market_mainline.replace_mainline_history_full(
+            tmp_path,
+            results,
+            repo,
+            start=d1,
+            end=d2,
+        )
+
+        coverage = pl.read_parquet(market_mainline.mainline_coverage_path(tmp_path))
+        assert set(zip(coverage["date"], coverage["kind"], strict=True)) == {
+            (d1, "concept"),
+            (d1, "industry"),
+            (d2, "concept"),
+            (d2, "industry"),
+        }
+        calls: list[tuple[date, date, str]] = []
+
+        def compute(current_repo, data_dir, start, end, kind="concept", **kwargs):
+            calls.append((start, end, kind))
+            return pl.DataFrame()
+
+        monkeypatch.setattr(market_mainline, "compute_mainline_range", compute)
+        market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+        market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="industry",
+        )
+        assert calls == []
+
     def test_incremental_defaults_to_cn_business_date(self, tmp_path, monkeypatch):
         """未显式传 today 时应使用北京时间业务日。"""
         target = date(2099, 1, 2)

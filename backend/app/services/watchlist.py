@@ -24,6 +24,7 @@ from pathlib import Path
 import polars as pl
 
 from app.config import settings
+from app.services.atomic_parquet import recover_file_set, replace_file_set
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
 from app.tickflow.rate_limits import chunked, resolve_limit
@@ -79,7 +80,16 @@ def _empty_entries() -> pl.DataFrame:
     return pl.DataFrame(schema=_ENTRY_SCHEMA)
 
 
+def _journal_path() -> Path:
+    return settings.data_dir / "user_data" / ".watchlist_publish.json"
+
+
+def _recover_watchlist_snapshot() -> None:
+    recover_file_set(_journal_path())
+
+
 def _read_entries() -> pl.DataFrame:
+    _recover_watchlist_snapshot()
     p = _path()
     if not p.exists():
         return _empty_entries()
@@ -99,9 +109,7 @@ def _read_entries() -> pl.DataFrame:
     return df.select(list(_ENTRY_SCHEMA))
 
 
-def _write_entries(df: pl.DataFrame) -> None:
-    global _REVISION
-    p = _path()
+def _backup_legacy_entries(p: Path) -> None:
     # 首次从旧 schema 迁移到 group_ids 前, 备份原文件(一次性)
     if p.exists():
         try:
@@ -109,13 +117,43 @@ def _write_entries(df: pl.DataFrame) -> None:
                 shutil.copy(p, p.with_suffix(p.suffix + ".bak"))
         except OSError as e:
             logger.warning("watchlist backup before migration failed: %s", e)
+
+
+def _write_entries(df: pl.DataFrame) -> None:
+    global _REVISION
+    p = _path()
+    _backup_legacy_entries(p)
     tmp = p.with_suffix(p.suffix + ".tmp")
     df.select(list(_ENTRY_SCHEMA)).write_parquet(tmp)
     os.replace(tmp, p)
     _REVISION += 1
 
 
+def _write_watchlist_snapshot(df: pl.DataFrame, groups: list[dict]) -> None:
+    """把成员关系与分组定义作为一个可回滚的文件集提交。"""
+    global _REVISION
+    entries_path = _path()
+    groups_path = _groups_path()
+    _backup_legacy_entries(entries_path)
+    groups_json = json.dumps(groups, ensure_ascii=False, indent=2)
+    replace_file_set(
+        [
+            (
+                entries_path,
+                lambda path: df.select(list(_ENTRY_SCHEMA)).write_parquet(path),
+            ),
+            (
+                groups_path,
+                lambda path: path.write_text(groups_json, encoding="utf-8"),
+            ),
+        ],
+        journal_path=_journal_path(),
+    )
+    _REVISION += 1
+
+
 def _read_groups() -> list[dict]:
+    _recover_watchlist_snapshot()
     p = _groups_path()
     if not p.exists():
         return []
@@ -303,8 +341,7 @@ def delete_group(group_id: str) -> tuple[list[dict], list[dict]]:
             raise KeyError(group_id)
         df = _strip_group(_read_entries(), group_id)
         remaining = [group for group in groups if group["id"] != group_id]
-        _write_entries(df)
-        _write_groups(remaining)
+        _write_watchlist_snapshot(df, remaining)
         return remaining, df.to_dicts()
 
 

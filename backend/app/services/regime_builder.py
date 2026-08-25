@@ -21,7 +21,11 @@ import polars as pl
 
 from app.market_time import cn_today
 from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
-from app.services.market_environment_lock import serialized_market_environment_update
+from app.services.market_environment_lock import (
+    market_environment_journal_path,
+    market_environment_snapshot,
+    serialized_market_environment_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -583,14 +587,15 @@ def mark_regime_range_processed(
 
 def load_regime_history(data_dir: Path) -> pl.DataFrame:
     """读取全部 regime 时序; 不存在返回空 DataFrame。"""
-    p = regime_path(data_dir)
-    if not p.exists():
-        return pl.DataFrame()
-    try:
-        return pl.read_parquet(p)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("load_regime_history failed: %s", e)
-        return pl.DataFrame()
+    with market_environment_snapshot(data_dir):
+        p = regime_path(data_dir)
+        if not p.exists():
+            return pl.DataFrame()
+        try:
+            return pl.read_parquet(p)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("load_regime_history failed: %s", e)
+            return pl.DataFrame()
 
 
 def label_phase_history(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
@@ -705,7 +710,10 @@ def replace_regime_history_full(
         start=start,
         end=end,
     )
-    replace_parquet_set(entries)
+    replace_parquet_set(
+        entries,
+        journal_path=market_environment_journal_path(data_dir),
+    )
 
 
 @serialized_market_environment_update

@@ -27,7 +27,11 @@ import polars as pl
 from app.market_time import cn_today
 from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
 from app.services.ext_data import ExtConfigStore
-from app.services.market_environment_lock import serialized_market_environment_update
+from app.services.market_environment_lock import (
+    market_environment_journal_path,
+    market_environment_snapshot,
+    serialized_market_environment_update,
+)
 from app.services.market_overview_builder import (
     _dimension_field,
     _dimension_values,
@@ -298,20 +302,7 @@ def _mark_mainline_dates_processed(
         return
     path = mainline_coverage_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    ordered_dates = sorted(dates)
-    membership_versions = _membership_versions_by_date(data_dir, kind, dates)
-    incoming = pl.DataFrame({
-        "date": pl.Series(ordered_dates, dtype=pl.Date),
-        "kind": pl.Series([kind] * len(ordered_dates), dtype=pl.Utf8),
-        "source_mtime_ns": pl.Series(
-            [_enriched_partition_mtime_ns(repo, item) for item in ordered_dates],
-            dtype=pl.Int64,
-        ),
-        "membership_version": pl.Series(
-            [membership_versions[item][0] for item in ordered_dates],
-            dtype=pl.Utf8,
-        ),
-    })
+    incoming = _mainline_coverage_frame(data_dir, repo, dates, (kind,))
     old = pl.read_parquet(path) if path.exists() else pl.DataFrame()
     if not old.is_empty() and "source_mtime_ns" not in old.columns:
         old = old.with_columns(pl.lit(None).cast(pl.Int64).alias("source_mtime_ns"))
@@ -329,6 +320,34 @@ def _mark_mainline_dates_processed(
         ),
         path,
     )
+
+
+def _mainline_coverage_frame(
+    data_dir: Path,
+    repo,
+    dates: set[date],
+    kinds: tuple[str, ...],
+) -> pl.DataFrame:
+    """构建指定交易日及维度的完整来源/成员版本水位。"""
+    if not dates or not kinds:
+        return pl.DataFrame(schema=_MAINLINE_COVERAGE_SCHEMA)
+    ordered_dates = sorted(dates)
+    frames: list[pl.DataFrame] = []
+    for kind in kinds:
+        membership_versions = _membership_versions_by_date(data_dir, kind, dates)
+        frames.append(pl.DataFrame({
+            "date": pl.Series(ordered_dates, dtype=pl.Date),
+            "kind": pl.Series([kind] * len(ordered_dates), dtype=pl.Utf8),
+            "source_mtime_ns": pl.Series(
+                [_enriched_partition_mtime_ns(repo, item) for item in ordered_dates],
+                dtype=pl.Int64,
+            ),
+            "membership_version": pl.Series(
+                [membership_versions[item][0] for item in ordered_dates],
+                dtype=pl.Utf8,
+            ),
+        }))
+    return pl.concat(frames).sort(["date", "kind"])
 
 
 def _remove_mainline_dates_processed(
@@ -385,14 +404,15 @@ def load_risk_warning_symbols(data_dir: Path) -> frozenset[str]:
 
 def load_mainline_history(data_dir: Path, kind: str = "concept") -> pl.DataFrame:
     """读取主线时序(全部 kind), 不存在返回空 DataFrame。"""
-    p = mainline_path(data_dir)
-    if not p.exists():
-        return pl.DataFrame()
-    try:
-        df = pl.read_parquet(p)
-    except Exception as e:
-        logger.warning("load_mainline_history failed: %s", e)
-        return pl.DataFrame()
+    with market_environment_snapshot(data_dir):
+        p = mainline_path(data_dir)
+        if not p.exists():
+            return pl.DataFrame()
+        try:
+            df = pl.read_parquet(p)
+        except Exception as e:
+            logger.warning("load_mainline_history failed: %s", e)
+            return pl.DataFrame()
     if df.is_empty() or "kind" not in df.columns:
         return df
     return df.filter(pl.col("kind") == kind)
@@ -643,8 +663,12 @@ def upsert_mainline_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
 def build_mainline_history_full_snapshot(
     data_dir: Path,
     rows_by_kind: dict[str, pl.DataFrame],
+    repo,
+    *,
+    start: date,
+    end: date,
 ) -> tuple[list[tuple[Path, pl.DataFrame]], int]:
-    """构建合并概念/行业结果与空完成水位的全量文件集合。"""
+    """构建合并概念/行业结果与逐日完整完成水位的全量文件集合。"""
     frames = [frame for frame in rows_by_kind.values() if not frame.is_empty()]
     if frames:
         combined = pl.concat(frames, how="vertical_relaxed").sort(
@@ -652,7 +676,19 @@ def build_mainline_history_full_snapshot(
         )
     else:
         combined = pl.DataFrame()
-    coverage = pl.DataFrame(schema=_MAINLINE_COVERAGE_SCHEMA)
+    from app.services.regime_builder import enriched_date_set
+
+    covered_dates = {
+        target_date
+        for target_date in enriched_date_set(repo)
+        if start <= target_date <= end
+    }
+    coverage = _mainline_coverage_frame(
+        data_dir,
+        repo,
+        covered_dates,
+        tuple(rows_by_kind),
+    )
     entries = [
         (mainline_path(data_dir), combined),
         (mainline_coverage_path(data_dir), coverage),
@@ -664,10 +700,23 @@ def build_mainline_history_full_snapshot(
 def replace_mainline_history_full(
     data_dir: Path,
     rows_by_kind: dict[str, pl.DataFrame],
+    repo,
+    *,
+    start: date,
+    end: date,
 ) -> int:
-    """原子发布合并后的概念/行业全量结果及空完成水位。"""
-    entries, rows = build_mainline_history_full_snapshot(data_dir, rows_by_kind)
-    replace_parquet_set(entries)
+    """原子发布合并后的概念/行业全量结果及逐日完成水位。"""
+    entries, rows = build_mainline_history_full_snapshot(
+        data_dir,
+        rows_by_kind,
+        repo,
+        start=start,
+        end=end,
+    )
+    replace_parquet_set(
+        entries,
+        journal_path=market_environment_journal_path(data_dir),
+    )
     return rows
 
 

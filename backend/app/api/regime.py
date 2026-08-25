@@ -15,7 +15,11 @@ from fastapi import APIRouter, Query, Request
 from app.market_time import cn_today
 from app.services import regime_builder
 from app.services.atomic_parquet import replace_parquet_set
-from app.services.market_environment_lock import serialized_market_environment_update
+from app.services.market_environment_lock import (
+    market_environment_journal_path,
+    market_environment_snapshot,
+    serialized_market_environment_update,
+)
 
 router = APIRouter(prefix="/api/regime", tags=["regime"])
 
@@ -227,12 +231,15 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
             market_mainline.build_mainline_history_full_snapshot(
                 data_dir,
                 mainline_results,
+                repo,
+                start=start,
+                end=end,
             )
         )
         replace_parquet_set([
             *regime_entries,
             *mainline_entries,
-        ])
+        ], journal_path=market_environment_journal_path(data_dir))
     else:
         mainline_rows = 0
         for kind, rows in mainline_results.items():
@@ -270,14 +277,14 @@ def regime_phases(
     from app.services.market_phase import PHASE_LABELS
 
     data_dir = _data_dir(request)
-    df = regime_builder.load_regime_history(data_dir)
-    if df.is_empty() or "phase" not in df.columns:
-        return {"segments": [], "total": 0}
-    df = _filter_history_window(df, start=start, end=end, limit=limit).sort("date")
-    if df.is_empty():
-        return {"segments": [], "total": 0}
-
-    mainline = load_mainline_history(data_dir, "concept")
+    with market_environment_snapshot(data_dir):
+        df = regime_builder.load_regime_history(data_dir)
+        if df.is_empty() or "phase" not in df.columns:
+            return {"segments": [], "total": 0}
+        df = _filter_history_window(df, start=start, end=end, limit=limit).sort("date")
+        if df.is_empty():
+            return {"segments": [], "total": 0}
+        mainline = load_mainline_history(data_dir, "concept")
 
     segments: list[dict] = []
     cur: dict | None = None
@@ -380,7 +387,13 @@ def mainline_recompute(request: Request):
         results[kind] = market_mainline.compute_mainline_range(
             repo, data_dir, earliest, business_today, kind=kind
         )
-    rows = market_mainline.replace_mainline_history_full(data_dir, results)
+    rows = market_mainline.replace_mainline_history_full(
+        data_dir,
+        results,
+        repo,
+        start=earliest,
+        end=business_today,
+    )
     return {"ok": True, "rows": rows}
 
 

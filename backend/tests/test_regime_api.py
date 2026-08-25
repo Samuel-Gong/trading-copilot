@@ -9,6 +9,7 @@ import polars as pl
 
 from app.api import regime
 from app.services import market_mainline, preferences
+from app.services.market_environment_lock import market_environment_snapshot
 
 
 def _request(tmp_path):
@@ -66,12 +67,16 @@ def test_recompute_defaults_to_cn_today_and_replaces_complete_ranges(
     monkeypatch.setattr(
         market_mainline,
         "build_mainline_history_full_snapshot",
-        lambda data_dir, rows_by_kind: (
+        lambda data_dir, rows_by_kind, repo, *, start, end: (
             [],
             sum(frame.height for frame in rows_by_kind.values()),
         ),
     )
-    monkeypatch.setattr(regime, "replace_parquet_set", lambda entries: None)
+    monkeypatch.setattr(
+        regime,
+        "replace_parquet_set",
+        lambda entries, **kwargs: None,
+    )
 
     regime.regime_recompute(_request(tmp_path))
     regime.mainline_recompute(_request(tmp_path))
@@ -165,9 +170,14 @@ def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monke
         regime.regime_builder.regime_coverage_path(tmp_path),
     )
     assert set(stored_regime_coverage["date"].to_list()) == {new_earliest}
-    assert pl.read_parquet(
+    stored_mainline_coverage = pl.read_parquet(
         market_mainline.mainline_coverage_path(tmp_path),
-    ).is_empty()
+    )
+    assert set(stored_mainline_coverage["date"].to_list()) == {new_earliest}
+    assert set(stored_mainline_coverage["kind"].to_list()) == {
+        "concept",
+        "industry",
+    }
 
 
 def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
@@ -258,6 +268,57 @@ def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
     assert not pipeline_thread.is_alive()
     assert not manual_thread.is_alive()
     assert errors == []
+
+
+def test_regime_phases_waits_for_market_environment_snapshot(tmp_path, monkeypatch):
+    """阶段与主线组合读取不得穿过整组发布边界。"""
+    target = date(2026, 8, 25)
+    history = pl.DataFrame({
+        "date": [target],
+        "phase": ["rally"],
+        "max_consecutive": [3],
+        "first_board": [8],
+        "ge2_count": [2],
+        "promo_rate": [0.2],
+        "seal_rate": [0.6],
+    })
+    publisher_entered = threading.Event()
+    release_publisher = threading.Event()
+    reader_entered = threading.Event()
+    result: list[dict] = []
+
+    def load_regime(data_dir):
+        reader_entered.set()
+        return history
+
+    monkeypatch.setattr(regime.regime_builder, "load_regime_history", load_regime)
+    monkeypatch.setattr(
+        market_mainline,
+        "load_mainline_history",
+        lambda data_dir, kind: pl.DataFrame(),
+    )
+
+    def hold_publish_boundary() -> None:
+        with market_environment_snapshot(tmp_path):
+            publisher_entered.set()
+            assert release_publisher.wait(2)
+
+    publisher = threading.Thread(target=hold_publish_boundary)
+    reader = threading.Thread(
+        target=lambda: result.append(regime.regime_phases(_request(tmp_path))),
+    )
+    publisher.start()
+    assert publisher_entered.wait(1)
+    reader.start()
+    blocked = not reader_entered.wait(0.2)
+    release_publisher.set()
+    publisher.join(2)
+    reader.join(2)
+
+    assert blocked
+    assert not publisher.is_alive()
+    assert not reader.is_alive()
+    assert result[0]["segments"][0]["phase"] == "rally"
 
 
 def test_regime_phases_limit_uses_latest_trading_days(tmp_path, monkeypatch):
