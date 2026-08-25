@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 import uuid
 from collections.abc import Collection, Mapping
@@ -422,6 +423,17 @@ class MiningRunStore:
                 self._transition_locked(manifest, "interrupted", error=None)
                 recovered += 1
         return recovered
+
+    def clear_runs(self) -> int:
+        """清除全部挖掘运行，并返回删除的 Parquet 产物数。"""
+        with _STORE_LOCK:
+            parquet_count = sum(
+                1 for path in self.runs_root.rglob("*.parquet") if path.is_file()
+            )
+            if self.runs_root.exists():
+                shutil.rmtree(self.runs_root)
+            self.runs_root.mkdir(parents=True, exist_ok=True)
+        return parquet_count
 
     def _transition_locked(
         self,

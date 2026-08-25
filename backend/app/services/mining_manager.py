@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app.backtest.worker import make_worker_task, run_worker_task
 from app.services.heavy_job_limiter import (
@@ -47,6 +48,7 @@ class MiningJobManager:
         self._threads: dict[str, threading.Thread] = {}
         self._cancel_events: dict[str, threading.Event] = {}
         self._shutdown = False
+        self._clearing = False
 
     @property
     def store(self) -> MiningRunStore:
@@ -64,6 +66,8 @@ class MiningJobManager:
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("mining job manager is shut down")
+            if self._clearing:
+                raise RuntimeError("mining runs are being cleared")
             if not force:
                 active = self._store.find_by_signature(
                     signature,
@@ -142,6 +146,35 @@ class MiningJobManager:
 
     def recover_interrupted(self) -> int:
         return self._store.recover_interrupted()
+
+    @contextmanager
+    def clearing_runs(self) -> Iterator[MiningRunStore]:
+        """在阻止新任务并取消、等待现有 worker 后进入清库区间。"""
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("mining job manager is shut down")
+            if self._clearing:
+                raise RuntimeError("mining runs are already being cleared")
+            self._clearing = True
+            workers = list(self._threads.items())
+
+        try:
+            for run_id, _thread in workers:
+                self.cancel(run_id)
+            current = threading.current_thread()
+            for _run_id, thread in workers:
+                if thread is current:
+                    raise RuntimeError("mining worker cannot clear its own run store")
+                thread.join()
+            yield self._store
+        finally:
+            with self._lock:
+                self._clearing = False
+
+    def clear_runs(self) -> int:
+        """取消并等待 worker，再清除全部运行产物。"""
+        with self.clearing_runs() as store:
+            return store.clear_runs()
 
     def _start_thread_locked(self, run_id: str, source: str) -> None:
         if run_id in self._threads:

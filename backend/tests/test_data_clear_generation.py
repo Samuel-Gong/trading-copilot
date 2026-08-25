@@ -14,6 +14,7 @@ from app.enriched_generation import (
     EnrichedGenerationUnavailableError,
     get_enriched_generation,
 )
+from app.services.mining_jobs import MiningRunStore
 
 
 class _RepoStub:
@@ -117,6 +118,29 @@ def test_clear_data_removes_regime_mainline_history_and_invalidates_cache(
     assert result == {"deleted_files": 3}
     assert all(not target.exists() for target in targets)
     assert invalidations == [None]
+
+
+def test_clear_data_removes_mining_runs_and_parquet_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_clear_side_effects(monkeypatch)
+    repo = _RepoStub(tmp_path)
+    store = MiningRunStore(tmp_path)
+    manifest = store.create(
+        {"factor_names": ["momentum"]},
+        "data-v1",
+        run_id="clear_me",
+    )
+    artifact = store.artifact_path(manifest["run_id"], "factors")
+    _write_parquet_placeholder(artifact)
+    store.register_artifact(manifest["run_id"], "factors", artifact)
+
+    result = data_api.clear_data(_request(repo))
+
+    assert result == {"deleted_files": 1}
+    assert not artifact.exists()
+    assert store.list_runs() == []
 
 
 def test_clear_data_restores_ready_generation_when_first_delete_fails(

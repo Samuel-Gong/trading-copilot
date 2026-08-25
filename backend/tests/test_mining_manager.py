@@ -256,6 +256,38 @@ def test_cancel_running_job_wins_over_worker_success(make_manager) -> None:
     assert manager.store.read_summary(run_id) == {}
 
 
+def test_clear_runs_cancels_worker_removes_history_and_allows_new_runs(
+    make_manager,
+) -> None:
+    runner_started = threading.Event()
+    cancel_observed = threading.Event()
+    calls = 0
+
+    def runner(task, progress_cb, cancel_event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            runner_started.set()
+            assert cancel_event.wait(2)
+            cancel_observed.set()
+        return {"status": "succeeded"}
+
+    manager = make_manager(runner)
+    created = manager.start({"factor_names": ["growth"]}, "data-v1")
+    assert runner_started.wait(1)
+    artifact = manager.store.artifact_path(created["run_id"], "factors")
+    artifact.write_bytes(b"parquet-placeholder")
+    manager.store.register_artifact(created["run_id"], "factors", artifact)
+
+    assert manager.clear_runs() == 1
+
+    assert cancel_observed.is_set()
+    assert manager.store.list_runs() == []
+    assert not artifact.exists()
+    restarted = manager.start({"factor_names": ["value"]}, "data-v2")
+    _wait_for_status(manager, restarted["run_id"], "succeeded")
+
+
 def test_runner_exception_marks_failed_and_appends_error_event(make_manager) -> None:
     def runner(task, progress_cb, cancel_event):
         raise RuntimeError("mining exploded")

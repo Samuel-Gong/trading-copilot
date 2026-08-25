@@ -313,6 +313,29 @@ def _mark_mainline_dates_processed(
     ).write_parquet(path)
 
 
+def _remove_mainline_dates_processed(
+    data_dir: Path,
+    kind: str,
+    dates: set[date],
+) -> None:
+    """删除已失去 enriched 来源的主线完成水位。"""
+    if not dates:
+        return
+    path = mainline_coverage_path(data_dir)
+    if not path.exists():
+        return
+    frame = pl.read_parquet(path)
+    if frame.is_empty() or not {"date", "kind"}.issubset(frame.columns):
+        return
+    kept = frame.filter(
+        ~(
+            (pl.col("kind") == kind)
+            & pl.col("date").is_in(sorted(dates))
+        )
+    )
+    kept.write_parquet(path)
+
+
 _ST_SYMBOLS_CACHE: tuple[float, frozenset[str]] | None = None
 
 
@@ -667,15 +690,19 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         d for d in _stale_mainline_dates(data_dir, repo, kind, completed_dates)
         if d in enriched_dates and d <= today
     )
-    to_compute = sorted(set(missing) | set(stale))
+    removed = sorted(
+        d for d in completed_dates if d not in enriched_dates and d <= today
+    )
+    to_compute = sorted(set(missing) | set(stale) | set(removed))
     if not to_compute:
         return pl.DataFrame()
     logger.info(
-        "mainline incremental(%s): compute %d days (missing=%d, stale=%d)",
+        "mainline incremental(%s): compute %d days (missing=%d, stale=%d, removed=%d)",
         kind,
         len(to_compute),
         len(missing),
         len(stale),
+        len(removed),
     )
     new_rows = compute_mainline_range(
         repo,
@@ -691,5 +718,11 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         end=to_compute[-1],
         kind=kind,
     )
-    _mark_mainline_dates_processed(data_dir, repo, kind, set(to_compute))
+    _remove_mainline_dates_processed(data_dir, kind, set(removed))
+    _mark_mainline_dates_processed(
+        data_dir,
+        repo,
+        kind,
+        set(to_compute) & enriched_dates,
+    )
     return new_rows

@@ -638,10 +638,51 @@ def trading_dates(request: Request) -> dict:
     }
 
 
+def _clear_parquet_directories(
+    data_dir: Path,
+    publications: dict[str, EnrichedPublication],
+) -> int:
+    """清除受管理的数据目录，并维持 enriched generation 发布语义。"""
+    import shutil
+
+    deleted = 0
+    for sub in (
+        "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
+        "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
+        "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
+        "backtest_results", "screener_results", "ai_cache", "regime_history", "mainline_history",
+    ):
+        directory = data_dir / sub
+        if not directory.exists():
+            continue
+        publication = publications.get(sub)
+        parquet_files = list(directory.rglob("*.parquet"))
+        if publication is not None and parquet_files:
+            publication.begin()
+        try:
+            for file_path in parquet_files:
+                file_path.unlink()
+                deleted += 1
+                if publication is not None:
+                    publication.mark_changed()
+            for child in list(directory.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+            if publication is not None:
+                publication.commit()
+        except BaseException:
+            if publication is not None:
+                publication.abandon()
+            raise
+    return deleted
+
+
 @router.post("/clear")
 def clear_data(request: Request):
     """清除所有本地 Parquet 数据（保留 capabilities.json 和目录结构）。"""
-    import shutil
+    from contextlib import nullcontext
+
+    from app.services.mining_jobs import MiningRunStore
 
     repo = request.app.state.repo
     data_dir = repo.store.data_dir
@@ -651,34 +692,17 @@ def clear_data(request: Request):
         "kline_etf_enriched": EnrichedPublication(data_dir, "etf", recover=True),
     }
 
-    for sub in (
-        "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
-        "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
-        "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
-        "backtest_results", "screener_results", "ai_cache", "regime_history", "mainline_history",
-    ):
-        d = data_dir / sub
-        if not d.exists():
-            continue
-        publication = publications.get(sub)
-        parquet_files = list(d.rglob("*.parquet"))
-        if publication is not None and parquet_files:
-            publication.begin()
-        try:
-            for f in parquet_files:
-                f.unlink()
-                deleted += 1
-                if publication is not None:
-                    publication.mark_changed()
-            for child in list(d.iterdir()):
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-            if publication is not None:
-                publication.commit()
-        except BaseException:
-            if publication is not None:
-                publication.abandon()
-            raise
+    # 在整个 Parquet 删除区间阻止新挖掘任务，并先取消、等待现有 worker；避免
+    # worker 与清库并发读写，也避免清库后旧 manifest/结果仍可由 API 读取。
+    mining_manager = getattr(request.app.state, "mining_manager", None)
+    if mining_manager is not None:
+        mining_clear_scope = mining_manager.clearing_runs()
+    else:
+        mining_clear_scope = nullcontext(MiningRunStore(data_dir))
+
+    with mining_clear_scope as mining_store:
+        deleted += _clear_parquet_directories(data_dir, publications)
+        deleted += mining_store.clear_runs()
 
     # 清除同步历史（内存 + 磁盘 job_store/ 文件夹）
     from app.services.pipeline_jobs import job_store

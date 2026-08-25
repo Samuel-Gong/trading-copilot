@@ -363,6 +363,42 @@ class TestComputeMainline:
         stored = market_mainline.load_mainline_history(tmp_path, "concept")
         assert set(stored["date"].to_list()) == {d1}
 
+    def test_incremental_clears_rows_and_coverage_for_deleted_enriched_date(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """来源分区被删除后，旧主线结果与完成水位都必须清除。"""
+        repo, d1, d2 = self._setup(tmp_path, monkeypatch)
+        initial = market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+        assert set(initial["date"].to_list()) == {d1, d2}
+
+        deleted = (
+            tmp_path / "kline_daily_enriched" / f"date={d2.isoformat()}" / "part.parquet"
+        )
+        deleted.unlink()
+
+        refreshed = market_mainline.compute_mainline_incremental(
+            repo,
+            tmp_path,
+            today=d2,
+            kind="concept",
+        )
+
+        assert refreshed.is_empty()
+        stored = market_mainline.load_mainline_history(tmp_path, "concept")
+        assert set(stored["date"].to_list()) == {d1}
+        coverage = pl.read_parquet(market_mainline.mainline_coverage_path(tmp_path))
+        concept_dates = set(
+            coverage.filter(pl.col("kind") == "concept")["date"].to_list()
+        )
+        assert concept_dates == {d1}
+
     def test_industry_level_truncation(self, tmp_path, monkeypatch):
         d1 = date(2024, 1, 2)
         rows = _mk_rows(d1, [("S1.SH", 2, 5e8), ("S2.SH", 1, 1e8),
