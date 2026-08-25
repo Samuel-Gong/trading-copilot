@@ -40,3 +40,14 @@ test('阶段与主线查询把最近交易日 limit 传到 API 和缓存键', as
   assert.match(queryKeys, /regimePhases:\s+\(start\?: string, end\?: string, limit\?: number\)/)
   assert.match(queryKeys, /regimeMainline:\s+\(kind: string, start\?: string, end\?: string, limit\?: number\)/)
 })
+
+
+test('缺少时点化风险警示数据时不展示无效 ST 过滤开关', async () => {
+  const regime = await readFile(new URL('../src/pages/Regime.tsx', import.meta.url), 'utf8')
+  const api = await readFile(new URL('../src/lib/api.ts', import.meta.url), 'utf8')
+  const panel = regime.match(/function MainlineFilterPanel[\s\S]*?function CustomDaysModal/)
+
+  assert.ok(panel, '应能定位主线过滤设置面板')
+  assert.doesNotMatch(panel[0], /excludeSt|统计剔除 ST 股|主线与情绪周期已全量重算/)
+  assert.doesNotMatch(api, /mainlineFilterUpdate: \(payload: \{[^}]*exclude_st/)
+})

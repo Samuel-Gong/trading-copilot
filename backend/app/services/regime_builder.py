@@ -438,12 +438,16 @@ def run_regime_batch(repo, start: date, end: date) -> pl.DataFrame:
     if start > end:
         return pl.DataFrame()
 
+    available_dates = enriched_date_set(repo)
+    target_dates = sorted(d for d in available_dates if start <= d <= end)
+    if not target_dates:
+        return pl.DataFrame()
+
     # 指数涨幅(主力指数)
     index_pct_map = _load_index_pct(repo, start, end)
 
     # 晋级率依赖上一交易日连板池。缓存快路径也必须带一个交易日前缀，不能只取
     # 目标日；优先从分区目录精确定位，目录不可用时多取 45 个日历日并让缓存裁剪。
-    available_dates = enriched_date_set(repo)
     previous_date = max((value for value in available_dates if value < start), default=None)
     cache_start = previous_date or (start - timedelta(days=45))
 
@@ -454,6 +458,14 @@ def run_regime_batch(repo, start: date, end: date) -> pl.DataFrame:
         df = _scan_enriched_fallback(repo, start, end)
     if df is None or df.is_empty():
         logger.info("regime batch: no enriched data for [%s~%s]", start, end)
+        return pl.DataFrame()
+    allowed_dates = set(target_dates)
+    if previous_date is not None:
+        allowed_dates.add(previous_date)
+    if "date" in df.columns:
+        # 缓存可能仍含已删除分区；只允许磁盘上仍存在的交易日参与本次聚合。
+        df = df.filter(pl.col("date").cast(pl.Date).is_in(sorted(allowed_dates)))
+    if df.is_empty():
         return pl.DataFrame()
 
     # 当前 instruments 名称没有历史生效日期，不能用一个当前 ST 集合过滤整段历史。
@@ -662,16 +674,17 @@ def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = Non
     existing_dates = set(existing["date"].to_list()) if not existing.is_empty() else set()
     missing = sorted(d for d in enriched_dates if d not in existing_dates and d <= today)
 
-    # stale: enriched 覆写过
+    # stale: enriched 覆写过；removed: 已有历史对应的来源分区被删除。
     stale = detect_stale_dates(data_dir, repo)
+    removed = sorted(d for d in existing_dates - enriched_dates if d <= today)
 
-    to_compute = sorted(set(missing) | set(stale))
+    to_compute = sorted(set(missing) | set(stale) | set(removed))
     if not to_compute:
         logger.debug("regime incremental: nothing to compute")
         return pl.DataFrame()
 
-    logger.info("regime incremental: compute %d days (missing=%d, stale=%d)",
-                len(to_compute), len(missing), len(stale))
+    logger.info("regime incremental: compute %d days (missing=%d, stale=%d, removed=%d)",
+                len(to_compute), len(missing), len(stale), len(removed))
     new_rows = run_regime_batch(repo, start=to_compute[0], end=to_compute[-1])
     replace_regime_history_range(
         data_dir,

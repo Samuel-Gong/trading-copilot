@@ -2834,7 +2834,7 @@ export const api = {
   },
   regimeMainlineRecompute: () =>
     request<{ ok: boolean; rows: number }>('/api/regime/mainline/recompute', { method: 'POST' }),
-  mainlineFilterUpdate: (payload: { min_members?: number; max_members?: number; blacklist?: string[]; exclude_st?: boolean }) =>
+  mainlineFilterUpdate: (payload: { min_members?: number; max_members?: number; blacklist?: string[] }) =>
     request<MainlineFilter>('/api/settings/preferences/mainline-filter', {
       method: 'PUT',
       body: JSON.stringify(payload),

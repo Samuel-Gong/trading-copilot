@@ -1,7 +1,7 @@
 """异动边缘统计测试 — 偏离列附着 + 规则口径 + 快照接近度。"""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import polars as pl
 
@@ -12,6 +12,7 @@ from app.indicators.pipeline import (
     load_benchmark_momentum,
 )
 from app.market_time import cn_today
+from app.services import index_sync
 from app.services.abnormal_moves import (
     _hist_cache,
     _hist_cache_lock,
@@ -20,6 +21,8 @@ from app.services.abnormal_moves import (
     is_st_name,
     rule_for,
 )
+from app.tickflow.capabilities import Cap, CapabilityLimits, CapabilitySet
+from app.tickflow.repository import DataStore, KlineRepository
 
 
 def _write_index_daily(tmp_path, rows: list[tuple[str, date, float]]) -> None:
@@ -191,6 +194,43 @@ def test_load_benchmark_momentum_does_not_crossfill_missing_sz(tmp_path) -> None
     frame = load_benchmark_momentum(tmp_path)
 
     assert "SZ" not in set(frame["bench_exchange"].to_list())
+
+
+def test_index_sync_invalidates_cached_missing_benchmark(tmp_path, monkeypatch) -> None:
+    """指数日 K 成功落盘后，先前缓存的缺失结果必须立即失效。"""
+    assert load_benchmark_momentum(tmp_path) is None
+
+    days = [date(2026, 8, 11) + timedelta(days=i) for i in range(6)]
+    raw = pl.DataFrame({
+        "symbol": ["000001.SH"] * len(days),
+        "date": days,
+        "open": [10.0 + i for i in range(len(days))],
+        "high": [10.5 + i for i in range(len(days))],
+        "low": [9.5 + i for i in range(len(days))],
+        "close": [10.0 + i for i in range(len(days))],
+        "volume": [1000] * len(days),
+        "amount": [10000.0] * len(days),
+    })
+    repo = KlineRepository(DataStore(tmp_path))
+    capset = CapabilitySet({
+        Cap.KLINE_DAILY_BATCH: CapabilityLimits(batch=100),
+    })
+    monkeypatch.setattr(index_sync.kline_sync, "sync_daily_batch", lambda *a, **k: raw)
+    monkeypatch.setattr(index_sync, "compute_enriched", lambda frame, **k: frame)
+    monkeypatch.setattr(repo, "refresh_index_views", lambda: None)
+
+    written = index_sync.sync_and_persist_index_daily(
+        repo,
+        capset,
+        start_date=datetime(2026, 8, 11),
+        end_date=datetime(2026, 8, 16),
+        symbols_override=["000001.SH"],
+    )
+
+    assert written == len(days)
+    refreshed = load_benchmark_momentum(tmp_path)
+    assert refreshed is not None
+    assert refreshed.filter(pl.col("bench_exchange") == "SH").height == len(days)
 
 
 def test_board_and_st_rules() -> None:

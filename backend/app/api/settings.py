@@ -1006,7 +1006,7 @@ class PipelineIndexSymbolsIn(BaseModel):
 
 
 class MainlineFilterIn(BaseModel):
-    """市场主线过滤配置(宽基/风格标签按成员数过滤 + 名称黑名单 + ST 剔除开关)。"""
+    """市场主线过滤配置；exclude_st 仅用于拒绝旧客户端的无效写入。"""
 
     min_members: int | None = None
     max_members: int | None = None
@@ -1016,13 +1016,15 @@ class MainlineFilterIn(BaseModel):
 
 @router.put("/preferences/mainline-filter")
 def update_mainline_filter(req: MainlineFilterIn) -> dict:
-    """更新市场主线过滤配置。部分更新; 修改后需重算主线(POST /api/regime/mainline/recompute)生效。
-
-    exclude_st 同步控制市场环境(regime)统计口径 — 切换后需全量重算 regime。
-    """
+    """更新市场主线过滤配置；历史 ST 过滤在具备时点化状态前 fail-closed。"""
     from app.services import preferences
 
-    payload = req.model_dump()
+    if req.exclude_st is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="历史风险警示状态尚无 point-in-time 数据，暂不支持修改 ST 过滤口径",
+        )
+    payload = req.model_dump(exclude={"exclude_st"})
     return preferences.set_mainline_filter_config(payload)
 
 

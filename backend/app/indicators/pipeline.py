@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1053,7 +1054,17 @@ _BENCHMARK_PREFERENCE: dict[str, list[str]] = {
 }
 
 _benchmark_cache: dict[str, tuple[float, pl.DataFrame | None]] = {}
+_benchmark_cache_generation: dict[str, int] = {}
+_benchmark_cache_lock = threading.Lock()
 _BENCHMARK_CACHE_TTL = 600.0
+
+
+def invalidate_benchmark_momentum_cache(data_dir: Path) -> None:
+    """指数日 K 写入后失效对应目录的基准动量缓存。"""
+    key = str(Path(data_dir).resolve())
+    with _benchmark_cache_lock:
+        _benchmark_cache.pop(key, None)
+        _benchmark_cache_generation[key] = _benchmark_cache_generation.get(key, 0) + 1
 
 
 def load_benchmark_momentum(data_dir: Path) -> pl.DataFrame | None:
@@ -1068,7 +1079,9 @@ def load_benchmark_momentum(data_dir: Path) -> pl.DataFrame | None:
 
     now = _time.monotonic()
     key = str(Path(data_dir).resolve())
-    cached = _benchmark_cache.get(key)
+    with _benchmark_cache_lock:
+        generation = _benchmark_cache_generation.get(key, 0)
+        cached = _benchmark_cache.get(key)
     if cached is not None and now - cached[0] < _BENCHMARK_CACHE_TTL:
         return cached[1]
 
@@ -1123,7 +1136,10 @@ def load_benchmark_momentum(data_dir: Path) -> pl.DataFrame | None:
         logger.warning("基准指数偏离数据加载失败: %s", exc)
         frame = None
 
-    _benchmark_cache[key] = (now, frame)
+    with _benchmark_cache_lock:
+        # 指数写入可能与本次磁盘扫描并发；失效后不得把旧扫描结果重新放回缓存。
+        if _benchmark_cache_generation.get(key, 0) == generation:
+            _benchmark_cache[key] = (now, frame)
     return frame
 
 

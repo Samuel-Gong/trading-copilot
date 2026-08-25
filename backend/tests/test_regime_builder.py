@@ -156,6 +156,10 @@ def test_run_regime_batch_does_not_apply_current_st_snapshot(tmp_path, monkeypat
     monkeypatch.setattr(market_mainline, "_ST_SYMBOLS_CACHE", None)
     monkeypatch.setattr(preferences, "get_sentiment_exclude_st", lambda: True)
     monkeypatch.setattr(regime_builder, "_load_index_pct", lambda *a, **k: {})
+    for target in (date(2026, 1, 2), date(2026, 1, 3)):
+        part = tmp_path / "kline_daily_enriched" / f"date={target.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"cache-fixture")
 
     class _FakeRepo:
         class store:
@@ -429,6 +433,59 @@ def test_compute_incremental_clears_stale_date_when_recompute_is_empty(
     assert result.is_empty()
     stored = regime_builder.load_regime_history(tmp_path)
     assert set(stored["date"].to_list()) == {d1}
+
+
+def test_compute_incremental_clears_deleted_enriched_date(
+    tmp_path,
+    monkeypatch,
+):
+    """来源分区被删除后，增量计算必须清除对应的旧 regime 行。"""
+    d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+    part = tmp_path / "kline_daily_enriched" / f"date={d1.isoformat()}" / "part.parquet"
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"source")
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2],
+        "state": ["range", "strong"],
+        "score": [50, 80],
+    }))
+    calls: list[tuple[date, date]] = []
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda repo, start, end: calls.append((start, end)) or pl.DataFrame(),
+    )
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    result = regime_builder.compute_regime_incremental(
+        _FakeRepo(),
+        tmp_path,
+        today=d2,
+    )
+
+    assert result.is_empty()
+    assert calls == [(d2, d2)]
+    stored = regime_builder.load_regime_history(tmp_path)
+    assert set(stored["date"].to_list()) == {d1}
+
+
+def test_run_regime_batch_ignores_cached_deleted_target(tmp_path):
+    """磁盘分区已删除时，不得从仍含旧日数据的仓库缓存重建 regime。"""
+    target = date(2026, 1, 2)
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+        def get_enriched_range(self, start, end):
+            raise AssertionError("删除日期不应继续读取 enriched 缓存")
+
+    result = regime_builder.run_regime_batch(_FakeRepo(), target, target)
+
+    assert result.is_empty()
 
 
 # ───────────────────────── 回测环境过滤(T-1 防未来函数) ─────────────────────────
