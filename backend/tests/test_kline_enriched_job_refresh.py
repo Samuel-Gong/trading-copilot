@@ -13,6 +13,7 @@ from app.services.enriched_job import (
     EnrichedRepositoryRefreshError,
     run_enriched_job_with_repository_refresh,
 )
+from app.tickflow import repository as repository_module
 from app.tickflow.repository import DataStore, KlineRepository
 
 
@@ -28,9 +29,9 @@ class _Repo:
     def refresh_cache(
         self,
         *,
-        enriched_wait_timeout: float | None = None,
+        enriched_wait_deadline: float | None = None,
     ) -> str:
-        assert enriched_wait_timeout is not None
+        assert enriched_wait_deadline is not None
         self.events.append("refresh")
         return self.generation
 
@@ -174,8 +175,8 @@ def test_refresh_exhaustion_keeps_realtime_paused(monkeypatch) -> None:
     quotes = _QuoteService(events)
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 0.0)
 
-    def refresh_cache(*, enriched_wait_timeout: float | None = None) -> str:
-        assert enriched_wait_timeout == 0.0
+    def refresh_cache(*, enriched_wait_deadline: float | None = None) -> str:
+        assert enriched_wait_deadline is not None
         events.append("refresh")
         raise OSError("injected refresh failure")
 
@@ -204,9 +205,9 @@ def test_transient_refresh_failure_retries_before_realtime_resumes(
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_WAIT_SECONDS", 1.0)
     monkeypatch.setattr(enriched_job, "_REPOSITORY_REFRESH_POLL_SECONDS", 0.0)
 
-    def refresh_cache(*, enriched_wait_timeout: float | None = None) -> str:
+    def refresh_cache(*, enriched_wait_deadline: float | None = None) -> str:
         nonlocal attempts
-        assert enriched_wait_timeout is not None
+        assert enriched_wait_deadline is not None
         attempts += 1
         events.append("refresh")
         if attempts == 1:
@@ -332,3 +333,35 @@ def test_refresh_lock_timeout_keeps_realtime_paused(
     assert isinstance(captured.value.refresh_error, TimeoutError)
     assert events == ["pause", "publish"]
     assert quotes.is_paused is True
+
+
+def test_refresh_deadline_deducts_instrument_refresh_time(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repo = KlineRepository(DataStore(tmp_path))
+    clock = [100.0]
+    lock_timeouts: list[float] = []
+
+    class UnavailableLock:
+        def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+            assert blocking is True
+            lock_timeouts.append(timeout)
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("未获取刷新锁时不应释放")
+
+    def refresh_instruments() -> None:
+        clock[0] = 130.0
+
+    monkeypatch.setattr(repository_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(repo, "_refresh_instruments", refresh_instruments)
+    monkeypatch.setattr(repo, "_refresh_index_instruments", lambda: None)
+    monkeypatch.setattr(repo, "_refresh_etf_instruments", lambda: None)
+    monkeypatch.setattr(repo, "_enriched_refresh_lock", UnavailableLock())
+
+    with pytest.raises(TimeoutError, match="快照刷新超时"):
+        repo.refresh_cache(enriched_wait_deadline=130.0)
+
+    assert lock_timeouts == [0.0]
