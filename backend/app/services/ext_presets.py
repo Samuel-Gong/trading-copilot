@@ -22,6 +22,7 @@ from pathlib import Path
 from app.market_time import cn_today
 from app.services.ext_data import (
     ExtConfig,
+    ExtConfigChangedError,
     ExtConfigStore,
     ExtField,
     PullConfig,
@@ -245,7 +246,7 @@ async def ensure_builtin_presets(data_dir: Path) -> None:
             # 用户已有此表 (老用户 / 自己重建过) → 一律不动
             continue
         try:
-            store.upsert(config)
+            store.create(config)
             logger.info("内置扩展表 %s 配置已就绪 (待用户手动获取数据)", config.id)
         except Exception as e:
             logger.warning("内置扩展表 %s 配置写入失败 (不影响启动): %s", config.id, e)
@@ -258,16 +259,23 @@ async def fetch_preset(config_id: str, data_dir: Path) -> int:
         ValueError: config_id 不是内置预设
         Exception: 网络请求/解析/写入失败 (由 API 层转 HTTP 错误)
     """
-    config = get_preset(config_id)
-    if config is None:
+    preset = get_preset(config_id)
+    if preset is None:
         raise ValueError(f"未知的内置预设: {config_id}")
 
     flatten = _flatten_concept_rows if config_id == "ext_gn_ths" else _flatten_industry_rows
 
     # 确保 config.json 存在 (用户可能从未启动过 ensure_builtin_presets)
     store = ExtConfigStore(data_dir)
-    if store.get(config_id) is None:
-        store.upsert(config)
+    config = store.get(config_id)
+    if config is None:
+        try:
+            store.create(preset)
+            config = preset
+        except ExtConfigChangedError:
+            config = store.get(config_id)
+            if config is None:
+                raise
 
     n = await _seed_one(config, flatten, data_dir)
     logger.info("内置扩展表 %s 手动拉取成功: %d 行", config_id, n)

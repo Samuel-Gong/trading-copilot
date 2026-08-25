@@ -328,6 +328,8 @@ async def fetch_preset_data(request: Request, config_id: str):
 
     try:
         n = await fetch_preset(config_id, _data_dir(request))
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(404, str(e)) from e
     except Exception as e:
@@ -352,7 +354,10 @@ def create_config(request: Request, body: CreateExtReq):
         symbol_map=body.symbol_map,
         code_map=body.code_map,
     )
-    store.upsert(config)
+    try:
+        store.create(config)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     return config.to_dict()
 
 
@@ -373,7 +378,10 @@ def update_config(request: Request, config_id: str, body: UpdateExtReq):
         config.symbol_map = body.symbol_map
     if body.code_map is not None:
         config.code_map = body.code_map
-    store.upsert(config)
+    try:
+        store.update(config)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     return config.to_dict()
 
 
@@ -630,7 +638,10 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         last_message=old_pull.last_message if old_pull else None,
         last_rows=old_pull.last_rows if old_pull else None,
     )
-    store.upsert(config)
+    try:
+        store.update(config)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
 
     # 刷新调度器
     pull_scheduler.refresh(_data_dir(request))
@@ -640,7 +651,7 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         cleared = store.get(config_id)
         if cleared and cleared.pull and cleared.pull.next_run:
             cleared.pull.next_run = None
-            store.upsert(cleared)
+            store.update(cleared)
 
     return {"status": "ok", "pull": config.pull.to_dict()}
 
@@ -705,7 +716,7 @@ async def run_pull(request: Request, config_id: str):
             updated.pull.last_status = "success"
             updated.pull.last_message = f"{n} rows @ {d}"
             updated.pull.last_rows = n
-            store.upsert(updated)
+            store.update(updated)
         return {"status": "ok", "rows": n, "date": d}
     except Exception as e:
         # 失败也写回状态, 记录错误信息
@@ -715,7 +726,7 @@ async def run_pull(request: Request, config_id: str):
             failed.pull.last_run = datetime.now(timezone.utc).isoformat()
             failed.pull.last_status = "error"
             failed.pull.last_message = str(e)[:200]
-            store.upsert(failed)
+            store.update(failed)
         raise HTTPException(400, f"拉取失败: {e}") from e
 
 

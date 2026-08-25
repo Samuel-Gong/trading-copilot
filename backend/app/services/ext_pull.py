@@ -309,7 +309,7 @@ class PullScheduler:
                     fresh.pull.next_run = datetime.fromtimestamp(
                         next_dt, tz=timezone.utc
                     ).isoformat()
-                    store.upsert(fresh)
+                    store.update(fresh)
                     logger.info("PullScheduler: %s skipped (outside time window)", config.id)
                     await asyncio.sleep(interval)
                     continue
@@ -321,7 +321,7 @@ class PullScheduler:
                     fresh.pull.last_status = "success"
                     fresh.pull.last_message = f"{n} rows @ {d}"
                     fresh.pull.last_rows = n
-                    store.upsert(fresh)
+                    store.update(fresh)
                     logger.info("PullScheduler: %s success, %d rows", config.id, n)
                 except Exception as e:
                     fresh2 = store.get(config.id)
@@ -329,7 +329,7 @@ class PullScheduler:
                         fresh2.pull.last_run = datetime.now(timezone.utc).isoformat()
                         fresh2.pull.last_status = "error"
                         fresh2.pull.last_message = str(e)[:200]
-                        store.upsert(fresh2)
+                        store.update(fresh2)
                     logger.warning("PullScheduler: %s error: %s", config.id, e)
 
                 # 间隔取自最新配置 (每次重新读取, 修复改间隔不生效)
@@ -341,7 +341,7 @@ class PullScheduler:
                     latest.pull.next_run = datetime.fromtimestamp(
                         next_dt, tz=timezone.utc
                     ).isoformat()
-                    store.upsert(latest)
+                    store.update(latest)
 
                 await asyncio.sleep(interval)
                 if not self._running:

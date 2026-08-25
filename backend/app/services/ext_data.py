@@ -307,16 +307,40 @@ class ExtConfigStore:
         except Exception:
             return None
 
-    def upsert(self, config: ExtConfig) -> None:
+    def _write_locked(self, config: ExtConfig) -> None:
+        config.updated_at = datetime.now().isoformat()
+        cp = self._config_path(config.id)
+        _atomic_write_text(
+            cp,
+            json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        config._storage_revision = config.updated_at
+
+    def create(self, config: ExtConfig) -> None:
+        """仅在 id 尚不存在时创建配置。"""
         with _ext_data_lock(config.id, self._base.parent):
-            config.updated_at = datetime.now().isoformat()
             cp = self._config_path(config.id)
-            _atomic_write_text(
-                cp,
-                json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            config._storage_revision = config.updated_at
+            if cp.exists():
+                raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已存在")
+            self._write_locked(config)
+
+    def update(self, config: ExtConfig) -> None:
+        """仅在磁盘修订号仍匹配时更新配置。"""
+        with _ext_data_lock(config.id, self._base.parent):
+            if config._storage_revision is None:
+                raise ExtConfigChangedError(
+                    f"扩展配置 '{config.id}' 缺少持久化修订号，请重新读取后更新"
+                )
+            _assert_current_config(config, self._base.parent)
+            self._write_locked(config)
+
+    def upsert(self, config: ExtConfig) -> None:
+        """兼容入口：无修订号时仅创建，有修订号时执行 CAS 更新。"""
+        if config._storage_revision is None:
+            self.create(config)
+        else:
+            self.update(config)
 
     def delete(self, config_id: str) -> bool:
         import shutil
@@ -579,7 +603,9 @@ def _assert_current_config(config: ExtConfig, data_dir: Path) -> None:
     """拒绝已经被删除或更新的持久化配置对象继续写入。"""
     expected = config._storage_revision
     if expected is None:
-        return
+        raise ExtConfigChangedError(
+            f"扩展配置 '{config.id}' 缺少持久化修订号，请重新读取后重试"
+        )
     path = _config_dir(config.id, data_dir) / "config.json"
     try:
         current = json.loads(path.read_text(encoding="utf-8"))

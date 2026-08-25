@@ -50,7 +50,10 @@ def test_upsert_edit_invalidates_cache(tmp_path):
     store.upsert(_config("cfg_a", "old"))
     assert store.load_all()[0].label == "old"
 
-    store.upsert(_config("cfg_a", "new"))
+    edited = store.get("cfg_a")
+    assert edited is not None
+    edited.label = "new"
+    store.upsert(edited)
     assert store.load_all()[0].label == "new"
 
 

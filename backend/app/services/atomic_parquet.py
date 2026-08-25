@@ -39,7 +39,8 @@ def replace_parquet_set(entries: Iterable[tuple[Path, Any]]) -> None:
 
     staged: list[tuple[Path, Path]] = []
     backups: dict[Path, Path | None] = {}
-    published: set[Path] = set()
+    published: list[Path] = []
+    preserved_backups: set[Path] = set()
     try:
         for target, frame in items:
             staged.append((target, _stage_parquet(frame, target)))
@@ -61,20 +62,27 @@ def replace_parquet_set(entries: Iterable[tuple[Path, Any]]) -> None:
 
         for target, temporary in staged:
             os.replace(temporary, target)
-            published.add(target)
-    except BaseException:
-        for target in reversed(targets):
+            published.append(target)
+    except BaseException as publish_error:
+        for target in reversed(published):
             backup = backups.get(target)
-            if backup is not None and backup.exists():
-                os.replace(backup, target)
-            elif target in published:
-                target.unlink(missing_ok=True)
+            try:
+                if backup is not None and backup.exists():
+                    os.replace(backup, target)
+                else:
+                    target.unlink(missing_ok=True)
+            except BaseException as rollback_error:
+                if backup is not None and backup.exists():
+                    preserved_backups.add(backup)
+                publish_error.add_note(
+                    f"回滚 {target} 失败，恢复副本已保留: {rollback_error}"
+                )
         raise
     finally:
         for _target, temporary in staged:
             temporary.unlink(missing_ok=True)
         for backup in backups.values():
-            if backup is not None:
+            if backup is not None and backup not in preserved_backups:
                 backup.unlink(missing_ok=True)
 
 

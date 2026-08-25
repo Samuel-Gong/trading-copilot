@@ -41,7 +41,7 @@ async def test_scheduler_waits_until_window_start_after_skip(monkeypatch, tmp_pa
         def get(self, config_id: str):
             return config if config_id == config.id else None
 
-        def upsert(self, _config) -> None:
+        def update(self, _config) -> None:
             pass
 
     scheduler = ext_pull.PullScheduler()

@@ -27,6 +27,7 @@ def _config() -> ExtConfig:
 
 def test_same_config_read_modify_write_is_serialized(tmp_path, monkeypatch) -> None:
     config = _config()
+    ExtConfigStore(tmp_path).create(config)
     ext_data.write_ext_parquet(
         pl.DataFrame({"symbol": ["A"], "value": ["0"]}),
         config,
@@ -118,3 +119,44 @@ def test_deleted_config_rejects_stale_scheduler_write(tmp_path) -> None:
         )
 
     assert not (tmp_path / "ext_data" / "concurrent").exists()
+
+
+def test_unversioned_config_cannot_create_data_directory(tmp_path) -> None:
+    with pytest.raises(ExtConfigChangedError, match="缺少持久化修订号"):
+        ext_data.write_ext_parquet(
+            pl.DataFrame({"symbol": ["A"], "value": ["unversioned"]}),
+            _config(),
+            tmp_path,
+        )
+
+    assert not (tmp_path / "ext_data" / "concurrent").exists()
+
+
+def test_deleted_config_rejects_stale_update(tmp_path) -> None:
+    store = ExtConfigStore(tmp_path)
+    store.create(_config())
+    stale = store.get("concurrent")
+    assert stale is not None
+    assert store.delete("concurrent") is True
+
+    stale.label = "陈旧更新"
+    with pytest.raises(ExtConfigChangedError, match="已删除"):
+        store.update(stale)
+
+    assert not (tmp_path / "ext_data" / "concurrent").exists()
+
+
+def test_stale_update_cannot_overwrite_newer_config(tmp_path) -> None:
+    store = ExtConfigStore(tmp_path)
+    store.create(_config())
+    stale = store.get("concurrent")
+    current = store.get("concurrent")
+    assert stale is not None and current is not None
+    current.label = "最新配置"
+    store.update(current)
+
+    stale.label = "陈旧配置"
+    with pytest.raises(ExtConfigChangedError, match="已更新"):
+        store.update(stale)
+
+    assert store.get("concurrent").label == "最新配置"
