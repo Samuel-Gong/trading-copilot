@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from itertools import pairwise
@@ -107,6 +107,41 @@ FACTOR_COLUMNS: list[dict] = [
     {"id": "net_income_yoy_latest", "label": "净利增速(最新公告)", "group": "财务", "desc": "最新已公告归母净利润同比(%)"},
     {"id": "debt_ratio_latest", "label": "资产负债率(最新公告)", "group": "财务", "desc": "最新已公告资产负债率(%)"},
 ]
+
+for _factor_column in FACTOR_COLUMNS:
+    _factor_column["asset_types"] = (
+        ["stock"]
+        if _factor_column["id"] in FUNDAMENTAL_FACTOR_NAMES
+        else ["stock", "etf"]
+    )
+
+
+def unsupported_factors_for_asset_type(
+    factor_names: Sequence[str],
+    asset_type: str,
+) -> tuple[str, ...]:
+    """返回不支持指定资产类型的因子, 并保留请求顺序。"""
+    supported = {
+        str(item["id"]): frozenset(str(value) for value in item["asset_types"])
+        for item in FACTOR_COLUMNS
+    }
+    return tuple(
+        name
+        for name in dict.fromkeys(str(value) for value in factor_names)
+        if asset_type not in supported.get(name, frozenset())
+    )
+
+
+def validate_factor_asset_types(
+    factor_names: Sequence[str],
+    asset_type: str,
+) -> None:
+    """拒绝把股票专属因子用于不支持的资产类型。"""
+    unsupported = unsupported_factors_for_asset_type(factor_names, asset_type)
+    if unsupported:
+        raise ValueError(
+            f"因子 {', '.join(unsupported)} 不支持资产类型 {asset_type}"
+        )
 
 FACTOR_WARMUP_DAYS = 120
 FACTOR_METHODOLOGY_VERSION = "factor_v2"
@@ -231,6 +266,7 @@ class FactorBacktestService:
         *,
         regime_by_date: Mapping[object, Any] | None = None,
     ) -> FactorResult:
+        validate_factor_asset_types([config.factor_name], config.asset_type)
         t0 = time.perf_counter()
         run_id = uuid.uuid4().hex[:10]
         generation = self._data_generation(config.asset_type)
@@ -279,6 +315,7 @@ class FactorBacktestService:
         t0 = time.perf_counter()
         run_id = uuid.uuid4().hex[:10]
         factor_names = list(dict.fromkeys(config.factor_names))
+        validate_factor_asset_types(factor_names, config.asset_type)
         result_config = self._batch_config_to_dict(config, factor_names)
         if not factor_names:
             return FactorBatchResult(

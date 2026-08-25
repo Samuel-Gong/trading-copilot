@@ -1430,6 +1430,7 @@ export interface FactorColumn {
   label: string
   group: string
   desc: string
+  asset_types: ('stock' | 'etf')[]
 }
 
 export interface GroupStat {

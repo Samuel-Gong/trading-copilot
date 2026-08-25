@@ -362,6 +362,24 @@ def test_availability_uses_asset_specific_valid_partitions(tmp_path):
     assert response.json()["eligible"] is True
 
 
+def test_start_rejects_stock_financial_factor_for_etf(tmp_path):
+    client, store = _client(tmp_path)
+
+    response = client.post(
+        "/api/backtest/mining/runs",
+        json={
+            "factor_names": ["roe_latest"],
+            "asset_type": "etf",
+            "budget_profile": "exploratory",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "roe_latest" in response.text
+    assert "etf" in response.text.lower()
+    assert store.list_runs() == []
+
+
 def test_result_reconstructs_artifacts_without_exposing_definition(tmp_path):
     client, store = _client(tmp_path)
     _successful_run(store)

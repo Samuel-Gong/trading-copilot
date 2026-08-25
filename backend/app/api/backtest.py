@@ -133,6 +133,15 @@ def factor_columns():
     return {"columns": FACTOR_COLUMNS}
 
 
+def _guard_factor_asset_types(factor_names: list[str], asset_type: str) -> None:
+    from app.backtest.factor import validate_factor_asset_types
+
+    try:
+        validate_factor_asset_types(factor_names, asset_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 class FactorBacktestRequest(BaseModel):
     factor_name: str = Field(..., min_length=1, max_length=64)
     symbols: list[str] | None = None
@@ -143,7 +152,7 @@ class FactorBacktestRequest(BaseModel):
     weight: Literal["equal", "factor_weight"] = "equal"
     fees_pct: float = 0.0002
     slippage_bps: float = 5.0
-    asset_type: str = "stock"
+    asset_type: Literal["stock", "etf"] = "stock"
 
 
 @router.post("/factor/run")
@@ -153,6 +162,7 @@ def factor_run(req: FactorBacktestRequest, request: Request):
 
     if req.factor_name not in {item["id"] for item in FACTOR_COLUMNS}:
         raise HTTPException(status_code=400, detail=f"不支持的因子: {req.factor_name}")
+    _guard_factor_asset_types([req.factor_name], req.asset_type)
 
     engine = _get_engine(request)
     svc = FactorBacktestService(engine)
@@ -193,7 +203,7 @@ class FactorBatchRequest(BaseModel):
     weight: Literal["equal", "factor_weight"] = "equal"
     fees_pct: float = 0.0002
     slippage_bps: float = 5.0
-    asset_type: str = "stock"
+    asset_type: Literal["stock", "etf"] = "stock"
 
 
 @router.post("/factor/batch")
@@ -210,6 +220,7 @@ def factor_batch(req: FactorBatchRequest, request: Request):
     invalid = [name for name in factor_names if name not in allowed]
     if invalid:
         raise HTTPException(status_code=400, detail=f"不支持的因子: {', '.join(invalid)}")
+    _guard_factor_asset_types(factor_names, req.asset_type)
 
     end = req.end or date.today()
     start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)

@@ -51,6 +51,21 @@ def test_runtime_rejects_insufficient_balanced_range_before_loading_panel(
         _decode_runtime_request(payload, tmp_path, SimpleNamespace())
 
 
+def test_runtime_rejects_stock_financial_factor_for_etf(tmp_path) -> None:
+    payload = {
+        "run_id": "etf-financial",
+        "request": {
+            "factor_names": ["roe_latest"],
+            "strategy_ids": [],
+            "asset_type": "etf",
+            "budget_profile": "exploratory",
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"roe_latest.*etf"):
+        _decode_runtime_request(payload, tmp_path, SimpleNamespace())
+
+
 def test_single_forward_label_uses_global_trading_axis_without_jump() -> None:
     first = date(2024, 1, 2)
     missing = first + timedelta(days=1)

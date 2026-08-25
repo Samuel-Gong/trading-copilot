@@ -200,6 +200,29 @@ def test_fingerprint_covers_financial_snapshot_for_financial_factors(tmp_path) -
     assert first["digest"] != second["digest"]
 
 
+def test_fingerprint_covers_financial_snapshot_for_selected_strategies(tmp_path) -> None:
+    repo = FakeRepo(tmp_path)
+    strategy = SimpleNamespace(execution_backend="matrix_native", file_path=None)
+    state = SimpleNamespace(
+        strategy_engine=SimpleNamespace(get=lambda _strategy_id: strategy)
+    )
+    metrics = tmp_path / "financials" / "metrics" / "part.parquet"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_bytes(b"financial-v1")
+    request = {
+        "asset_type": "stock",
+        "strategy_ids": ["benchmark"],
+        "factor_names": ["turnover_rate"],
+    }
+
+    first = mining_schedule.build_data_fingerprint(repo, state, request)
+    metrics.write_bytes(b"financial-v2")
+    second = mining_schedule.build_data_fingerprint(repo, state, request)
+
+    assert first["financial_metrics"]["sha256"] != second["financial_metrics"]["sha256"]
+    assert first["digest"] != second["digest"]
+
+
 def test_fingerprint_retries_financial_snapshot_change_until_stable(
     tmp_path,
     monkeypatch,

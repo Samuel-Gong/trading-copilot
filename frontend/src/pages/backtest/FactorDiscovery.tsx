@@ -9,6 +9,7 @@ import { api, type FactorBatchItem, type FactorColumn } from '@/lib/api'
 import { fmtPct, priceColorClass } from '@/lib/format'
 import { QK } from '@/lib/queryKeys'
 import { FactorBacktest } from './FactorBacktest'
+import { factorColumnsForAsset, factorNamesForAsset } from './factorCatalog'
 import { factorBatchCandidate } from './researchCandidates'
 
 const formatDate = (value: Date) => value.toISOString().slice(0, 10)
@@ -44,6 +45,10 @@ function BatchDiscovery({ onInspect }: { onInspect: (factorName: string) => void
     queryKey: QK.factorColumns,
     queryFn: api.factorColumns,
   })
+  const availableColumns = useMemo(
+    () => factorColumnsForAsset(columns.data?.columns ?? [], assetType),
+    [assetType, columns.data],
+  )
   const watchlist = useQuery({
     queryKey: QK.watchlist,
     queryFn: api.watchlistList,
@@ -61,18 +66,22 @@ function BatchDiscovery({ onInspect }: { onInspect: (factorName: string) => void
     return counts
   }, [watchlistEntries])
   useEffect(() => {
-    if (initialized.current || !columns.data?.columns.length) return
+    if (initialized.current || !availableColumns.length) return
     initialized.current = true
-    setSelected(columns.data.columns.map(column => column.id))
-  }, [columns.data])
+    setSelected(availableColumns.map(column => column.id))
+  }, [availableColumns])
+  useEffect(() => {
+    if (!columns.data) return
+    setSelected(current => factorNamesForAsset(columns.data!.columns, current, assetType))
+  }, [assetType, columns.data])
 
   const factorGroups = useMemo(() => {
     const groups: Record<string, FactorColumn[]> = {}
-    for (const column of columns.data?.columns ?? []) {
+    for (const column of availableColumns) {
       ;(groups[column.group] ??= []).push(column)
     }
     return groups
-  }, [columns.data])
+  }, [availableColumns])
 
   const run = useMutation({
     mutationFn: () => api.factorBatch({
@@ -131,7 +140,7 @@ function BatchDiscovery({ onInspect }: { onInspect: (factorName: string) => void
     const current = symbols.split(',').map(value => value.trim()).filter(Boolean)
     setSymbols(Array.from(new Set([...current, ...entries.map(entry => entry.symbol)])).join(','))
   }
-  const allColumns = columns.data?.columns ?? []
+  const allColumns = availableColumns
   const allSelected = allColumns.length > 0 && allColumns.every(item => selected.includes(item.id))
 
   return (

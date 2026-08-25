@@ -13,7 +13,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sse_starlette.sse import EventSourceResponse
 
-from app.backtest.factor import FACTOR_COLUMNS
+from app.backtest.factor import FACTOR_COLUMNS, validate_factor_asset_types
 from app.backtest.mining import (
     MAX_BEAM_WIDTH,
     MAX_COMBINATION_SIZE,
@@ -107,6 +107,7 @@ class MiningStartRequest(BaseModel):
     def _date_range(self) -> MiningStartRequest:
         if self.start is not None and self.end is not None and self.start > self.end:
             raise ValueError("start must not be after end")
+        validate_factor_asset_types(self.factor_names, self.asset_type)
         return self
 
 

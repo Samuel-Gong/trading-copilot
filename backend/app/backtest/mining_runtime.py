@@ -22,6 +22,7 @@ from app.backtest.factor import (
     FACTOR_WARMUP_DAYS,
     FactorBacktestService,
     FactorBatchConfig,
+    validate_factor_asset_types,
 )
 from app.backtest.fundamentals import (
     FUNDAMENTAL_FACTOR_NAMES,
@@ -783,6 +784,7 @@ def _decode_runtime_request(
     asset_type = str(request.get("asset_type") or "stock")
     if asset_type not in {"stock", "etf"}:
         raise ValueError("mining asset_type must be stock or etf")
+    validate_factor_asset_types(factor_names, asset_type)
     for strategy_id in strategy_ids:
         strategy = strategy_engine.get(strategy_id)
         if strategy.meta.get("research_only"):

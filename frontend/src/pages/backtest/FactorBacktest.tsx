@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { Play, BarChart3, BookmarkPlus, Clock } from 'lucide-react'
@@ -10,6 +10,7 @@ import { toast } from '@/components/Toast'
 import { QK } from '@/lib/queryKeys'
 import { FactorICChart } from './charts/FactorICChart'
 import { FactorGroupNavChart } from './charts/FactorGroupNavChart'
+import { factorColumnsForAsset } from './factorCatalog'
 import { factorResultCandidate } from './researchCandidates'
 
 const formatDate = (date: Date) => date.toISOString().slice(0, 10)
@@ -99,16 +100,28 @@ export function FactorBacktest({ initialFactorName = 'momentum_20d' }: { initial
     queryKey: QK.factorColumns,
     queryFn: api.factorColumns,
   })
+  const availableColumns = useMemo(
+    () => factorColumnsForAsset(columns.data?.columns ?? [], assetType),
+    [assetType, columns.data],
+  )
+
+  useEffect(() => {
+    if (
+      availableColumns.length
+      && !availableColumns.some(column => column.id === factorName)
+    ) {
+      setFactorName(availableColumns[0].id)
+    }
+  }, [availableColumns, factorName])
 
   // 按 group 分类的因子
   const factorGroups = useMemo(() => {
-    const cols = columns.data?.columns ?? []
     const groups: Record<string, FactorColumn[]> = {}
-    for (const c of cols) {
+    for (const c of availableColumns) {
       ;(groups[c.group] ??= []).push(c)
     }
     return groups
-  }, [columns.data])
+  }, [availableColumns])
 
   // 当前因子描述
   const factorDesc = useMemo(() => {
@@ -223,7 +236,7 @@ export function FactorBacktest({ initialFactorName = 'momentum_20d' }: { initial
               <button
                 key={t}
                 type="button"
-                onClick={() => { setAssetType(t); setSymbols('') }}
+                onClick={() => { setAssetType(t); setSymbols(''); setResult(null) }}
                 className={`h-full px-3 text-xs font-medium transition-colors cursor-pointer
                   ${assetType === t ? 'bg-accent/10 text-accent' : 'text-muted hover:text-foreground'}`}
               >

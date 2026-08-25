@@ -29,6 +29,30 @@ def test_factor_batch_request_accepts_full_research_catalog():
     assert request.factor_names == factor_names
 
 
+def test_factor_catalog_declares_fundamentals_as_stock_only():
+    catalog = {item["id"]: item for item in api.factor_columns()["columns"]}
+
+    assert catalog["roe_latest"]["asset_types"] == ["stock"]
+    assert catalog["momentum_20d"]["asset_types"] == ["stock", "etf"]
+
+
+@pytest.mark.parametrize("endpoint", [api.factor_run, api.factor_batch])
+def test_factor_apis_reject_stock_financial_factors_for_etf(endpoint):
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    req = (
+        api.FactorBacktestRequest(factor_name="roe_latest", asset_type="etf")
+        if endpoint is api.factor_run
+        else api.FactorBatchRequest(factor_names=["roe_latest"], asset_type="etf")
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        endpoint(req, request)
+
+    assert exc_info.value.status_code == 400
+    assert "roe_latest" in str(exc_info.value.detail)
+    assert "etf" in str(exc_info.value.detail).lower()
+
+
 def test_candidate_api_create_list_and_update(monkeypatch, tmp_path):
     monkeypatch.setattr(api.settings, "data_dir", tmp_path)
     created = api.candidate_create(api.CandidateCreateRequest(

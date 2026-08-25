@@ -39,6 +39,7 @@ import {
 } from '@/lib/miningTask'
 import { QK } from '@/lib/queryKeys'
 import { FactorCorrelationHeatmap } from './charts/FactorCorrelationHeatmap'
+import { factorColumnsForAsset, factorNamesForAsset } from './factorCatalog'
 import { MiningOosChart } from './charts/MiningOosChart'
 import { RegimeComparisonChart } from './charts/RegimeComparisonChart'
 
@@ -277,6 +278,10 @@ export function MiningWorkbench() {
   const selectedCandidate = searchParams.get('candidate') || ''
 
   const factorQuery = useQuery({ queryKey: QK.factorColumns, queryFn: api.factorColumns })
+  const availableFactorColumns = useMemo(
+    () => factorColumnsForAsset(factorQuery.data?.columns ?? [], draft.assetType),
+    [draft.assetType, factorQuery.data],
+  )
   const strategyQuery = useQuery({
     queryKey: QK.strategyLinkOptions(draft.assetType),
     queryFn: () => api.strategyList(draft.assetType),
@@ -310,12 +315,29 @@ export function MiningWorkbench() {
   }, [draft])
 
   useEffect(() => {
-    if (initializedFactors.current || !factorQuery.data?.columns.length) return
+    if (initializedFactors.current || !availableFactorColumns.length) return
     initializedFactors.current = true
     if (!draft.factorNames.length) {
-      setDraft(current => ({ ...current, factorNames: factorQuery.data!.columns.slice(0, 48).map(item => item.id) }))
+      setDraft(current => ({
+        ...current,
+        factorNames: availableFactorColumns.slice(0, 48).map(item => item.id),
+      }))
     }
-  }, [factorQuery.data, draft.factorNames.length])
+  }, [availableFactorColumns, draft.factorNames.length])
+
+  useEffect(() => {
+    if (!factorQuery.data) return
+    setDraft(current => {
+      const factorNames = factorNamesForAsset(
+        factorQuery.data!.columns,
+        current.factorNames,
+        current.assetType,
+      )
+      return factorNames.length === current.factorNames.length
+        ? current
+        : { ...current, factorNames }
+    })
+  }, [draft.assetType, factorQuery.data])
 
   useEffect(() => {
     if (configQuery.data && !scheduleDraft) setScheduleDraft(configQuery.data)
@@ -389,9 +411,9 @@ export function MiningWorkbench() {
 
   const factorGroups = useMemo(() => {
     const groups: Record<string, FactorColumn[]> = {}
-    for (const item of factorQuery.data?.columns ?? []) (groups[item.group] ??= []).push(item)
+    for (const item of availableFactorColumns) (groups[item.group] ??= []).push(item)
     return groups
-  }, [factorQuery.data])
+  }, [availableFactorColumns])
   const strategies = strategyQuery.data?.strategies.filter(item => item.execution_backend === 'matrix_native') ?? []
 
   useEffect(() => {
@@ -410,6 +432,11 @@ export function MiningWorkbench() {
     setDraft(current => ({
       ...current,
       assetType,
+      factorNames: factorNamesForAsset(
+        factorQuery.data?.columns ?? [],
+        current.factorNames,
+        assetType,
+      ),
       strategyIds: [],
     }))
   }
@@ -570,7 +597,7 @@ export function MiningWorkbench() {
           <section className="border-t border-border pt-3">
             <div className="mb-2 flex items-center justify-between">
               <span className="flex items-center gap-1.5 text-[10px] font-semibold text-secondary"><FlaskConical className="h-3 w-3" />因子目录</span>
-              <button type="button" className="text-[9px] text-accent" onClick={() => updateDraft('factorNames', draft.factorNames.length ? [] : (factorQuery.data?.columns ?? []).slice(0, 48).map(item => item.id))}>{draft.factorNames.length ? '清空' : '全选'}</button>
+              <button type="button" className="text-[9px] text-accent" onClick={() => updateDraft('factorNames', draft.factorNames.length ? [] : availableFactorColumns.slice(0, 48).map(item => item.id))}>{draft.factorNames.length ? '清空' : '全选'}</button>
             </div>
             <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
               {Object.entries(factorGroups).map(([group, items]) => (

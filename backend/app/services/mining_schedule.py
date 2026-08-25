@@ -279,7 +279,8 @@ def _financial_metrics_metadata(
     request: dict[str, Any],
 ) -> dict[str, Any] | None:
     factor_names = {str(name) for name in request.get("factor_names") or []}
-    if factor_names.isdisjoint(FUNDAMENTAL_FACTOR_NAMES):
+    strategy_ids = request.get("strategy_ids") or []
+    if factor_names.isdisjoint(FUNDAMENTAL_FACTOR_NAMES) and not strategy_ids:
         return None
     return _content_metadata(
         data_dir / "financials" / "metrics" / "part.parquet",
