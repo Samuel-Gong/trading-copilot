@@ -183,6 +183,7 @@ def regime_recompute(request: Request, start: date | None = None, end: date | No
         earliest = regime_builder.earliest_enriched_date(repo)
         if earliest is None:
             empty = pl.DataFrame()
+            regime_builder.assert_enriched_source_empty(repo)
             replace_parquet_set([
                 (regime_builder.regime_path(data_dir), empty),
                 (regime_builder.regime_coverage_path(data_dir), empty),
@@ -428,6 +429,7 @@ def mainline_recompute(request: Request):
     earliest = regime_builder.earliest_enriched_date(repo)
     if earliest is None:
         empty = pl.DataFrame()
+        regime_builder.assert_enriched_source_empty(repo)
         replace_parquet_set([
             (market_mainline.mainline_path(data_dir), empty),
             (market_mainline.mainline_coverage_path(data_dir), empty),

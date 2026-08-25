@@ -34,6 +34,12 @@ class RegimeSourceChangedError(RuntimeError):
     """全量环境计算期间个股或指数行情来源发生变化。"""
 
 
+def assert_enriched_source_empty(repo) -> None:
+    """发布空派生快照前复验 enriched 来源仍为空。"""
+    if enriched_date_set(repo):
+        raise RegimeSourceChangedError("清理派生数据期间行情来源已出现，请重试")
+
+
 # ───────────────────────── 状态分类阈值(可调) ─────────────────────────
 # 评分模型对齐看板情绪分(market_overview_builder): 采用 _score(low,high) 归一化
 # (比多点插值简洁、不易设错), 4 个轻量维度(赚钱/投机/抗跌/趋势), 阈值与看板统一。

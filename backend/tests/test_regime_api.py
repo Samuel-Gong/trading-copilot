@@ -226,6 +226,40 @@ def test_mainline_recompute_empty_source_failure_restores_both_files(
     assert not regime.market_environment_journal_path(tmp_path).exists()
 
 
+@pytest.mark.parametrize("entrypoint", ["regime", "mainline"])
+def test_empty_source_recompute_rejects_new_enriched_partition_before_publish(
+    tmp_path,
+    monkeypatch,
+    entrypoint,
+):
+    """首次空源扫描后出现新分区时，组合与独立入口都必须 fail-closed。"""
+    target = date(2026, 8, 25)
+    published: list[object] = []
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "earliest_enriched_date",
+        lambda _repo: None,
+    )
+    monkeypatch.setattr(
+        regime.regime_builder,
+        "enriched_date_set",
+        lambda _repo: {target},
+    )
+    monkeypatch.setattr(
+        regime,
+        "replace_parquet_set",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(regime.regime_builder.RegimeSourceChangedError):
+        if entrypoint == "regime":
+            regime.regime_recompute(_request(tmp_path))
+        else:
+            regime.mainline_recompute(_request(tmp_path))
+
+    assert published == []
+
+
 def test_full_recompute_drops_history_before_new_earliest_source(tmp_path, monkeypatch):
     """删除最早来源分区后，全量重算不得保留新起点之前的旧派生日期。"""
     old_date = date(2026, 1, 1)
