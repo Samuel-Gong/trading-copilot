@@ -2,11 +2,12 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'node:path'
 
+import { buildBackendTarget } from './viteBackendTarget'
+
 const backendHost = process.env.BACKEND_HOST || '127.0.0.1'
-const proxyHost = ['0.0.0.0', '::'].includes(backendHost) ? '127.0.0.1' : backendHost
 const legacyBackendPort = process.env.TICKFLOW_BACKEND_PORT ?? '3018'
 const backendPort = process.env.BACKEND_PORT || legacyBackendPort
-const backendTarget = `http://${proxyHost}:${backendPort}`
+const backendTarget = buildBackendTarget(backendHost, backendPort)
 
 export default defineConfig({
   plugins: [react()],

@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from app.backtest.factor import FACTOR_COLUMNS, FACTOR_METHODOLOGY_VERSION
+from app.backtest.fundamentals import FUNDAMENTAL_FACTOR_NAMES
 from app.backtest.mining import (
     required_outer_folds,
     required_trading_bars,
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 MINING_ALGORITHM_VERSION = "mining-v2"
-FINGERPRINT_VERSION = "weekly-mining-data-v2"
+FINGERPRINT_VERSION = "weekly-mining-data-v3"
 _PROFILES = frozenset({"balanced", "strict"})
 _CLAIM_LOCK = threading.Lock()
 
@@ -74,11 +75,15 @@ def build_data_fingerprint(
     request: dict[str, Any],
 ) -> dict[str, Any]:
     """Hash one stable managed generation plus source metadata."""
+    data_dir = Path(repo.store.data_dir)
     for _attempt in range(2):
         fingerprint = _build_data_fingerprint_once(repo, app_state, request)
-        if repo.get_matrix_data_generation(fingerprint["asset_type"]) == fingerprint["generation"]:
-            return fingerprint
-    raise ValueError("enriched data changed while building the mining fingerprint")
+        if repo.get_matrix_data_generation(fingerprint["asset_type"]) != fingerprint["generation"]:
+            continue
+        if _financial_metrics_metadata(data_dir, request) != fingerprint["financial_metrics"]:
+            continue
+        return fingerprint
+    raise ValueError("mining source data changed while building the fingerprint")
 
 
 def _build_data_fingerprint_once(
@@ -102,6 +107,7 @@ def _build_data_fingerprint_once(
         "enriched": _enriched_metadata(enriched_root),
         "instruments": _instrument_metadata(repo, asset_type),
         "regime": _path_metadata(regime_path(data_dir), root=data_dir),
+        "financial_metrics": _financial_metrics_metadata(data_dir, request),
         "algorithm_version": MINING_ALGORITHM_VERSION,
         "methodology_version": FACTOR_METHODOLOGY_VERSION,
         "implementation": _implementation_metadata(module_root),
@@ -266,6 +272,19 @@ def _instrument_metadata(repo: Any, asset_type: str) -> dict[str, Any]:
         digest_size=20,
     ).hexdigest()
     return {"rows": instruments.height, "columns": columns, "digest": digest}
+
+
+def _financial_metrics_metadata(
+    data_dir: Path,
+    request: dict[str, Any],
+) -> dict[str, Any] | None:
+    factor_names = {str(name) for name in request.get("factor_names") or []}
+    if factor_names.isdisjoint(FUNDAMENTAL_FACTOR_NAMES):
+        return None
+    return _content_metadata(
+        data_dir / "financials" / "metrics" / "part.parquet",
+        root=data_dir,
+    )
 
 
 def _enriched_metadata(root: Path) -> dict[str, Any]:

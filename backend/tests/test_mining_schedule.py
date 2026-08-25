@@ -177,6 +177,58 @@ def test_fingerprint_covers_result_implementation_digest(
     assert first["digest"] != second["digest"]
 
 
+def test_fingerprint_covers_financial_snapshot_for_financial_factors(tmp_path) -> None:
+    repo = FakeRepo(tmp_path)
+    state = SimpleNamespace(strategy_engine=None)
+    metrics = tmp_path / "financials" / "metrics" / "part.parquet"
+    metrics.parent.mkdir(parents=True)
+    metrics.write_bytes(b"financial-v1")
+
+    first = mining_schedule.build_data_fingerprint(
+        repo,
+        state,
+        {"asset_type": "stock", "strategy_ids": [], "factor_names": ["roe_latest"]},
+    )
+    metrics.write_bytes(b"financial-v2")
+    second = mining_schedule.build_data_fingerprint(
+        repo,
+        state,
+        {"asset_type": "stock", "strategy_ids": [], "factor_names": ["roe_latest"]},
+    )
+
+    assert first["financial_metrics"]["sha256"] != second["financial_metrics"]["sha256"]
+    assert first["digest"] != second["digest"]
+
+
+def test_fingerprint_retries_financial_snapshot_change_until_stable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repo = FakeRepo(tmp_path)
+    state = SimpleNamespace(strategy_engine=None)
+    versions = iter(
+        [
+            {"sha256": "financial-v1"},
+            {"sha256": "financial-v2"},
+            {"sha256": "financial-v2"},
+            {"sha256": "financial-v2"},
+        ]
+    )
+    monkeypatch.setattr(
+        mining_schedule,
+        "_financial_metrics_metadata",
+        lambda _data_dir, _request: next(versions),
+    )
+
+    fingerprint = mining_schedule.build_data_fingerprint(
+        repo,
+        state,
+        {"asset_type": "stock", "strategy_ids": [], "factor_names": ["pb_latest"]},
+    )
+
+    assert fingerprint["financial_metrics"] == {"sha256": "financial-v2"}
+
+
 def test_selected_strategy_metadata_changes_with_same_size_source_edit(tmp_path) -> None:
     source = tmp_path / "strategies" / "custom" / "demo.py"
     source.parent.mkdir(parents=True)
