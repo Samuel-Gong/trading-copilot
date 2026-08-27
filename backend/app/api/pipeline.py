@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.jobs import daily_pipeline
 from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
+from app.services.enriched_job import run_enriched_job_with_repository_refresh
 from app.api.data import invalidate_storage_cache
 
 # 长时间任务专用线程池（隔离于 FastAPI 默认线程池，防止阻塞请求处理）
@@ -55,15 +56,19 @@ async def run_now(request: Request) -> dict:
                 job_store.progress(job_id, stage, pct, msg, stage_pct=stage_pct, skip_log=skip_log)
 
             def _run() -> dict:
-                if qs:
-                    with qs.paused():
-                        return daily_pipeline.run_now(repo, capset, on_progress=progress)
-                return daily_pipeline.run_now(repo, capset, on_progress=progress)
+                return run_enriched_job_with_repository_refresh(
+                    repo,
+                    lambda: daily_pipeline.run_now(
+                        repo,
+                        capset,
+                        on_progress=progress,
+                    ),
+                    qs,
+                )
 
             result = await loop.run_in_executor(_long_task_executor, _run)
             job_store.succeed(job_id, result)
             invalidate_storage_cache()
-            repo.refresh_cache()  # 刷新 Polars 缓存
         except Exception as e:  # noqa: BLE001
             logger.exception("pipeline failed")
             job_store.fail(job_id, str(e))

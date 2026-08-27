@@ -1,16 +1,53 @@
 """扩展数据服务 — 配置管理 + 文件解析 + Parquet 存储。"""
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import os
 import re
+import tempfile
+import threading
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
 import polars as pl
 
+from app.market_time import cn_today
+
 logger = logging.getLogger(__name__)
+
+EXT_DATA_GENERATION_FILE = ".generation"
+
+_ext_data_locks: dict[tuple[str, str], threading.RLock] = {}
+_ext_data_locks_guard = threading.Lock()
+
+
+def _ext_data_lock(config_id: str, data_dir: Path) -> threading.RLock:
+    """返回同一数据目录与配置共享的进程内读改写锁。"""
+    key = (str(data_dir.resolve()), config_id)
+    with _ext_data_locks_guard:
+        return _ext_data_locks.setdefault(key, threading.RLock())
+
+
+def _atomic_write_text(path: Path, content: str, *, encoding: str) -> None:
+    """在同目录完整写入文本后原子替换。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(content, encoding=encoding)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # 配置模型
@@ -39,7 +76,7 @@ class PullConfig:
         "url", "method", "headers", "body", "response_path",
         "field_map", "schedule_minutes", "enabled",
         "last_run", "last_status", "last_message", "last_rows",
-        "next_run",
+        "next_run", "time_window_start", "time_window_end",
     )
 
     def __init__(
@@ -57,6 +94,8 @@ class PullConfig:
         last_message: str | None = None,
         last_rows: int | None = None,
         next_run: str | None = None,
+        time_window_start: str | None = None,
+        time_window_end: str | None = None,
     ) -> None:
         self.url = url
         self.method = method              # GET | POST
@@ -71,6 +110,8 @@ class PullConfig:
         self.last_message = last_message
         self.last_rows = last_rows
         self.next_run = next_run            # 下次预计运行 (ISO, 调度器写入)
+        self.time_window_start = time_window_start  # 每日拉取窗口起始 "HH:MM", None=不限
+        self.time_window_end = time_window_end      # 每日拉取窗口结束 "HH:MM", None=不限
 
     def to_dict(self) -> dict:
         return {
@@ -87,6 +128,8 @@ class PullConfig:
             "last_message": self.last_message,
             "last_rows": self.last_rows,
             "next_run": self.next_run,
+            "time_window_start": self.time_window_start,
+            "time_window_end": self.time_window_end,
         }
 
     @classmethod
@@ -107,6 +150,8 @@ class PullConfig:
             last_message=d.get("last_message"),
             last_rows=d.get("last_rows"),
             next_run=d.get("next_run"),
+            time_window_start=d.get("time_window_start"),
+            time_window_end=d.get("time_window_end"),
         )
 
 
@@ -116,6 +161,7 @@ class ExtConfig:
         "id", "label", "mode", "fields", "description",
         "symbol_map", "code_map",
         "created_at", "updated_at", "pull",
+        "_storage_revision",
     )
 
     def __init__(
@@ -142,6 +188,7 @@ class ExtConfig:
         self.created_at = created_at or datetime.now().isoformat()
         self.updated_at = updated_at or datetime.now().isoformat()
         self.pull = pull
+        self._storage_revision: str | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -179,17 +226,48 @@ class ExtConfig:
 # 配置持久化
 # ---------------------------------------------------------------------------
 
+# load_all 进程内缓存: kline/screener/watchlist 等热路径每请求调用, 每次都
+# iterdir + 逐 config.json read_text+parse 纯重复; 以配置目录的
+# (目录名, mtime_ns, size) 签名失效 (新增/编辑/删除配置都会改变签名)。
+_load_all_cache: dict[str, tuple[tuple, list[ExtConfig]]] = {}
+
+
+def _ext_config_dir_signature(base: Path) -> tuple | None:
+    """配置目录下所有 config.json 的 (目录名, mtime_ns, size) 签名; 出错返回 None (禁用缓存)。"""
+    try:
+        sig = []
+        for d in sorted(base.iterdir()):
+            cp = d / "config.json"
+            if d.is_dir() and cp.exists():
+                st = cp.stat()
+                sig.append((d.name, st.st_mtime_ns, st.st_size))
+        return tuple(sig)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class ExtConfigStore:
     """扩展数据配置文件读写 — 每个表独立目录 data/ext/{config_id}/config.json。"""
+
+    # 与创建端点 CreateExtReq.id 的 pattern 一致; load_all 之外的 config_id
+    # 来自 URL path 参数, 必须先过白名单再拼路径, 防止 ../ 穿越删除。
+    _VALID_ID = re.compile(r"^[a-zA-Z0-9_]+$")
 
     def __init__(self, data_dir: Path) -> None:
         self._base = data_dir / "ext_data"
 
     def _config_path(self, config_id: str) -> Path:
+        if not self._VALID_ID.match(config_id):
+            raise ValueError(f"非法 config_id: {config_id!r}")
         return self._base / config_id / "config.json"
 
     def load_all(self) -> list[ExtConfig]:
         # 兼容旧版: 如果目录为空且旧配置文件存在则迁移
+        sig = _ext_config_dir_signature(self._base)
+        if sig is not None:
+            cached = _load_all_cache.get(str(self._base))
+            if cached is not None and cached[0] == sig:
+                return copy.deepcopy(cached[1])
         if not self._base.exists() or not any(self._base.iterdir()):
             old = self._base.parent / "ext_configs.json"
             if not old.exists():
@@ -204,37 +282,80 @@ class ExtConfigStore:
             if d.is_dir() and cp.exists():
                 try:
                     raw = json.loads(cp.read_text(encoding="utf-8"))
-                    configs.append(ExtConfig.from_dict(raw))
+                    config = ExtConfig.from_dict(raw)
+                    config._storage_revision = raw.get("_revision") or config.updated_at
+                    configs.append(config)
                 except Exception as e:
                     logger.warning("扩展表配置解析失败 %s: %s", cp, e)
+        if sig is not None and configs:
+            # 缓存存私有副本, 命中时返回深拷贝, 调用方改配置对象不会污染缓存。
+            _load_all_cache[str(self._base)] = (sig, copy.deepcopy(configs))
         return configs
 
     def get(self, config_id: str) -> ExtConfig | None:
-        cp = self._config_path(config_id)
+        try:
+            cp = self._config_path(config_id)
+        except ValueError:
+            return None
         if not cp.exists():
             return None
         try:
             raw = json.loads(cp.read_text(encoding="utf-8"))
-            return ExtConfig.from_dict(raw)
+            config = ExtConfig.from_dict(raw)
+            config._storage_revision = raw.get("_revision") or config.updated_at
+            return config
         except Exception:
             return None
 
-    def upsert(self, config: ExtConfig) -> None:
+    def _write_locked(self, config: ExtConfig) -> None:
         config.updated_at = datetime.now().isoformat()
+        revision = uuid.uuid4().hex
+        payload = config.to_dict()
+        payload["_revision"] = revision
         cp = self._config_path(config.id)
-        cp.parent.mkdir(parents=True, exist_ok=True)
-        cp.write_text(
-            json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
+        _atomic_write_text(
+            cp,
+            json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        config._storage_revision = revision
+
+    def create(self, config: ExtConfig) -> None:
+        """仅在 id 尚不存在时创建配置。"""
+        with _ext_data_lock(config.id, self._base.parent):
+            cp = self._config_path(config.id)
+            if cp.exists():
+                raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已存在")
+            self._write_locked(config)
+
+    def update(self, config: ExtConfig) -> None:
+        """仅在磁盘修订号仍匹配时更新配置。"""
+        with _ext_data_lock(config.id, self._base.parent):
+            if config._storage_revision is None:
+                raise ExtConfigChangedError(
+                    f"扩展配置 '{config.id}' 缺少持久化修订号，请重新读取后更新"
+                )
+            _assert_current_config(config, self._base.parent)
+            self._write_locked(config)
+
+    def upsert(self, config: ExtConfig) -> None:
+        """兼容入口：无修订号时仅创建，有修订号时执行 CAS 更新。"""
+        if config._storage_revision is None:
+            self.create(config)
+        else:
+            self.update(config)
 
     def delete(self, config_id: str) -> bool:
         import shutil
-        cp = self._config_path(config_id)
-        if not cp.exists():
+        try:
+            cp = self._config_path(config_id)
+        except ValueError:
             return False
-        shutil.rmtree(cp.parent, ignore_errors=True)
-        return True
+        with _ext_data_lock(config_id, self._base.parent):
+            if not cp.exists():
+                return False
+            shutil.rmtree(cp.parent, ignore_errors=True)
+            return True
 
     def _migrate_legacy(self, old_path: Path) -> None:
         """一次性迁移旧版 ext_configs.json 到独立目录结构。"""
@@ -477,6 +598,62 @@ def _config_dir(config_id: str, data_dir: Path) -> Path:
     return data_dir / "ext_data" / config_id
 
 
+class ExtConfigChangedError(RuntimeError):
+    """写入开始前配置已被删除或替换。"""
+
+
+def _assert_current_config(config: ExtConfig, data_dir: Path) -> None:
+    """拒绝已经被删除或更新的持久化配置对象继续写入。"""
+    expected = config._storage_revision
+    if expected is None:
+        raise ExtConfigChangedError(
+            f"扩展配置 '{config.id}' 缺少持久化修订号，请重新读取后重试"
+        )
+    path = _config_dir(config.id, data_dir) / "config.json"
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已删除或不可读") from exc
+    current_revision = current.get("_revision") or current.get("updated_at")
+    if current_revision != expected:
+        raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已更新，请使用最新配置重试")
+
+
+def _atomic_write_parquet(df, out_path: Path) -> None:
+    """在目标目录写临时文件并原子替换，失败时保留原文件。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.",
+        suffix=".tmp",
+        dir=out_path.parent,
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        df.write_parquet(temp_path)
+        os.replace(temp_path, out_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _bump_ext_data_generation(config_id: str, data_dir: Path) -> None:
+    """更新扩展数据版本标记，供实时消费者以 O(1) 成本判断缓存失效。"""
+    marker = _config_dir(config_id, data_dir) / EXT_DATA_GENERATION_FILE
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{marker.name}.",
+        suffix=".tmp",
+        dir=marker.parent,
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.write_text(uuid.uuid4().hex, encoding="ascii")
+        os.replace(temp_path, marker)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def write_ext_parquet(
     df: pl.DataFrame,
     config: ExtConfig,
@@ -492,7 +669,7 @@ def write_ext_parquet(
     Returns:
         写入行数。
     """
-    snap = snapshot_date or date.today()
+    snap = snapshot_date or cn_today()
     cfg_dir = _config_dir(config.id, data_dir)
 
     # 标准化 symbol 列: 用维表查找 → 准确匹配交易所
@@ -500,40 +677,43 @@ def write_ext_parquet(
         lookup = build_code_lookup(data_dir)
         df = df.with_columns(normalize_symbol(df["symbol"], lookup))
 
-    if config.mode == "snapshot":
-        # 快照: 与 config.json 同级，直接覆盖
-        cfg_dir.mkdir(parents=True, exist_ok=True)
-        out_path = cfg_dir / "part.parquet"
+    with _ext_data_lock(config.id, data_dir):
+        _assert_current_config(config, data_dir)
+        if config.mode == "snapshot":
+            # 快照: 与 config.json 同级，直接覆盖
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            out_path = cfg_dir / "part.parquet"
 
-        # 如果已有文件，合并去重后覆盖
-        if out_path.exists():
-            try:
-                existing = pl.read_parquet(out_path)
-                key = "symbol" if "symbol" in df.columns else df.columns[0]
-                df = pl.concat([existing, df]).unique(subset=[key], keep="last")
-            except Exception as e:
-                # schema 不一致 (列不同) 时 concat 失败 → 直接用新 df 覆盖。
-                # 记日志而非静默吞掉, 便于排查"数据结构错乱"类问题。
-                logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
-    else:
-        # 时序: timeseries/ 下按日期分区
-        out_dir = cfg_dir / "timeseries" / f"date={snap}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "part.parquet"
+            # 如果已有文件，合并去重后覆盖
+            if out_path.exists():
+                try:
+                    existing = pl.read_parquet(out_path)
+                    key = "symbol" if "symbol" in df.columns else df.columns[0]
+                    df = pl.concat([existing, df]).unique(subset=[key], keep="last")
+                except Exception as e:
+                    # schema 不一致 (列不同) 时 concat 失败 → 直接用新 df 覆盖。
+                    # 记日志而非静默吞掉, 便于排查"数据结构错乱"类问题。
+                    logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
+        else:
+            # 时序: timeseries/ 下按日期分区
+            out_dir = cfg_dir / "timeseries" / f"date={snap}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / "part.parquet"
 
-        # 如果已有文件，合并去重
-        if out_path.exists():
-            try:
-                existing = pl.read_parquet(out_path)
-                key = "symbol" if "symbol" in df.columns else df.columns[0]
-                df = pl.concat([existing, df]).unique(subset=[key], keep="last")
-            except Exception as e:
-                logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
+            # 如果已有文件，合并去重
+            if out_path.exists():
+                try:
+                    existing = pl.read_parquet(out_path)
+                    key = "symbol" if "symbol" in df.columns else df.columns[0]
+                    df = pl.concat([existing, df]).unique(subset=[key], keep="last")
+                except Exception as e:
+                    logger.warning("扩展表 %s 合并去重失败, 将覆盖写入: %s", config.id, e)
 
-    df = cast_df_to_schema(df, config.fields)
-    df.write_parquet(out_path)
-    logger.info("扩展表写入: %s → %s (%d 行)", config.id, out_path, len(df))
-    return len(df)
+        df = cast_df_to_schema(df, config.fields)
+        _atomic_write_parquet(df, out_path)
+        _bump_ext_data_generation(config.id, data_dir)
+        logger.info("扩展表写入: %s → %s (%d 行)", config.id, out_path, len(df))
+        return len(df)
 
 
 def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
@@ -542,16 +722,22 @@ def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
     - snapshot: 删除 ext_data/{id}/part.parquet
     - timeseries: 删除 ext_data/{id}/timeseries/ 目录
     """
-    cfg_dir = _config_dir(config_id, data_dir)
-    # 删除快照文件
-    snap = cfg_dir / "part.parquet"
-    if snap.exists():
-        snap.unlink()
-    # 删除时序目录
-    ts_dir = cfg_dir / "timeseries"
-    if ts_dir.exists():
-        import shutil
-        shutil.rmtree(ts_dir, ignore_errors=True)
+    with _ext_data_lock(config_id, data_dir):
+        cfg_dir = _config_dir(config_id, data_dir)
+        changed = False
+        # 删除快照文件
+        snap = cfg_dir / "part.parquet"
+        if snap.exists():
+            snap.unlink()
+            changed = True
+        # 删除时序目录
+        ts_dir = cfg_dir / "timeseries"
+        if ts_dir.exists():
+            import shutil
+            shutil.rmtree(ts_dir, ignore_errors=True)
+            changed = True
+        if changed:
+            _bump_ext_data_generation(config_id, data_dir)
 
 
 def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
@@ -563,44 +749,53 @@ def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
     Returns:
         修复的文件数。
     """
-    cfg_dir = _config_dir(config.id, data_dir)
-    if not cfg_dir.exists():
-        return 0
+    with _ext_data_lock(config.id, data_dir):
+        _assert_current_config(config, data_dir)
+        cfg_dir = _config_dir(config.id, data_dir)
+        if not cfg_dir.exists():
+            return 0
 
-    # 收集需要扫描的 parquet 文件列表
-    parquet_files: list[Path] = []
-    if config.mode == "snapshot":
-        p = cfg_dir / "part.parquet"
-        if p.exists():
-            parquet_files.append(p)
-    else:
-        ts_dir = cfg_dir / "timeseries"
-        if ts_dir.exists():
-            for part_dir in sorted(ts_dir.iterdir()):
-                if not part_dir.is_dir() or not part_dir.name.startswith("date="):
+        # 收集需要扫描的 parquet 文件列表
+        parquet_files: list[Path] = []
+        if config.mode == "snapshot":
+            p = cfg_dir / "part.parquet"
+            if p.exists():
+                parquet_files.append(p)
+        else:
+            ts_dir = cfg_dir / "timeseries"
+            if ts_dir.exists():
+                for part_dir in sorted(ts_dir.iterdir()):
+                    if not part_dir.is_dir() or not part_dir.name.startswith("date="):
+                        continue
+                    p = part_dir / "part.parquet"
+                    if p.exists():
+                        parquet_files.append(p)
+
+        fixed = 0
+        lookup = build_code_lookup(data_dir)
+        for parquet_path in parquet_files:
+            try:
+                df = pl.read_parquet(parquet_path)
+                if "symbol" not in df.columns:
                     continue
-                p = part_dir / "part.parquet"
-                if p.exists():
-                    parquet_files.append(p)
+                old = df["symbol"].to_list()
+                df = df.with_columns(normalize_symbol(df["symbol"], lookup))
+                new = df["symbol"].to_list()
+                if old != new:
+                    _atomic_write_parquet(df, parquet_path)
+                    fixed += 1
+                    logger.info(
+                        "代码格式修复: %s/%s (%d 行)",
+                        config.id,
+                        parquet_path.parent.name,
+                        len(df),
+                    )
+            except Exception as e:
+                logger.warning("代码格式修复跳过 %s: %s", parquet_path, e)
 
-    fixed = 0
-    lookup = build_code_lookup(data_dir)
-    for parquet_path in parquet_files:
-        try:
-            df = pl.read_parquet(parquet_path)
-            if "symbol" not in df.columns:
-                continue
-            old = df["symbol"].to_list()
-            df = df.with_columns(normalize_symbol(df["symbol"], lookup))
-            new = df["symbol"].to_list()
-            if old != new:
-                df.write_parquet(parquet_path)
-                fixed += 1
-                logger.info("代码格式修复: %s/%s (%d 行)", config.id, parquet_path.parent.name, len(df))
-        except Exception as e:
-            logger.warning("代码格式修复跳过 %s: %s", parquet_path, e)
-
-    return fixed
+        if fixed:
+            _bump_ext_data_generation(config.id, data_dir)
+        return fixed
 
 
 def rows_to_parquet(

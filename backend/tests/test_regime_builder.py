@@ -13,6 +13,7 @@ import time
 from datetime import date
 
 import polars as pl
+import pytest
 
 from app.services import regime_builder
 
@@ -145,6 +146,84 @@ def test_aggregate_empty_returns_empty():
     assert regime_builder._aggregate_daily(pl.DataFrame()).is_empty()
 
 
+def test_run_regime_batch_does_not_apply_current_st_snapshot(tmp_path, monkeypatch):
+    """历史 ST 状态无版本时停用过滤，不能用当前名称反向改写历史。"""
+    from app.services import market_mainline, preferences
+
+    instruments = tmp_path / "instruments" / "part.parquet"
+    instruments.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"symbol": ["A", "B"], "name": ["*ST甲", "正常乙"]}).write_parquet(instruments)
+    monkeypatch.setattr(market_mainline, "_ST_SYMBOLS_CACHE", None)
+    monkeypatch.setattr(preferences, "get_sentiment_exclude_st", lambda: True)
+    monkeypatch.setattr(regime_builder, "_load_index_pct", lambda *a, **k: {})
+    for target in (date(2026, 1, 2), date(2026, 1, 3)):
+        part = tmp_path / "kline_daily_enriched" / f"date={target.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"cache-fixture")
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+        def get_enriched_range(self, start, end):
+            return _enriched_df()
+
+    out = regime_builder.run_regime_batch(_FakeRepo(), date(2026, 1, 2), date(2026, 1, 3))
+    r1 = out.filter(pl.col("date") == date(2026, 1, 2)).row(0, named=True)
+    r2 = out.filter(pl.col("date") == date(2026, 1, 3)).row(0, named=True)
+    assert r1["limit_up"] == 1
+    assert r1["up_count"] == 2
+    assert r1["down_count"] == 2
+    assert r2["max_consecutive"] == 2
+
+    monkeypatch.setattr(preferences, "get_sentiment_exclude_st", lambda: False)
+    out_all = regime_builder.run_regime_batch(_FakeRepo(), date(2026, 1, 2), date(2026, 1, 3))
+    r1_all = out_all.filter(pl.col("date") == date(2026, 1, 2)).row(0, named=True)
+    assert r1_all["limit_up"] == 1
+    assert r1_all["up_count"] == 2
+
+
+def test_run_regime_batch_cache_path_loads_previous_trading_day(tmp_path, monkeypatch):
+    """单日增量命中缓存时，晋级率仍应使用上一交易日的连板池。"""
+    target = date(2026, 1, 5)
+    previous = date(2026, 1, 2)
+    symbols = [f"S{i}" for i in range(12)]
+    full = pl.DataFrame({
+        "date": [previous] * 12 + [target] * 12,
+        "symbol": symbols * 2,
+        "close": [10.0] * 24,
+        "change_pct": [0.1] * 24,
+        "amount": [1e8] * 24,
+        "ma20": [9.0] * 24,
+        "signal_limit_up": [True] * 24,
+        "signal_limit_down": [False] * 24,
+        "signal_broken_limit_up": [False] * 24,
+        "consecutive_limit_ups": [1] * 12 + [2] * 12,
+    })
+    requested: list[date] = []
+    monkeypatch.setattr(regime_builder, "_load_index_pct", lambda *a, **k: {})
+    for value in (previous, target):
+        part = tmp_path / "kline_daily_enriched" / f"date={value}" / "part.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"cache-only-placeholder")
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+        def get_enriched_range(self, start, end):
+            requested.append(start)
+            return full.filter((pl.col("date") >= start) & (pl.col("date") <= end))
+
+    out = regime_builder.run_regime_batch(_FakeRepo(), target, target)
+    row = out.row(0, named=True)
+
+    assert requested == [previous]
+    assert row["date"] == target
+    assert row["promo_pool"] == 12
+    assert row["promo_rate"] == 1.0
+
+
 # ───────────────────────── 持久化(upsert) ─────────────────────────
 
 
@@ -180,6 +259,33 @@ def test_upsert_overwrites_existing_date(tmp_path):
     # 1/1 不受影响
     r1 = loaded.filter(pl.col("date") == date(2026, 1, 1)).row(0, named=True)
     assert r1["state"] == "range"
+
+
+def test_replace_range_clears_dates_missing_from_recompute(tmp_path):
+    """范围重算局部或整体为空时，必须清除范围内没有新结果的旧行。"""
+    d1, d2, d3 = date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3)
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2, d3],
+        "state": ["range", "strong", "weak"],
+        "score": [50, 80, 20],
+    }))
+
+    regime_builder.replace_regime_history_range(
+        tmp_path,
+        pl.DataFrame({
+            "date": [d1],
+            "state": ["strong"],
+            "score": [90],
+        }),
+        start=d1,
+        end=d2,
+    )
+
+    loaded = regime_builder.load_regime_history(tmp_path).sort("date")
+    assert loaded.to_dicts() == [
+        {"date": d1, "state": "strong", "score": 90},
+        {"date": d3, "state": "weak", "score": 20},
+    ]
 
 
 def test_coverage_metadata(tmp_path):
@@ -225,16 +331,97 @@ def test_detect_stale_dates_by_mtime(tmp_path):
         "date": [date(2026, 1, 1), date(2026, 1, 2)],
         "state": ["range", "range"], "score": [50, 50],
     }))
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        _FakeRepo(),
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 2),
+    )
     # 让 1/2 的 mtime 更新到 future > regime mtime
     future = time.time() + 10
     os.utime(enriched_dir / "date=2026-01-02" / "part.parquet", (future, future))
 
-    class _FakeRepo:
-        class store:
-            data_dir = tmp_path
     stale = regime_builder.detect_stale_dates(tmp_path, _FakeRepo())
     assert date(2026, 1, 2) in stale
     assert date(2026, 1, 1) not in stale  # 1/1 没更新
+
+
+def test_date_source_version_survives_unrelated_partial_recompute(tmp_path):
+    """较晚日期局部重算不得掩盖较早日期已经变化的 enriched 来源。"""
+    d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+    enriched_dir = tmp_path / "kline_daily_enriched"
+    for target in (d1, d2):
+        part = enriched_dir / f"date={target.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True)
+        part.write_bytes(b"source-v1")
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    repo = _FakeRepo()
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2],
+        "state": ["range", "strong"],
+        "score": [50, 80],
+    }))
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        repo,
+        start=d1,
+        end=d2,
+    )
+
+    stale_source = enriched_dir / f"date={d1.isoformat()}" / "part.parquet"
+    stale_source.write_bytes(b"source-v2")
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d2],
+        "state": ["weak"],
+        "score": [20],
+    }))
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        repo,
+        start=d2,
+        end=d2,
+    )
+
+    assert regime_builder.detect_stale_dates(tmp_path, repo) == [d1]
+
+
+def test_index_source_version_marks_regime_date_stale(tmp_path):
+    """指数 enriched 覆写后，即使个股 enriched 未变也必须重算 regime。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    index = tmp_path / "kline_index_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    index.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    index.write_bytes(b"index-v1")
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    repo = _FakeRepo()
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [target],
+        "state": ["range"],
+        "score": [50],
+    }))
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        repo,
+        start=target,
+        end=target,
+    )
+
+    index.write_bytes(b"index-version-two")
+
+    assert regime_builder.detect_stale_dates(tmp_path, repo) == [target]
 
 
 def test_compute_incremental_missing_dates(tmp_path):
@@ -259,6 +446,286 @@ def test_compute_incremental_missing_dates(tmp_path):
     new = regime_builder.compute_regime_incremental(_FakeRepo(), tmp_path, today=date(2026, 1, 3))
     # 无真实 enriched 数据 → 不算出新行, 但不报错
     assert new.is_empty() or new.height >= 0
+
+
+def test_compute_incremental_defaults_to_cn_business_date(tmp_path, monkeypatch):
+    """增量 regime 的默认截止日应来自北京时间，而非服务器日历。"""
+    target = date(2099, 1, 2)
+    calls: list[tuple[date, date]] = []
+    monkeypatch.setattr(
+        regime_builder,
+        "cn_today",
+        lambda: target,
+        raising=False,
+    )
+    monkeypatch.setattr(regime_builder, "enriched_date_set", lambda repo: {target})
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda repo, start, end: calls.append((start, end)) or pl.DataFrame(),
+    )
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    regime_builder.compute_regime_incremental(_FakeRepo(), tmp_path)
+
+    assert calls == [(target, target)]
+
+
+def test_compute_incremental_clears_stale_date_when_recompute_is_empty(
+    tmp_path,
+    monkeypatch,
+):
+    """stale 分区重算为空时，旧 regime 行必须被删除。"""
+    d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+    enriched_dir = tmp_path / "kline_daily_enriched"
+    for target in (d1, d2):
+        part = enriched_dir / f"date={target.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True)
+        part.write_bytes(b"source")
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2],
+        "state": ["range", "strong"],
+        "score": [50, 80],
+    }))
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        _FakeRepo(),
+        start=d1,
+        end=d2,
+    )
+    future = time.time() + 10
+    os.utime(
+        enriched_dir / f"date={d2.isoformat()}" / "part.parquet",
+        (future, future),
+    )
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda repo, start, end: pl.DataFrame(),
+    )
+
+    result = regime_builder.compute_regime_incremental(
+        _FakeRepo(),
+        tmp_path,
+        today=d2,
+    )
+
+    assert result.is_empty()
+    stored = regime_builder.load_regime_history(tmp_path)
+    assert set(stored["date"].to_list()) == {d1}
+
+
+def test_compute_incremental_rejects_source_change_before_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """增量计算期间行情来源变化时不得发布旧结果或新水位。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    index = tmp_path / "kline_index_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    index.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    index.write_bytes(b"index-v1")
+    published: list[object] = []
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    def change_source_during_compute(*args, **kwargs):
+        index.write_bytes(b"index-version-two")
+        return pl.DataFrame({
+            "date": [target],
+            "state": ["range"],
+            "score": [50],
+        })
+
+    monkeypatch.setattr(regime_builder, "run_regime_batch", change_source_during_compute)
+    monkeypatch.setattr(
+        regime_builder,
+        "replace_regime_history_range",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(regime_builder.RegimeSourceChangedError):
+        regime_builder.compute_regime_incremental(
+            _FakeRepo(),
+            tmp_path,
+            today=target,
+        )
+
+    assert published == []
+    assert not regime_builder.regime_coverage_path(tmp_path).exists()
+
+
+def test_compute_incremental_publishes_labeled_history_and_coverage_together(
+    tmp_path,
+    monkeypatch,
+):
+    """增量结果先在内存重标，再与完成水位作为同一文件集提交。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    published: list[list[tuple[object, pl.DataFrame]]] = []
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda *args, **kwargs: pl.DataFrame({
+            "date": [target],
+            "state": ["range"],
+            "max_consecutive": [2],
+            "first_board": [10],
+            "ge2_count": [3],
+            "promo_rate": [0.1],
+            "seal_rate": [0.5],
+        }),
+    )
+    monkeypatch.setattr(
+        regime_builder,
+        "replace_parquet_set",
+        lambda entries, **kwargs: published.append(entries),
+    )
+
+    result = regime_builder.compute_regime_incremental(
+        _FakeRepo(),
+        tmp_path,
+        today=target,
+    )
+
+    assert result.height == 1
+    assert len(published) == 1
+    entries = dict(published[0])
+    assert set(entries) == {
+        regime_builder.regime_path(tmp_path),
+        regime_builder.regime_coverage_path(tmp_path),
+    }
+    assert entries[regime_builder.regime_path(tmp_path)]["phase"].to_list() == ["ice"]
+    assert entries[regime_builder.regime_coverage_path(tmp_path)]["date"].to_list() == [
+        target,
+    ]
+    assert not regime_builder.regime_path(tmp_path).exists()
+    assert not regime_builder.regime_coverage_path(tmp_path).exists()
+
+
+def test_compute_incremental_phase_label_failure_keeps_old_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """阶段重标失败必须发生在事务发布前，不能留下新水位。"""
+    target = date(2026, 1, 2)
+    enriched = tmp_path / "kline_daily_enriched" / f"date={target}" / "part.parquet"
+    enriched.parent.mkdir(parents=True)
+    enriched.write_bytes(b"stock-source")
+    published: list[object] = []
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda *args, **kwargs: pl.DataFrame({
+            "date": [target],
+            "state": ["range"],
+            "max_consecutive": [2],
+            "first_board": [10],
+            "ge2_count": [3],
+            "promo_rate": [0.1],
+            "seal_rate": [0.5],
+        }),
+    )
+    monkeypatch.setattr(
+        "app.services.market_phase.classify_phase_series",
+        lambda _frame: (_ for _ in ()).throw(RuntimeError("phase failed")),
+    )
+    monkeypatch.setattr(
+        regime_builder,
+        "replace_parquet_set",
+        lambda *args, **kwargs: published.append(args),
+    )
+
+    with pytest.raises(RuntimeError, match="phase failed"):
+        regime_builder.compute_regime_incremental(
+            _FakeRepo(),
+            tmp_path,
+            today=target,
+        )
+
+    assert published == []
+    assert not regime_builder.regime_path(tmp_path).exists()
+    assert not regime_builder.regime_coverage_path(tmp_path).exists()
+
+
+def test_compute_incremental_clears_deleted_enriched_date(
+    tmp_path,
+    monkeypatch,
+):
+    """来源分区被删除后，增量计算必须清除对应的旧 regime 行。"""
+    d1, d2 = date(2026, 1, 1), date(2026, 1, 2)
+    part = tmp_path / "kline_daily_enriched" / f"date={d1.isoformat()}" / "part.parquet"
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"source")
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [d1, d2],
+        "state": ["range", "strong"],
+        "score": [50, 80],
+    }))
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+    regime_builder.mark_regime_range_processed(
+        tmp_path,
+        _FakeRepo(),
+        start=d1,
+        end=d1,
+    )
+    calls: list[tuple[date, date]] = []
+    monkeypatch.setattr(
+        regime_builder,
+        "run_regime_batch",
+        lambda repo, start, end: calls.append((start, end)) or pl.DataFrame(),
+    )
+
+    result = regime_builder.compute_regime_incremental(
+        _FakeRepo(),
+        tmp_path,
+        today=d2,
+    )
+
+    assert result.is_empty()
+    assert calls == [(d2, d2)]
+    stored = regime_builder.load_regime_history(tmp_path)
+    assert set(stored["date"].to_list()) == {d1}
+
+
+def test_run_regime_batch_ignores_cached_deleted_target(tmp_path):
+    """磁盘分区已删除时，不得从仍含旧日数据的仓库缓存重建 regime。"""
+    target = date(2026, 1, 2)
+
+    class _FakeRepo:
+        class store:
+            data_dir = tmp_path
+
+        def get_enriched_range(self, start, end):
+            raise AssertionError("删除日期不应继续读取 enriched 缓存")
+
+    result = regime_builder.run_regime_batch(_FakeRepo(), target, target)
+
+    assert result.is_empty()
 
 
 # ───────────────────────── 回测环境过滤(T-1 防未来函数) ─────────────────────────
@@ -312,28 +779,58 @@ def test_build_regime_mask_none_when_no_filter():
     assert StrategyBacktestService._build_regime_mask(("2026-01-01",), None, None) is None
 
 
-def test_build_regime_mask_none_when_no_data(tmp_path):
-    """无 regime 历史数据 → 返回 None(不阻断回测)。"""
+def test_build_regime_mask_fails_when_no_data(tmp_path):
+    """启用过滤但无 regime 历史数据时必须阻止回测。"""
     from app.backtest.strategy import StrategyBacktestService
 
-    mask = StrategyBacktestService._build_regime_mask(
-        ("2026-01-01", "2026-01-02"), {"states": ["strong"]}, tmp_path,
-    )
-    assert mask is None
+    with pytest.raises(ValueError, match="市场环境数据为空"):
+        StrategyBacktestService._build_regime_mask(
+            ("2026-01-01", "2026-01-02"), {"states": ["strong"]}, tmp_path,
+        )
 
 
-def test_build_regime_mask_first_day_allowed(tmp_path):
-    """首日无前一日环境数据 → 默认允许(不阻断)。"""
+def test_build_regime_mask_fails_when_required_t1_date_is_missing(tmp_path):
+    """正式区间内任一入场日缺少 T-1 环境时必须阻止回测。"""
     from app.backtest.strategy import StrategyBacktestService
 
     regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
         "date": [date(2026, 1, 1)],
-        "state": ["weak"], "score": [10],
+        "state": ["strong"],
+        "score": [85],
     }))
-    labels = ("2026-01-01", "2026-01-02")
-    mask = StrategyBacktestService._build_regime_mask(
-        labels, {"states": ["strong"]}, tmp_path,
-    )
-    # 1/1 首日 → True; 1/2 由 1/1(weak) → False
-    assert mask.tolist() == [True, False]
 
+    with pytest.raises(ValueError, match="缺少前一交易日环境"):
+        StrategyBacktestService._build_regime_mask(
+            ("2026-01-01", "2026-01-02", "2026-01-03"),
+            {"states": ["strong"]},
+            tmp_path,
+        )
+
+
+def test_build_regime_mask_first_formal_day_requires_warmup_predecessor(tmp_path):
+    """正式首日缺少前一交易标签时必须阻断; warmup 前缀可安全对齐。"""
+    from app.backtest.strategy import StrategyBacktestService
+
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [date(2026, 1, 1), date(2026, 1, 2)],
+        "state": ["weak", "strong"],
+        "score": [10, 85],
+    }))
+    with pytest.raises(ValueError, match="正式首日"):
+        StrategyBacktestService._build_regime_mask(
+            ("2026-01-01", "2026-01-02"),
+            {"states": ["strong"]},
+            tmp_path,
+            required_start=date(2026, 1, 1),
+            required_end=date(2026, 1, 2),
+        )
+
+    mask = StrategyBacktestService._build_regime_mask(
+        ("2026-01-01", "2026-01-02", "2026-01-03"),
+        {"states": ["strong"]},
+        tmp_path,
+        required_start=date(2026, 1, 2),
+        required_end=date(2026, 1, 3),
+    )
+    assert mask is not None
+    assert mask.tolist() == [True, False, True]

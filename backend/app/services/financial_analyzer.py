@@ -23,7 +23,7 @@ _MAX_PERIODS = 4
 
 
 def _load_stock_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]:
-    """读取该标的财务数据,返回 {table: [records...]}(按 period_end 降序,截取最新 N 期)。
+    """读取当前态财务数据，按报告期取最新公告版本后截取最近 N 期。
 
     数值统一做 NaN/Inf → null 清洗,保证 JSON 序列化不报错。
     """
@@ -37,9 +37,19 @@ def _load_stock_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]
         if df.is_empty():
             result[table] = []
             continue
-        # 按 period_end 降序,截取最新 N 期
+        # 历史存储保留同报告期的全部公告版本；当前态 AI 分析只使用最新版本，
+        # 避免修订前后的重复行挤掉更早的独立报告期。
         if "period_end" in df.columns:
-            df = df.sort("period_end", descending=True).head(_MAX_PERIODS)
+            sort_columns = ["period_end"]
+            descending = [True]
+            if "announce_date" in df.columns:
+                sort_columns.append("announce_date")
+                descending.append(True)
+            df = (
+                df.sort(sort_columns, descending=descending, nulls_last=True)
+                .unique(subset=["period_end"], keep="first", maintain_order=True)
+                .head(_MAX_PERIODS)
+            )
         # 清洗 NaN/Inf,转成 JSON 安全的 dict 列表
         rows = []
         for rec in df.to_dicts():
@@ -178,14 +188,17 @@ async def analyze_financials_stream(
         from app.services.ai_provider import stream_ai_text
 
         user_prompt = _build_user_prompt(fins, symbol, focus)
+        got_content = False
         async for delta in stream_ai_text(
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.4,
-            max_tokens=4000,
+            # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
+            max_tokens=None,
         ):
+            got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 
     except Exception as e:  # noqa: BLE001
@@ -193,4 +206,8 @@ async def analyze_financials_stream(
         yield json.dumps({"type": "error", "message": f"AI 分析失败: {e}"}, ensure_ascii=False)
         return
 
+    if not got_content:
+        logger.warning("AI financial analysis ended with empty content for %s", symbol)
+        yield json.dumps({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"}, ensure_ascii=False)
+        return
     yield json.dumps({"type": "done"}, ensure_ascii=False)

@@ -14,12 +14,42 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
 
+from app.enriched_generation import stable_enriched_generation
+from app.market_time import cn_today
+from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
+from app.services.market_environment_lock import (
+    market_environment_journal_path,
+    market_environment_snapshot,
+    serialized_market_environment_update,
+)
+
 logger = logging.getLogger(__name__)
+
+
+class RegimeSourceChangedError(RuntimeError):
+    """全量环境计算期间个股或指数行情来源发生变化。"""
+
+
+def assert_enriched_source_empty(repo) -> None:
+    """发布空派生快照前复验 enriched 来源仍为空。"""
+    if enriched_date_set(repo):
+        raise RegimeSourceChangedError("清理派生数据期间行情来源已出现，请重试")
+
+
+@contextmanager
+def locked_empty_enriched_source(repo) -> Iterator[None]:
+    """从空源复验到派生清理发布持续阻止 enriched generation 切换。"""
+    with stable_enriched_generation(repo.store.data_dir, "stock"):
+        assert_enriched_source_empty(repo)
+        yield
+
 
 # ───────────────────────── 状态分类阈值(可调) ─────────────────────────
 # 评分模型对齐看板情绪分(market_overview_builder): 采用 _score(low,high) 归一化
@@ -150,13 +180,25 @@ def _aggregate_daily(df: pl.DataFrame, index_pct_map: dict | None = None) -> pl.
 
     纯 polars 聚合, 不重算指标(假设 df 已含 signal_*/change_pct/ma20 等列)。
     index_pct_map: {date: 指数涨幅} 可选, 由调用方从指数数据预先算好。
+    梯队指标(首板/N板宽度/晋级率)由 market_phase 提供; phase 列不在此算
+    (需要完整日序做平滑), 由 refresh_phase_labels 在 upsert 后统一重标。
     """
+    from app.services.market_phase import (
+        finalize_ladder_row,
+        ladder_daily_aggs,
+        ladder_promo_aggs,
+        with_prev_consecutive,
+    )
+
     needed = ["date", "change_pct", "amount", "signal_limit_up",
               "signal_limit_down", "signal_broken_limit_up",
               "consecutive_limit_ups", "close", "ma20"]
     avail = [c for c in needed if c in df.columns]
     if "date" not in avail or "change_pct" not in avail:
         return pl.DataFrame()
+
+    if "consecutive_limit_ups" in avail and "symbol" in df.columns:
+        df = with_prev_consecutive(df)
 
     # 基础聚合 — 全部用 group_by 一次性向量化算出, 避免逐日 filter 扫全表(OOM/超时元凶)。
     has_ma20 = "close" in avail and "ma20" in avail
@@ -215,6 +257,15 @@ def _aggregate_daily(df: pl.DataFrame, index_pct_map: dict | None = None) -> pl.
                   .then(1).otherwise(None).sum().alias("_valid_cnt"),
             ]
             if has_ma20 else []
+        ),
+        # 梯队指标(阶段判定所需): 首板/N板宽度/非空档位数; 晋级率需 _prev_consec
+        *(
+            ladder_daily_aggs()
+            if "consecutive_limit_ups" in avail else []
+        ),
+        *(
+            ladder_promo_aggs()
+            if "consecutive_limit_ups" in avail and "_prev_consec" in df.columns else []
         ),
     ).sort("date")
 
@@ -289,6 +340,8 @@ def _aggregate_daily(df: pl.DataFrame, index_pct_map: dict | None = None) -> pl.
             "speculation_score": round(sub["speculation"]),
             "resilience_score": round(sub["resilience"]),
             "trend_score": round(sub["trend"]),
+            # 梯队指标(阶段判定所需); phase 由 refresh_phase_labels 统一重标
+            **finalize_ladder_row(r),
         })
     return pl.DataFrame(rows) if rows else pl.DataFrame()
 
@@ -308,7 +361,6 @@ def _compute_batch(repo, enriched_dir, instruments, historical_shares,
     warmup 前缀保证每批边界的滚动窗口指标(ma20)正确, 不依赖相邻批次。
     返回目标区间(不含 warmup)的含指标列 DataFrame。
     """
-    from datetime import timedelta
     from app.indicators.pipeline import compute_indicators, compute_limit_signals
     warmup_start = batch_start - timedelta(days=warmup_days)
     df = pl.scan_parquet(enriched_dir / "**" / "*.parquet").filter(
@@ -325,6 +377,10 @@ def _compute_batch(repo, enriched_dir, instruments, historical_shares,
             needed={"signal_limit_up", "signal_limit_down", "signal_broken_limit_up"},
             historical_shares=historical_shares,
         )
+    # 晋级率需要昨日连板数: 在裁掉 warmup 之前先按 symbol 平移,
+    # 保证每批首日的 _prev_consec 来自 warmup 的最后一个交易日而非 null。
+    from app.services.market_phase import with_prev_consecutive
+    df = with_prev_consecutive(df)
     # 丢弃 warmup 行, 只留目标区间
     return df.filter((pl.col("date") >= batch_start) & (pl.col("date") <= batch_end))
 
@@ -410,19 +466,42 @@ def run_regime_batch(repo, start: date, end: date) -> pl.DataFrame:
     if start > end:
         return pl.DataFrame()
 
+    available_dates = enriched_date_set(repo)
+    target_dates = sorted(d for d in available_dates if start <= d <= end)
+    if not target_dates:
+        return pl.DataFrame()
+
     # 指数涨幅(主力指数)
     index_pct_map = _load_index_pct(repo, start, end)
 
+    # 晋级率依赖上一交易日连板池。缓存快路径也必须带一个交易日前缀，不能只取
+    # 目标日；优先从分区目录精确定位，目录不可用时多取 45 个日历日并让缓存裁剪。
+    previous_date = max((value for value in available_dates if value < start), default=None)
+    cache_start = previous_date or (start - timedelta(days=45))
+
     # enriched 多日数据(优先缓存)
-    df = repo.get_enriched_range(start, end)
+    df = repo.get_enriched_range(cache_start, end)
     if df is None or df.is_empty():
         logger.info("regime batch: enriched cache miss [%s~%s], fallback to scan", start, end)
         df = _scan_enriched_fallback(repo, start, end)
     if df is None or df.is_empty():
         logger.info("regime batch: no enriched data for [%s~%s]", start, end)
         return pl.DataFrame()
+    allowed_dates = set(target_dates)
+    if previous_date is not None:
+        allowed_dates.add(previous_date)
+    if "date" in df.columns:
+        # 缓存可能仍含已删除分区；只允许磁盘上仍存在的交易日参与本次聚合。
+        df = df.filter(pl.col("date").cast(pl.Date).is_in(sorted(allowed_dates)))
+    if df.is_empty():
+        return pl.DataFrame()
 
-    return _aggregate_daily(df, index_pct_map)
+    # 当前 instruments 名称没有历史生效日期，不能用一个当前 ST 集合过滤整段历史。
+    # 在引入 point-in-time 风险警示状态前，历史 regime 明确停用该过滤。
+    aggregated = _aggregate_daily(df, index_pct_map)
+    if aggregated.is_empty():
+        return aggregated
+    return aggregated.filter((pl.col("date") >= start) & (pl.col("date") <= end))
 
 
 # ───────────────────────── 持久化(upsert) ─────────────────────────
@@ -434,18 +513,215 @@ def regime_path(data_dir: Path) -> Path:
     return data_dir / REGIME_DIR / "part.parquet"
 
 
-def load_regime_history(data_dir: Path) -> pl.DataFrame:
-    """读取全部 regime 时序; 不存在返回空 DataFrame。"""
-    p = regime_path(data_dir)
-    if not p.exists():
+def regime_coverage_path(data_dir: Path) -> Path:
+    """保存每个 regime 日期处理时对应的个股与指数 enriched 来源版本。"""
+    return data_dir / REGIME_DIR / "coverage.parquet"
+
+
+def clear_regime_history(data_dir: Path) -> None:
+    """删除失去 enriched 来源后的 regime 历史及逐日完成水位。"""
+    for path in (regime_path(data_dir), regime_coverage_path(data_dir)):
+        path.unlink(missing_ok=True)
+
+
+def _load_regime_coverage(data_dir: Path) -> pl.DataFrame:
+    path = regime_coverage_path(data_dir)
+    if not path.exists():
         return pl.DataFrame()
     try:
-        return pl.read_parquet(p)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("load_regime_history failed: %s", e)
+        frame = pl.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("load regime coverage failed: %s", exc)
         return pl.DataFrame()
+    if not {"date", "source_mtime_ns"}.issubset(frame.columns):
+        return pl.DataFrame()
+    return frame.select([
+        pl.col("date").cast(pl.Date),
+        pl.col("source_mtime_ns").cast(pl.Int64),
+        (
+            pl.col("index_source_mtime_ns").cast(pl.Int64)
+            if "index_source_mtime_ns" in frame.columns
+            else pl.lit(None).cast(pl.Int64).alias("index_source_mtime_ns")
+        ),
+        (
+            pl.col("index_source_size").cast(pl.Int64)
+            if "index_source_size" in frame.columns
+            else pl.lit(None).cast(pl.Int64).alias("index_source_size")
+        ),
+    ])
 
 
+def _processed_regime_dates(data_dir: Path) -> set[date]:
+    coverage = _load_regime_coverage(data_dir)
+    if coverage.is_empty():
+        return set()
+    return set(coverage["date"].to_list())
+
+
+def _enriched_partition_mtime_ns(repo, target_date: date) -> int | None:
+    path = (
+        repo.store.data_dir
+        / "kline_daily_enriched"
+        / f"date={target_date.isoformat()}"
+        / "part.parquet"
+    )
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _index_partition_version(repo, target_date: date) -> tuple[int | None, int | None]:
+    path = (
+        repo.store.data_dir
+        / "kline_index_enriched"
+        / f"date={target_date.isoformat()}"
+        / "part.parquet"
+    )
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _regime_coverage_frame(repo, *, start: date, end: date) -> pl.DataFrame:
+    dates = sorted(
+        target_date
+        for target_date in enriched_date_set(repo)
+        if start <= target_date <= end
+    )
+    index_versions = [_index_partition_version(repo, target_date) for target_date in dates]
+    return pl.DataFrame({
+        "date": pl.Series(dates, dtype=pl.Date),
+        "source_mtime_ns": pl.Series(
+            [_enriched_partition_mtime_ns(repo, target_date) for target_date in dates],
+            dtype=pl.Int64,
+        ),
+        "index_source_mtime_ns": pl.Series(
+            [version[0] for version in index_versions],
+            dtype=pl.Int64,
+        ),
+        "index_source_size": pl.Series(
+            [version[1] for version in index_versions],
+            dtype=pl.Int64,
+        ),
+    })
+
+
+def capture_regime_source_snapshot(repo, *, start: date, end: date) -> pl.DataFrame:
+    """捕获全量环境结果对应的个股 enriched 与指数 enriched 来源版本。"""
+    return _regime_coverage_frame(repo, start=start, end=end)
+
+
+def assert_regime_source_unchanged(
+    expected: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    """发布前复验环境计算使用的完整行情来源版本。"""
+    current = capture_regime_source_snapshot(repo, start=start, end=end)
+    if expected.to_dicts() != current.to_dicts():
+        raise RegimeSourceChangedError("环境计算期间行情来源已更新，请重试全量重算")
+
+
+def mark_regime_range_processed(
+    data_dir: Path,
+    repo,
+    *,
+    start: date,
+    end: date,
+    source_snapshot: pl.DataFrame | None = None,
+) -> None:
+    """以当前个股与指数 enriched 版本完整替换指定日期范围的完成水位。"""
+    if start > end:
+        return
+    path = regime_coverage_path(data_dir)
+    old = _load_regime_coverage(data_dir)
+    kept = (
+        old.filter((pl.col("date") < start) | (pl.col("date") > end))
+        if not old.is_empty()
+        else pl.DataFrame()
+    )
+    incoming = source_snapshot
+    if incoming is None:
+        incoming = capture_regime_source_snapshot(repo, start=start, end=end)
+    elif not incoming.is_empty():
+        incoming = incoming.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end),
+        )
+    if kept.is_empty():
+        combined = incoming
+    elif incoming.is_empty():
+        combined = kept
+    else:
+        combined = pl.concat([kept.select(incoming.columns), incoming])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_parquet_atomic(
+        combined.unique(subset=["date"], keep="last").sort("date"),
+        path,
+    )
+
+
+def load_regime_history(data_dir: Path) -> pl.DataFrame:
+    """读取全部 regime 时序; 不存在返回空 DataFrame。"""
+    with market_environment_snapshot(data_dir):
+        p = regime_path(data_dir)
+        if not p.exists():
+            return pl.DataFrame()
+        try:
+            return pl.read_parquet(p)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("load_regime_history failed: %s", e)
+            return pl.DataFrame()
+
+
+def label_phase_history(
+    df: pl.DataFrame,
+    *,
+    strict: bool = False,
+) -> tuple[pl.DataFrame, int]:
+    """在内存中对全量 regime 时序重标情绪周期阶段。"""
+    from app.services.market_phase import classify_phase_series
+
+    required = {
+        "date",
+        "max_consecutive",
+        "first_board",
+        "ge2_count",
+        "promo_rate",
+        "seal_rate",
+    }
+    if df.is_empty() or not required.issubset(df.columns):
+        return df, 0
+    try:
+        labeled = classify_phase_series(df)
+    except Exception as e:
+        if strict:
+            raise
+        logger.warning("refresh_phase_labels failed: %s", e)
+        return df, 0
+    return labeled, labeled.height
+
+
+@serialized_market_environment_update
+def refresh_phase_labels(data_dir: Path) -> int:
+    """对全量 regime 时序重标情绪周期阶段(冰点/启动/主升/高潮/退潮/修复)。
+
+    阶段判定需要完整日序(EMA 平滑 + 持续性确认), 不能在单批内完成,
+    因此每次 upsert 后调用本函数整体重标并写回。行数为天数(千级), 开销可忽略。
+    返回标注的天数; 阶段列缺失所需指标(旧 schema 未重算)时返回 0。
+    """
+    df = load_regime_history(data_dir)
+    labeled, days = label_phase_history(df)
+    if days:
+        write_parquet_atomic(labeled, regime_path(data_dir))
+    return days
+
+
+@serialized_market_environment_update
 def upsert_regime_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
     """按 date 覆盖(upsert): 重算的天覆盖旧行, 新天追加。
 
@@ -477,7 +753,192 @@ def upsert_regime_history(data_dir: Path, new_rows: pl.DataFrame) -> None:
         new_rows = new_rows.select(target_cols)
         combined = pl.concat([kept, new_rows], how="vertical_relaxed")
     combined = combined.sort("date").unique(subset=["date"], keep="last")
-    combined.write_parquet(p)
+    write_parquet_atomic(combined, p)
+
+
+def build_regime_history_full_snapshot(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+    source_snapshot: pl.DataFrame | None = None,
+) -> list[tuple[Path, pl.DataFrame]]:
+    """构建可与主线结果一起发布的全量 regime 文件集合。"""
+    incoming = new_rows
+    if not incoming.is_empty():
+        incoming = (
+            incoming.filter((pl.col("date") >= start) & (pl.col("date") <= end))
+            .sort("date")
+            .unique(subset=["date"], keep="last")
+        )
+    coverage = source_snapshot
+    if coverage is None:
+        coverage = capture_regime_source_snapshot(repo, start=start, end=end)
+    return [
+        (regime_path(data_dir), incoming),
+        (regime_coverage_path(data_dir), coverage),
+    ]
+
+
+@serialized_market_environment_update
+def replace_regime_history_full(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+    source_snapshot: pl.DataFrame | None = None,
+) -> None:
+    """原子发布全量 regime 历史及其来源版本水位。"""
+    if source_snapshot is not None:
+        assert_regime_source_unchanged(
+            source_snapshot,
+            repo,
+            start=start,
+            end=end,
+        )
+    entries = build_regime_history_full_snapshot(
+        data_dir,
+        new_rows,
+        repo,
+        start=start,
+        end=end,
+        source_snapshot=source_snapshot,
+    )
+    replace_parquet_set(
+        entries,
+        journal_path=market_environment_journal_path(data_dir),
+    )
+
+
+@serialized_market_environment_update
+def replace_regime_history_range(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    """以重算结果完整替换日期范围，允许结果局部或整体为空。"""
+    if start > end:
+        return
+    p = regime_path(data_dir)
+    old = load_regime_history(data_dir)
+    if old.is_empty() and new_rows.is_empty():
+        return
+
+    incoming = new_rows
+    if not incoming.is_empty():
+        incoming = incoming.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end)
+        )
+
+    if old.is_empty():
+        combined = incoming
+    else:
+        kept = old.filter(~((pl.col("date") >= start) & (pl.col("date") <= end)))
+        if incoming.is_empty():
+            combined = kept
+        else:
+            target_cols = incoming.columns
+            kept = kept.select([
+                pl.col(column)
+                if column in kept.columns
+                else pl.lit(None).alias(column)
+                for column in target_cols
+            ])
+            combined = pl.concat(
+                [kept, incoming.select(target_cols)],
+                how="vertical_relaxed",
+            )
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_parquet_atomic(
+        combined.sort("date").unique(subset=["date"], keep="last"),
+        p,
+    )
+
+
+def build_regime_history_range_snapshot(
+    data_dir: Path,
+    new_rows: pl.DataFrame,
+    repo,
+    *,
+    start: date,
+    end: date,
+    source_snapshot: pl.DataFrame | None = None,
+) -> tuple[list[tuple[Path, pl.DataFrame]], int]:
+    """构建区间重算后的最终阶段历史与完成水位，不提前写盘。"""
+    old = load_regime_history(data_dir)
+    incoming = new_rows
+    if not incoming.is_empty():
+        incoming = incoming.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end),
+        )
+
+    if old.is_empty():
+        combined = incoming
+    else:
+        kept = old.filter(~((pl.col("date") >= start) & (pl.col("date") <= end)))
+        if incoming.is_empty():
+            combined = kept
+        else:
+            target_cols = incoming.columns
+            kept = kept.select([
+                pl.col(column)
+                if column in kept.columns
+                else pl.lit(None).alias(column)
+                for column in target_cols
+            ])
+            combined = pl.concat(
+                [kept, incoming.select(target_cols)],
+                how="vertical_relaxed",
+            )
+    if not combined.is_empty():
+        combined = combined.sort("date").unique(subset=["date"], keep="last")
+    labeled, phase_days = label_phase_history(combined, strict=True)
+
+    old_coverage = _load_regime_coverage(data_dir)
+    kept_coverage = (
+        old_coverage.filter(
+            (pl.col("date") < start) | (pl.col("date") > end),
+        )
+        if not old_coverage.is_empty()
+        else pl.DataFrame()
+    )
+    incoming_coverage = source_snapshot
+    if incoming_coverage is None:
+        incoming_coverage = capture_regime_source_snapshot(
+            repo,
+            start=start,
+            end=end,
+        )
+    elif not incoming_coverage.is_empty():
+        incoming_coverage = incoming_coverage.filter(
+            (pl.col("date") >= start) & (pl.col("date") <= end),
+        )
+    if kept_coverage.is_empty():
+        combined_coverage = incoming_coverage
+    elif incoming_coverage.is_empty():
+        combined_coverage = kept_coverage
+    else:
+        combined_coverage = pl.concat([
+            kept_coverage.select(incoming_coverage.columns),
+            incoming_coverage,
+        ])
+    if not combined_coverage.is_empty():
+        combined_coverage = combined_coverage.unique(
+            subset=["date"],
+            keep="last",
+        ).sort("date")
+
+    return [
+        (regime_path(data_dir), labeled),
+        (regime_coverage_path(data_dir), combined_coverage),
+    ], phase_days
 
 
 def get_regime_coverage(data_dir: Path) -> dict:
@@ -493,66 +954,112 @@ def get_regime_coverage(data_dir: Path) -> dict:
 
 
 def detect_stale_dates(data_dir: Path, repo) -> list[date]:
-    """检测 regime 已有但需要重算的天(enriched 被覆写)。
-
-    用 mtime 比对: enriched 分区 parquet 的 mtime > regime parquet 的 mtime
-    → 该日 enriched 更新过, regime 需重算。
-    """
-    regime_p = regime_path(data_dir)
-    if not regime_p.exists():
-        return []
-    regime_mtime = regime_p.stat().st_mtime
-    enriched_dir = repo.store.data_dir / "kline_daily_enriched"
-    if not enriched_dir.exists():
-        return []
-    stale: list[date] = []
+    """检测每个已处理日期的个股或指数 enriched 来源版本是否发生变化。"""
     existing = load_regime_history(data_dir)
-    if existing.is_empty():
+    existing_dates = (
+        set(existing["date"].to_list())
+        if not existing.is_empty() and "date" in existing.columns
+        else set()
+    )
+    completed_dates = existing_dates | _processed_regime_dates(data_dir)
+    if not completed_dates:
         return []
-    existing_dates = set(existing["date"].to_list())
-    for part in enriched_dir.glob("date=*/part.parquet"):
-        try:
-            ds = part.parent.name.replace("date=", "")
-            d = date.fromisoformat(ds)
-        except (ValueError, OSError):
-            continue
-        if d not in existing_dates:
-            continue
-        try:
-            if part.stat().st_mtime > regime_mtime:
-                stale.append(d)
-        except OSError:
-            continue
-    return sorted(stale)
+    coverage = _load_regime_coverage(data_dir)
+    recorded = {
+        row["date"]: (
+            row["source_mtime_ns"],
+            row["index_source_mtime_ns"],
+            row["index_source_size"],
+        )
+        for row in coverage.iter_rows(named=True)
+    }
+    return sorted(
+        target_date
+        for target_date in completed_dates
+        if (
+            (current := _enriched_partition_mtime_ns(repo, target_date)) is not None
+            and (
+                target_date not in recorded
+                or recorded[target_date][0] != current
+            )
+        )
+        or (
+            target_date in recorded
+            and recorded[target_date][1:]
+            != _index_partition_version(repo, target_date)
+        )
+    )
 
 
+def latest_phase_transition(data_dir: Path) -> tuple[str, str, str] | None:
+    """读取 regime 时序末两日, 返回最近一次阶段切换 (prev, new, 日期str)。
+
+    末两日阶段相同(或数据不足/无阶段列)返回 None。供盘后管道推送阶段切换通知。
+    """
+    hist = load_regime_history(data_dir)
+    if hist.is_empty() or "phase" not in hist.columns:
+        return None
+    tail = hist.select(["date", "phase"]).sort("date").tail(2)
+    if tail.height < 2:
+        return None
+    prev_phase, cur_phase = tail["phase"].to_list()
+    if not prev_phase or not cur_phase or prev_phase == cur_phase:
+        return None
+    return prev_phase, cur_phase, str(tail["date"][-1])
+
+
+@serialized_market_environment_update
 def compute_regime_incremental(repo, data_dir: Path, *, today: date | None = None) -> pl.DataFrame:
     """增量计算 regime(供 daily_pipeline / 启动补算调用)。
 
     双检测: 1) 缺口(enriched 有但 regime 没有) 2) stale(enriched 被覆写)。
     自动补齐所有需要的日。返回本次新算的 DataFrame。
     """
-    today = today or date.today()
+    today = today or cn_today()
     existing = load_regime_history(data_dir)
 
     # 缺口: enriched 有哪些天, regime 缺哪些
     enriched_dates = enriched_date_set(repo)
     existing_dates = set(existing["date"].to_list()) if not existing.is_empty() else set()
-    missing = sorted(d for d in enriched_dates if d not in existing_dates and d <= today)
+    processed_dates = _processed_regime_dates(data_dir)
+    completed_dates = existing_dates | processed_dates
+    missing = sorted(d for d in enriched_dates if d not in completed_dates and d <= today)
 
-    # stale: enriched 覆写过
-    stale = detect_stale_dates(data_dir, repo)
+    # stale: enriched 覆写过；removed: 已有历史对应的来源分区被删除。
+    stale = sorted(d for d in detect_stale_dates(data_dir, repo) if d <= today)
+    removed = sorted(d for d in completed_dates - enriched_dates if d <= today)
 
-    to_compute = sorted(set(missing) | set(stale))
+    to_compute = sorted(set(missing) | set(stale) | set(removed))
     if not to_compute:
         logger.debug("regime incremental: nothing to compute")
         return pl.DataFrame()
 
-    logger.info("regime incremental: compute %d days (missing=%d, stale=%d)",
-                len(to_compute), len(missing), len(stale))
+    logger.info("regime incremental: compute %d days (missing=%d, stale=%d, removed=%d)",
+                len(to_compute), len(missing), len(stale), len(removed))
+    source_snapshot = capture_regime_source_snapshot(
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
+    )
     new_rows = run_regime_batch(repo, start=to_compute[0], end=to_compute[-1])
-    if not new_rows.is_empty():
-        upsert_regime_history(data_dir, new_rows)
+    entries, _phase_days = build_regime_history_range_snapshot(
+        data_dir,
+        new_rows,
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
+        source_snapshot=source_snapshot,
+    )
+    assert_regime_source_unchanged(
+        source_snapshot,
+        repo,
+        start=to_compute[0],
+        end=to_compute[-1],
+    )
+    replace_parquet_set(
+        entries,
+        journal_path=market_environment_journal_path(data_dir),
+    )
     return new_rows
 
 

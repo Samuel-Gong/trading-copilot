@@ -2,8 +2,12 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'node:path'
 
-const backendPort = process.env.TICKFLOW_BACKEND_PORT ?? '3018'
-const backendTarget = `http://localhost:${backendPort}`
+import { buildBackendTarget } from './viteBackendTarget'
+
+const backendHost = process.env.BACKEND_HOST || '127.0.0.1'
+const legacyBackendPort = process.env.TICKFLOW_BACKEND_PORT ?? '3018'
+const backendPort = process.env.BACKEND_PORT || legacyBackendPort
+const backendTarget = buildBackendTarget(backendHost, backendPort)
 
 export default defineConfig({
   plugins: [react()],
@@ -13,10 +17,10 @@ export default defineConfig({
     },
   },
   server: {
-    host: '0.0.0.0',   // 允许局域网访问
+    host: '0.0.0.0',   // dev.sh / dev.ps1 会用 CLI --host 覆盖
     port: 3011,
     proxy: {
-      // dev 时 /api 转发到 FastAPI
+      // dev 时 /api 转发到与启动脚本相同的 FastAPI 地址
       '/api': {
         target: backendTarget,
         // SSE 端点需要禁用缓冲

@@ -2,15 +2,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import threading
-from datetime import date, datetime, timezone
-from functools import reduce
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
+from app.market_time import CN_TZ
 from app.services.ext_data import (
     ExtConfig,
     ExtConfigStore,
@@ -18,6 +16,48 @@ from app.services.ext_data import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _beijing_datetime(now: datetime | None = None) -> datetime:
+    """把当前或传入时刻统一为北京时间；无时区值按北京时间解释。"""
+    current = now or datetime.now(CN_TZ)
+    if current.tzinfo is None:
+        return current.replace(tzinfo=CN_TZ)
+    return current.astimezone(CN_TZ)
+
+
+def _in_time_window(
+    start: str | None,
+    end: str | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """检查当前北京时间是否在每日时间窗口内。
+
+    start/end 为 "HH:MM" 格式。两者都为 None 时不限制(返回 True)。
+    支持跨午夜窗口(如 22:00-02:00)。
+    """
+    if not start or not end:
+        return True
+    current = _beijing_datetime(now)
+    current_hm = current.strftime("%H:%M")
+    if start <= end:
+        return start <= current_hm < end
+    # 跨午夜: 如 22:00-02:00
+    return current_hm >= start or current_hm < end
+
+
+def _seconds_until_window_start(start: str, *, now: datetime | None = None) -> float | None:
+    """返回北京时间当前时刻到下一个每日窗口起点的秒数; 格式非法时返回 None。"""
+    current = _beijing_datetime(now)
+    try:
+        hour, minute = (int(part) for part in start.split(":", 1))
+        target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except (TypeError, ValueError):
+        return None
+    if target <= current:
+        target += timedelta(days=1)
+    return max((target - current).total_seconds(), 60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +183,7 @@ async def fetch_and_ingest(
         raise ValueError("数据行中缺少 symbol/code 字段，请配置字段映射或标的映射")
 
     # 写入
-    snap = date.today()
+    snap = _beijing_datetime().date()
     n = rows_to_parquet(rows, config, data_dir, snapshot_date=snap)
     return n, snap.isoformat()
 
@@ -253,6 +293,27 @@ class PullScheduler:
                     break
                 pull = fresh.pull
 
+                # 时间窗口检查: 不在窗口内则跳过本次拉取
+                if not _in_time_window(pull.time_window_start, pull.time_window_end):
+                    fresh.pull.last_run = datetime.now(timezone.utc).isoformat()
+                    fresh.pull.last_status = "skipped"
+                    fresh.pull.last_message = "不在拉取时间窗口内"
+                    schedule_interval = max(pull.schedule_minutes * 60, 60)
+                    until_window = _seconds_until_window_start(pull.time_window_start)
+                    interval = (
+                        min(schedule_interval, until_window)
+                        if until_window is not None
+                        else schedule_interval
+                    )
+                    next_dt = datetime.now(timezone.utc).timestamp() + interval
+                    fresh.pull.next_run = datetime.fromtimestamp(
+                        next_dt, tz=timezone.utc
+                    ).isoformat()
+                    store.update(fresh)
+                    logger.info("PullScheduler: %s skipped (outside time window)", config.id)
+                    await asyncio.sleep(interval)
+                    continue
+
                 # 先执行一次 (启用即拉取, 让用户立刻看到生效)
                 try:
                     n, d = await fetch_and_ingest(fresh, self._data_dir)
@@ -260,7 +321,7 @@ class PullScheduler:
                     fresh.pull.last_status = "success"
                     fresh.pull.last_message = f"{n} rows @ {d}"
                     fresh.pull.last_rows = n
-                    store.upsert(fresh)
+                    store.update(fresh)
                     logger.info("PullScheduler: %s success, %d rows", config.id, n)
                 except Exception as e:
                     fresh2 = store.get(config.id)
@@ -268,7 +329,7 @@ class PullScheduler:
                         fresh2.pull.last_run = datetime.now(timezone.utc).isoformat()
                         fresh2.pull.last_status = "error"
                         fresh2.pull.last_message = str(e)[:200]
-                        store.upsert(fresh2)
+                        store.update(fresh2)
                     logger.warning("PullScheduler: %s error: %s", config.id, e)
 
                 # 间隔取自最新配置 (每次重新读取, 修复改间隔不生效)
@@ -280,7 +341,7 @@ class PullScheduler:
                     latest.pull.next_run = datetime.fromtimestamp(
                         next_dt, tz=timezone.utc
                     ).isoformat()
-                    store.upsert(latest)
+                    store.update(latest)
 
                 await asyncio.sleep(interval)
                 if not self._running:
