@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
+import { Fragment, useEffect, useMemo, useReducer, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   DndContext, closestCenter, KeyboardSensor, PointerSensor,
@@ -24,6 +24,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   ShieldAlert,
   Sparkles,
   Trash2,
@@ -50,7 +51,11 @@ import {
   buildInlineTradeCreatePayload,
   buildInlineTradeDraft,
   buildTradeInsertionTargets,
+  filterStockTradeGroups,
+  persistInlineTradeDraft,
+  reduceLedgerInlineTradeState,
   type InlineTradeDraft,
+  type TradeLedgerView,
   type TradeInsertionTarget,
 } from './portfolio/tradeInsertion'
 import {
@@ -143,7 +148,13 @@ export function Portfolio() {
   const [tradeDetailReturnPosition, setTradeDetailReturnPosition] = useState<PortfolioPosition | null>(null)
   const [draft, setDraft] = useState<TradeDraft | null>(null)
   const [statementOpen, setStatementOpen] = useState(false)
-  const [tradesView, setTradesView] = useState<'flat' | 'stock' | 'date'>('flat')
+  const [tradesView, setTradesView] = useState<TradeLedgerView>('flat')
+  const [stockTradeSearch, setStockTradeSearch] = useState('')
+  const [ledgerInlineTradeState, dispatchLedgerInlineTrade] = useReducer(
+    reduceLedgerInlineTradeState,
+    null,
+  )
+  const ledgerInlineDraft = ledgerInlineTradeState?.draft ?? null
   const tradingDatesQuery = useTradingDates()
   const tradingDates = tradingDatesQuery.data?.dates ?? []
 
@@ -152,6 +163,14 @@ export function Portfolio() {
     if (!latest) return
     setAsOf(current => current && tradingDates.includes(current) ? current : latest)
   }, [tradingDates, tradingDatesQuery.data?.latest_date])
+
+  useEffect(() => {
+    dispatchLedgerInlineTrade({ type: 'context-changed', context: 'account' })
+  }, [accountId])
+
+  useEffect(() => {
+    dispatchLedgerInlineTrade({ type: 'context-changed', context: 'date' })
+  }, [asOf])
 
   const accountsQuery = useQuery({
     queryKey: QK.portfolioAccounts,
@@ -249,6 +268,18 @@ export function Portfolio() {
         return a.symbol.localeCompare(b.symbol)
       })
   }, [visibleTrades])
+  const filteredTradesByStock = useMemo(
+    () => filterStockTradeGroups(tradesByStock, stockTradeSearch),
+    [stockTradeSearch, tradesByStock],
+  )
+  const filteredStockTradeCount = useMemo(
+    () => filteredTradesByStock.reduce((total, group) => total + group.items.length, 0),
+    [filteredTradesByStock],
+  )
+  const flatTradeInsertionTargets = useMemo(
+    () => buildTradeInsertionTargets(visibleTrades, asOf),
+    [asOf, visibleTrades],
+  )
 
   async function invalidatePortfolio() {
     await Promise.all([
@@ -382,22 +413,72 @@ export function Portfolio() {
   }
 
   async function saveInlineTrade(inlineDraft: InlineTradeDraft) {
-    const payload = buildInlineTradeCreatePayload(inlineDraft)
-    if (!payload) {
-      toast('请填写正数量及有效的成交价', 'error')
-      return false
-    }
     setTradeBusy(true)
     try {
-      await api.portfolioTradeCreate(payload)
-      await invalidatePortfolioTradeChanges()
+      const result = await persistInlineTradeDraft(inlineDraft, {
+        // 内联补录统一由这里提示错误，避免 API 层与页面重复 toast。
+        createTrade: payload => api.portfolioTradeCreate(payload, { quiet: true }),
+        invalidate: invalidatePortfolioTradeChanges,
+      })
+      if (result.status === 'invalid') {
+        toast('请填写正数量及有效的成交价', 'error')
+        return false
+      }
+      if (result.status === 'failed') {
+        toast(
+          result.error instanceof TypeError
+            ? '网络连接失败，请检查网络后重试'
+            : result.error instanceof Error
+              ? result.error.message
+              : '补录交易失败，请重试',
+          'error',
+        )
+        return false
+      }
+      if (result.refreshError) {
+        toast('交易已记录，但页面刷新失败，请手动刷新', 'error')
+        return true
+      }
       toast(inlineDraft.side === 'buy' ? '买入交易已记录' : '卖出交易已记录', 'success')
       return true
-    } catch {
-      return false
     } finally {
       setTradeBusy(false)
     }
+  }
+
+  const ledgerInteractionDisabled = Boolean(
+    ledgerInlineDraft || tradeBusy || reorderBusy || tradeEditBusy,
+  )
+
+  function startLedgerInlineTrade(trade: PortfolioTrade, target: TradeInsertionTarget) {
+    if (ledgerInteractionDisabled) return
+    dispatchLedgerInlineTrade({
+      type: 'start',
+      view: tradesView,
+      source: trade,
+      target,
+    })
+  }
+
+  async function saveLedgerInlineDraft() {
+    if (!ledgerInlineDraft || tradeBusy) return
+    const saved = await saveInlineTrade(ledgerInlineDraft)
+    dispatchLedgerInlineTrade({ type: 'save-result', saved })
+  }
+
+  function changeLedgerInlineDraft(nextDraft: InlineTradeDraft | null) {
+    dispatchLedgerInlineTrade(nextDraft
+      ? { type: 'change', draft: nextDraft }
+      : { type: 'cancel' })
+  }
+
+  function cancelLedgerInlineDraft() {
+    dispatchLedgerInlineTrade({ type: 'cancel' })
+  }
+
+  function changeTradesView(nextView: TradeLedgerView) {
+    setTradesView(nextView)
+    dispatchLedgerInlineTrade({ type: 'context-changed', context: 'view' })
   }
 
   async function deleteTrade(trade: PortfolioTrade) {
@@ -475,6 +556,7 @@ export function Portfolio() {
   // trades 是后端排序数组 (交易日倒序，日内 seq 倒序)：同一天内靠上的行是更晚的成交
   // 只允许同一交易日内拖放排序；跨日放置不改变状态，行会弹回原位
   function handleTradeDragEnd(event: DragEndEvent) {
+    if (ledgerInteractionDisabled) return
     const { active, over } = event
     if (!over || active.id === over.id) return
     const activeTrade = visibleTrades.find(item => item.id === active.id)
@@ -621,12 +703,12 @@ export function Portfolio() {
 
         <section className="overflow-hidden rounded-card border border-border bg-surface">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
-            <div><h2 className="text-sm font-medium">交易流水</h2><p className="mt-0.5 text-[11px] text-muted">同一交易日内的多笔交易可拖动行首手柄调整成交先后，影响持仓回放；删除交易会重算全部历史持仓</p></div>
+            <div><h2 className="text-sm font-medium">交易流水</h2><p className="mt-0.5 text-[11px] text-muted">同一交易日内的多笔交易可拖动排序；将鼠标移到流水行，点击行下边界的加号可临时补录</p></div>
             <div className="flex items-center gap-1">
               {(['flat', 'stock', 'date'] as const).map(v => (
                 <button
                   key={v}
-                  onClick={() => setTradesView(v)}
+                  onClick={() => changeTradesView(v)}
                   className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
                     tradesView === v ? 'border-accent text-accent' : 'border-transparent text-secondary hover:text-foreground'
                   }`}
@@ -637,6 +719,35 @@ export function Portfolio() {
             </div>
             <span className="font-mono text-[11px] text-muted">{visibleTrades.length} 笔</span>
           </div>
+          {tradesView === 'stock' && visibleTrades.length > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-elevated/20 px-4 py-2.5">
+              <label className="flex h-8 min-w-56 flex-1 items-center gap-2 rounded-btn border border-border bg-surface px-2.5 text-xs focus-within:border-accent/60 sm:max-w-sm">
+                <Search className="h-3.5 w-3.5 shrink-0 text-muted" />
+                <input
+                  aria-label="搜索交易流水个股"
+                  value={stockTradeSearch}
+                  onChange={event => setStockTradeSearch(event.target.value)}
+                  disabled={Boolean(ledgerInlineDraft)}
+                  placeholder="搜索个股名称或代码"
+                  className="min-w-0 flex-1 bg-transparent text-foreground outline-none placeholder:text-muted disabled:cursor-not-allowed"
+                />
+                {stockTradeSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setStockTradeSearch('')}
+                    disabled={Boolean(ledgerInlineDraft)}
+                    className="rounded-btn p-0.5 text-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                    title="清空搜索"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </label>
+              <span className="text-[11px] text-muted">
+                {filteredTradesByStock.length} 支个股 · {filteredStockTradeCount} 笔
+              </span>
+            </div>
+          )}
           {tradesQuery.isLoading ? (
             <div className="grid min-h-36 place-items-center"><Loader2 className="h-4 w-4 animate-spin text-muted" /></div>
           ) : tradesQuery.isError ? (
@@ -651,7 +762,19 @@ export function Portfolio() {
               </button>
             </div>
           ) : visibleTrades.length === 0 ? (
-            <div className="grid min-h-36 place-items-center px-4 text-center text-xs text-muted">尚无交易记录</div>
+            <div className="grid min-h-36 place-items-center px-4 text-center text-xs text-muted">
+              <div>
+                <div>尚无交易记录</div>
+                <button
+                  type="button"
+                  onClick={() => openCreateTrade('buy')}
+                  disabled={accounts.length === 0 || !asOf}
+                  className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-btn border border-accent/25 bg-accent/5 px-3 text-xs text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Plus className="h-3.5 w-3.5" />添加第一条交易
+                </button>
+              </div>
+            </div>
           ) : tradesView === 'date' ? (
             <div className="space-y-3 p-3">
               {tradesByDate.map(group => (
@@ -665,13 +788,38 @@ export function Portfolio() {
                       {group.items.length} 笔 · 买 {group.buyCount} / 卖 {group.sellCount} · 净买入 <SignedNetAmount value={group.netAmount} />（含费用税）
                     </div>
                   </div>
-                  <GroupedTradeTable items={group.items} mode="byDate" accountNameById={accountNameById} onDelete={deleteTrade} onReorderDay={reorderDayTrades} reorderBusy={reorderBusy} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} onUpdateDate={updateTradeDate} tradeEditBusy={tradeEditBusy} tradingDates={tradingDates} earliestTradingDate={tradingDatesQuery.data?.earliest_date} latestTradingDate={tradingDatesQuery.data?.latest_date} />
+                  <GroupedTradeTable
+                    items={group.items}
+                    mode="byDate"
+                    accountNameById={accountNameById}
+                    onDelete={deleteTrade}
+                    onReorderDay={reorderDayTrades}
+                    reorderBusy={reorderBusy}
+                    onEditCost={setCostEditTrade}
+                    onUpdateExecution={updateTradeExecution}
+                    onUpdateDate={updateTradeDate}
+                    tradeEditBusy={tradeEditBusy}
+                    tradingDates={tradingDates}
+                    earliestTradingDate={tradingDatesQuery.data?.earliest_date}
+                    latestTradingDate={tradingDatesQuery.data?.latest_date}
+                    insertionTargets={buildTradeInsertionTargets(group.items, group.date)}
+                    onInsertTrade={startLedgerInlineTrade}
+                    inlineDraft={ledgerInlineDraft}
+                    onInlineDraftChange={changeLedgerInlineDraft}
+                    onSaveInlineDraft={saveLedgerInlineDraft}
+                    inlineSaveBusy={tradeBusy}
+                    interactionDisabled={ledgerInteractionDisabled}
+                  />
                 </div>
               ))}
             </div>
           ) : tradesView === 'stock' ? (
             <div className="space-y-3 p-3">
-              {tradesByStock.map(group => (
+              {filteredTradesByStock.length === 0 ? (
+                <div className="grid min-h-32 place-items-center rounded-card border border-dashed border-border px-4 text-center text-xs text-muted">
+                  没有匹配“{stockTradeSearch.trim()}”的个股
+                </div>
+              ) : filteredTradesByStock.map(group => (
                 <div key={group.symbol} className="overflow-hidden rounded-card border border-border bg-surface">
                   <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-elevated/40 px-3.5 py-2.5">
                     <div>
@@ -682,23 +830,62 @@ export function Portfolio() {
                       买 {group.buyCount} / 卖 {group.sellCount} · 净买入 <SignedNetAmount value={group.netAmount} />（含费用税） · 净股数 <span className={`font-mono ${group.netQuantity > 0 ? 'text-foreground' : group.netQuantity < 0 ? 'text-bear' : 'text-muted'}`}>{formatQuantity(group.netQuantity)}</span>
                     </div>
                   </div>
-                  <GroupedTradeTable items={group.items} mode="byStock" accountNameById={accountNameById} onDelete={deleteTrade} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} onUpdateDate={updateTradeDate} tradeEditBusy={tradeEditBusy} tradingDates={tradingDates} earliestTradingDate={tradingDatesQuery.data?.earliest_date} latestTradingDate={tradingDatesQuery.data?.latest_date} />
+                  <GroupedTradeTable
+                    items={group.items}
+                    mode="byStock"
+                    accountNameById={accountNameById}
+                    onDelete={deleteTrade}
+                    onEditCost={setCostEditTrade}
+                    onUpdateExecution={updateTradeExecution}
+                    onUpdateDate={updateTradeDate}
+                    tradeEditBusy={tradeEditBusy}
+                    tradingDates={tradingDates}
+                    earliestTradingDate={tradingDatesQuery.data?.earliest_date}
+                    latestTradingDate={tradingDatesQuery.data?.latest_date}
+                    insertionTargets={buildTradeInsertionTargets(group.items, asOf)}
+                    onInsertTrade={startLedgerInlineTrade}
+                    inlineDraft={ledgerInlineDraft}
+                    onInlineDraftChange={changeLedgerInlineDraft}
+                    onSaveInlineDraft={saveLedgerInlineDraft}
+                    inlineSaveBusy={tradeBusy}
+                    interactionDisabled={ledgerInteractionDisabled}
+                  />
                 </div>
               ))}
             </div>
           ) : (
             <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={handleTradeDragEnd}>
               <SortableContext items={visibleTrades.map(trade => trade.id)} strategy={verticalListSortingStrategy}>
-                <div className="overflow-x-auto">
+                <div className="overflow-x-auto pb-3">
                   <table className="w-full min-w-[900px] text-left text-xs">
                     <thead className="bg-elevated/50 text-muted"><tr><th className="w-7" /><th className="px-4 py-2 font-medium">交易日</th><th className="px-3 py-2 font-medium">标的 / 账户</th><th className="px-3 py-2 font-medium">方向</th><th className="px-3 py-2 text-right font-medium">成交价 × 数量</th><th className="px-3 py-2 text-right font-medium">费用 / 税费</th><th className="px-3 py-2 font-medium">备注</th><th className="px-4 py-2 text-right font-medium">操作</th></tr></thead>
                     <tbody className="divide-y divide-border/70">
-                      {visibleTrades.map(trade => (
-                        <SortableTradeRow key={trade.id} id={trade.id} busy={reorderBusy}>
-                          <td className="px-4 py-3 font-mono"><TradeDateCell trade={trade} busy={tradeEditBusy} tradingDates={tradingDates} earliestTradingDate={tradingDatesQuery.data?.earliest_date} latestTradingDate={tradingDatesQuery.data?.latest_date} onSave={updateTradeDate} /></td>
-                          <td className="px-3 py-3"><div>{trade.name || trade.symbol}</div><div className="font-mono text-[10px] text-muted">{trade.symbol} · {accountNameById[trade.account_id] || '未知账户'}</div></td>
-                          <TradeRowCells trade={trade} onDelete={deleteTrade} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} tradeEditBusy={tradeEditBusy} />
-                        </SortableTradeRow>
+                      {visibleTrades.map((trade, index) => (
+                        <Fragment key={trade.id}>
+                          <SortableTradeRow
+                            id={trade.id}
+                            busy={Boolean(reorderBusy || ledgerInteractionDisabled)}
+                            trade={trade}
+                            insertionTarget={flatTradeInsertionTargets[index]}
+                            onInsertTrade={startLedgerInlineTrade}
+                            insertionDisabled={ledgerInteractionDisabled}
+                          >
+                            <td className="px-4 py-3 font-mono"><TradeDateCell trade={trade} busy={Boolean(tradeEditBusy || ledgerInteractionDisabled)} tradingDates={tradingDates} earliestTradingDate={tradingDatesQuery.data?.earliest_date} latestTradingDate={tradingDatesQuery.data?.latest_date} onSave={updateTradeDate} /></td>
+                            <td className="px-3 py-3"><div>{trade.name || trade.symbol}</div><div className="font-mono text-[10px] text-muted">{trade.symbol} · {accountNameById[trade.account_id] || '未知账户'}</div></td>
+                            <TradeRowCells trade={trade} onDelete={deleteTrade} onEditCost={setCostEditTrade} onUpdateExecution={updateTradeExecution} tradeEditBusy={tradeEditBusy} interactionDisabled={ledgerInteractionDisabled} />
+                          </SortableTradeRow>
+                          {ledgerInlineDraft?.sourceTradeId === trade.id && (
+                            <InlineTradeDraftRow
+                              draft={ledgerInlineDraft}
+                              mode="byDate"
+                              accountName={accountNameById[ledgerInlineDraft.accountId] || '未知账户'}
+                              busy={tradeBusy}
+                              onChange={changeLedgerInlineDraft}
+                              onSave={saveLedgerInlineDraft}
+                              onCancel={cancelLedgerInlineDraft}
+                            />
+                          )}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>

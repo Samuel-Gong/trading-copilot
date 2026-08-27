@@ -2083,9 +2083,10 @@ export const api = {
     tax?: number
     note?: string
     insert_before_trade_id?: string
-  }) => request<PortfolioTrade>('/api/portfolio/trades', {
+  }, options?: { quiet?: boolean }) => request<PortfolioTrade>('/api/portfolio/trades', {
     method: 'POST',
     body: JSON.stringify(body),
+    quiet: options?.quiet,
   }),
   portfolioTradeDelete: (tradeId: string) =>
     request<{ ok: boolean }>(`/api/portfolio/trades/${encodeURIComponent(tradeId)}`, {
