@@ -332,21 +332,24 @@ def test_empty_input_date_cannot_replace_export_cache(client, monkeypatch, run_k
     assert strategy_cache.read_cache(data_dir) == original
 
 
-def test_historical_batch_run_without_cache_is_not_export_snapshot(client, monkeypatch):
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_run_without_cache_is_not_export_snapshot(client, monkeypatch, run_kind):
     import polars as pl
 
     from app.services.screener import ScreenerResult
 
     engine = client.app.state.strategy_engine
     engine.has = lambda _: True
-    engine.run_all = lambda *_, **__: {
-        "alpha": ScreenerResult(
-            as_of=date(2026, 9, 3),
-            strategy="alpha",
-            rows=[{"symbol": "000003.SZ"}],
-            total=1,
-        ),
-    }
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
     monkeypatch.setattr(
         api.ScreenerService,
         "build_strategy_context",
@@ -355,12 +358,63 @@ def test_historical_batch_run_without_cache_is_not_export_snapshot(client, monke
         ),
     )
 
-    response = client.post("/api/screener/run_all", json={
-        "strategy_ids": ["alpha"], "as_of": "2026-09-03",
-    })
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
 
     assert response.status_code == 200
-    assert response.json()["results"]["alpha"]["rows"][0]["symbol"] == "000003.SZ"
+    assert rows[0]["symbol"] == "000003.SZ"
+    assert strategy_cache.read_cache(client.app.state.repo.store.data_dir) is None
+    assert client.get("/api/screener/export").status_code == 404
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_run_without_latest_date_never_creates_export_snapshot(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    client.app.state.repo.enriched_latest_date = lambda: None
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
+
+    assert response.status_code == 200
+    assert rows[0]["symbol"] == "000003.SZ"
     assert strategy_cache.read_cache(client.app.state.repo.store.data_dir) is None
     assert client.get("/api/screener/export").status_code == 404
 

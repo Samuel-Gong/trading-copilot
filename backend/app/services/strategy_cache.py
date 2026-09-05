@@ -125,8 +125,8 @@ def write_cache(
     - 设置 preserve_newer 时, 防止历史日期覆盖较新的共享快照
     - latest_available_as_of 可为日期或延迟读取函数. 函数在写锁内调用, 避免
       过期日期快照放行较早任务覆盖并发完成的新结果
-    - only_latest_available 仅保存最新可用交易日的结果; 异常未来日期缓存仍可
-      被正常最新交易日替换
+    - only_latest_available 仅在能确认且日期等于最新可用交易日时保存; 异常未来
+      日期缓存仍可被正常最新交易日替换
     """
     path = _cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,7 +169,7 @@ def _write_cache_locked(
             if latest_available else None
         )
         incoming_date = date.fromisoformat(as_of)
-        if only_latest_available and latest_available_date and incoming_date < latest_available_date:
+        if only_latest_available and incoming_date != latest_available_date:
             return
         if preserve_newer and old_as_of:
             old_date = date.fromisoformat(old_as_of)
