@@ -213,7 +213,7 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
     return payload
 
 
-def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
+def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict, scope: str = "all") -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
     strategy_cache.write_cache(data_dir, as_of, {
         strategy_id: {
@@ -221,6 +221,8 @@ def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: di
             "as_of": as_of,
             "asset_type": "stock",
             "timeframe": "1d",
+            "scope": scope,
+            "computed_at_ns": time.time_ns(),
             "rows": safe_data.get("rows", []),
         }
     })
@@ -315,12 +317,13 @@ def run_preset(req: PresetRequest, request: Request):
 
     safe_data = _safe(asdict(result))
     if req.asset_type == "stock" and req.timeframe == "1d":
-        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
+        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data,
+                               "symbols" if req.pool else "all")
 
     return _result_with_ext(safe_data, ext_values)
 
 
-def _cached_with_realtime(request: Request, as_of: Optional[date] = None) -> dict:
+def _cached_with_realtime(request: Request) -> dict:
     """读取盘后缓存，并用监控引擎的实时结果覆盖同策略。"""
     data_dir = request.app.state.repo.store.data_dir
     cached = strategy_cache.read_cache(data_dir)
@@ -331,12 +334,6 @@ def _cached_with_realtime(request: Request, as_of: Optional[date] = None) -> dic
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     if monitor_engine is not None:
         realtime_results = monitor_engine.latest_strategy_results()
-        if as_of is not None:
-            # 导出指定日期时保留仍可用的盘后快照, 不让另一天的监控结果遮住它。
-            realtime_results = {
-                sid: result for sid, result in realtime_results.items()
-                if result.get("as_of") == str(as_of)
-            }
         if realtime_results:
             results = dict(cached.get("results") or {})
             results.update(realtime_results)
@@ -369,7 +366,10 @@ def get_export(
         and "1d" in meta.get("timeframes", ["1d"])
     }
     try:
-        payload = build_export(_cached_with_realtime(request, as_of), names, strategy_id, as_of)
+        monitor = getattr(request.app.state, "monitor_engine", None)
+        realtime = monitor.latest_strategy_results(for_export=True) if monitor else {}
+        payload = build_export(strategy_cache.read_cache(data_dir) or {}, names, strategy_id,
+                               as_of, realtime_results=realtime)
     except ExportError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     headers = {"Cache-Control": "no-store"}
@@ -611,6 +611,8 @@ def run_all(request: Request, body: Optional[dict] = None):
             "as_of": str(as_of),
             "asset_type": asset_type,
             "timeframe": timeframe,
+            "scope": "all",
+            "computed_at_ns": time.time_ns(),
             "rows": safe_rows,
         }
 
