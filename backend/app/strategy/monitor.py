@@ -324,8 +324,6 @@ class MonitorRuleEngine:
     def __init__(self, alert_handler: Callable[[dict], None] | None = None):
         self._alert_handler = alert_handler
         self._rules: dict[str, dict] = {}  # rule_id → rule
-        # 版本与规则对象绑定发布, 避免行情线程把旧规则计算标为新版本。
-        self._rule_versions: dict[str, tuple[int, dict]] = {}
         # (rule_id, symbol, event_type) → 上次触发时间戳(秒)。用于 cooldown 去重。
         self._last_fire: dict[tuple[str, str, str], float] = {}
         self._strategy_engine = None  # 延迟注入, type=strategy 规则用它跑选股
@@ -367,7 +365,6 @@ class MonitorRuleEngine:
 
     def invalidate_strategy_state(self) -> None:
         """策略注册表变更后清除选股池、结果和矩阵快照。"""
-        self._rule_versions = {rid: (time.time_ns(), rule) for rid, rule in self._rules.items()}
         self._strategy_pools.clear()
         self._strategy_signal_state.clear()
         self._strategy_signal_seen.clear()
@@ -436,13 +433,6 @@ class MonitorRuleEngine:
             and self._rule_state_signature(self._rules[rule_id])
             != self._rule_state_signature(rule)
         }
-        previous_versions = dict(self._rule_versions)
-        self._rule_versions = {
-            rid: (previous_versions[rid][0]
-                  if rid in previous_versions and previous_versions[rid][1] == rule
-                  else time.time_ns(), rule)
-            for rid, rule in new_rules.items()
-        }
         self._rules = new_rules
         active_ids = set(new_rules) - changed_ids
         self._last_fire = {
@@ -465,14 +455,11 @@ class MonitorRuleEngine:
 
     def add_rule(self, rule: dict) -> None:
         if rule.get("enabled") is not False:
-            self._rule_versions[rule["id"]] = (time.time_ns(), rule)
             self._rules[rule["id"]] = rule
         else:
-            self._rule_versions.pop(rule["id"], None)
             self._rules.pop(rule["id"], None)
 
     def remove_rule(self, rule_id: str) -> None:
-        self._rule_versions.pop(rule_id, None)
         self._rules.pop(rule_id, None)
         self._last_fire = {k: v for k, v in list(self._last_fire.items()) if k[0] != rule_id}
         self._strategy_pools = {
@@ -486,7 +473,6 @@ class MonitorRuleEngine:
         }
 
     def clear(self) -> None:
-        self._rule_versions.clear()
         self._rules.clear()
         self._last_fire.clear()
         self._strategy_pools.clear()
@@ -501,22 +487,13 @@ class MonitorRuleEngine:
     def rule_count(self) -> int:
         return len(self._rules)
 
-    def latest_strategy_results(self, *, for_export: bool = False) -> dict[str, dict]:
+    def latest_strategy_results(self) -> dict[str, dict]:
         """返回本轮 evaluate() 产出的策略选股结果 (strategy_id → {rows, total, as_of})。
 
         供策略页实时回显复用: /api/screener/cached 端点直接读取此内存结果,
         避免对被监控的策略重跑第二遍。无 type=strategy 规则时返回空 dict。
-        for_export 仅返回由当前规则版本算出的全市场完整结果。
         """
-        if not for_export:
-            return self._latest_strategy_results
-        versions = {rid: version[0] for rid, version in dict(self._rule_versions).items()}
-        return {
-            sid: result for sid, result in self._latest_strategy_results.items()
-            if result.get("scope") == "all"
-            and result.get("rule_version") is not None
-            and versions.get(result.get("rule_id")) == result["rule_version"]
-        }
+        return self._latest_strategy_results
 
     def consume_strategy_result_updates(self) -> bool:
         """返回并清除本轮成功写入的股票策略实时结果标记。"""
@@ -808,8 +785,6 @@ class MonitorRuleEngine:
         """
         if self._strategy_engine is None:
             return []
-        binding = self._rule_versions.get(rule.get("id"))
-        rule_version = binding[0] if binding and binding[1] is rule else None
         sid = rule.get("strategy_id")
         if not sid:
             return []
@@ -909,21 +884,12 @@ class MonitorRuleEngine:
         # 策略结果缓存仅用于股票策略页 /cached 回显; ETF 策略页走实时单跑, 不写入。
         # 写到 evaluate 提供的临时容器 (_building_strategy_results), 算完后整体替换,
         # 避免并发读到半填充状态。
-        scope = rule.get("scope", "symbols")
-        existing = self._building_strategy_results.get(sid) or {}
-        # 同策略存在多条规则时, 局部监控不能把本轮全市场结果截短。
-        if at == "stock" and (scope == "all" or existing.get("scope") != "all"):
+        if at == "stock":
             try:
                 import math
                 self._building_strategy_results[sid] = {
                     "total": result.total,
                     "as_of": str(cn_today()),
-                    "asset_type": "stock",
-                    "timeframe": "1d",
-                    "scope": scope,
-                    "rule_id": rule.get("id"),
-                    "rule_version": rule_version,
-                    "computed_at_ns": time.time_ns(),
                     "rows": [
                         {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
                          for k, v in row.items()}

@@ -36,23 +36,9 @@ def build_export(
     strategy_names: dict[str, str],
     strategy_ids: list[str] | None = None,
     as_of: date | None = None,
-    *,
-    realtime_results: dict | None = None,
 ) -> dict:
     """整批验证后返回快照; 缺失或跨日期结果不能伪装成完整股票清单。"""
     results = dict(cached.get("results") or {})
-    for sid, live in (realtime_results or {}).items():
-        # 只接受完整范围的监控结果; 同日按每个策略的完成时间比较,
-        # 避免另一策略写入文件的时间掩盖本策略实时结果。
-        if live.get("scope") != "all" or (as_of and live.get("as_of") != str(as_of)):
-            continue
-        stored = results.get(sid) or {}
-        if not isinstance(stored, dict):
-            stored = {}
-        live_key = (live.get("as_of") or "", live.get("computed_at_ns") or 0)
-        stored_key = (stored.get("as_of") or "", stored.get("computed_at_ns") or 0)
-        if not stored or (as_of and stored.get("as_of") != str(as_of)) or live_key > stored_key:
-            results[sid] = live
     ids = list(dict.fromkeys(strategy_ids)) if strategy_ids else [
         sid for sid in results if sid in strategy_names
     ]
@@ -71,8 +57,6 @@ def build_export(
         # 旧缓存没有资产信息, 曾可能被 ETF 单跑覆盖; 要求重跑以确认口径。
         if result.get("asset_type") != "stock" or result.get("timeframe") != "1d":
             raise ExportError(f"策略 {sid} 的缓存缺少股票日线标记, 请重新运行策略")
-        if result.get("scope") != "all":
-            raise ExportError(f"策略 {sid} 的结果不是完整范围, 请不限定股票池重新运行策略")
         try:
             result_date = date.fromisoformat(str(result.get("as_of")))
         except ValueError as exc:

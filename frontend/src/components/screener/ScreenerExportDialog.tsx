@@ -70,7 +70,7 @@ export function ScreenerExportDialog({ asOf, activeStrategy, strategyNames, pool
           </label>
           <span className="text-xs text-muted num">{asOf || '未选择日期'}</span>
         </div>
-        <p className="text-xs leading-6 text-muted">导出所选策略已完成的选股结果，保留策略配置的数量上限，不含今日已失效股票。页面的临时筛选和排序不影响导出。</p>
+        <p className="text-xs leading-6 text-muted">读取已保存的策略结果，保留策略数量及股票池设置，不含「今日曾命中」历史行。盘中监控、页面临时筛选和排序不影响导出。</p>
         <div className="rounded-btn border border-border bg-elevated/50 px-4 py-3 space-y-3">
           {!ready ? <p className="text-muted">请先选择日期并向策略池添加策略。</p>
             : busy ? <p role="status" className="text-muted">{download.isPending ? '正在生成文件…' : '正在读取选股结果…'}</p>
@@ -85,7 +85,7 @@ export function ScreenerExportDialog({ asOf, activeStrategy, strategyNames, pool
         <div className="space-y-2">
           <div className="flex items-center justify-between"><h3 className="text-sm text-foreground">供其他软件读取的 JSON API</h3><button className={buttonClass} disabled={!ready} onClick={copy}><Copy className="h-3 w-3" />复制地址</button></div>
           <textarea aria-label="JSON API 地址" readOnly value={ready ? apiUrl : ''} onFocus={e => e.target.select()} className="w-full h-20 resize-none p-3 text-xs font-mono bg-elevated border border-border rounded-btn text-secondary" />
-          <p className="text-xs text-muted leading-6">每天选股完成后请求同一地址，读取最新结果中的 symbols 去重代码清单。设有访问密码时，先调用 POST /api/auth/login，再携带返回的 Cookie 请求。指定日期可追加 as_of=YYYY-MM-DD；日期不一致会明确报错。</p>
+          <p className="text-xs text-muted leading-6">每天选股完成并保存后请求同一地址，读取结果中的 symbols 去重代码清单。设有访问密码时，先调用 POST /api/auth/login，再携带返回的 Cookie 请求。指定日期可追加 as_of=YYYY-MM-DD；日期不一致会明确报错。</p>
           <p className="text-xs text-muted">其他设备接入时，将地址中的 localhost 或 127.0.0.1 换成面板可访问的域名或 IP。</p>
         </div>
       </div>

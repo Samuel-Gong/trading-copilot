@@ -213,7 +213,7 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
     return payload
 
 
-def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict, scope: str = "all") -> None:
+def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
     strategy_cache.write_cache(data_dir, as_of, {
         strategy_id: {
@@ -221,8 +221,6 @@ def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: di
             "as_of": as_of,
             "asset_type": "stock",
             "timeframe": "1d",
-            "scope": scope,
-            "computed_at_ns": time.time_ns(),
             "rows": safe_data.get("rows", []),
         }
     }, preserve_newer=True)
@@ -317,8 +315,7 @@ def run_preset(req: PresetRequest, request: Request):
 
     safe_data = _safe(asdict(result))
     if req.asset_type == "stock" and req.timeframe == "1d":
-        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data,
-                               "symbols" if req.pool else "all")
+        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
 
     return _result_with_ext(safe_data, ext_values)
 
@@ -353,7 +350,7 @@ def get_export(
     strategy_id: Annotated[list[str] | None, Query(description="可重复传入; 省略时导出已有结果的股票策略")] = None,
     as_of: Annotated[date | None, Query(description="要求所有结果属于此日期; 省略时要求日期一致")] = None,
 ):
-    """导出已完成的股票日线选股结果, 不触发计算, 不包含今日失效行。"""
+    """导出已保存的股票日线选股结果, 不触发计算或追加今日曾命中历史行。"""
     engine = getattr(request.app.state, "strategy_engine", None)
     if engine is None:
         raise HTTPException(status_code=503, detail="策略引擎未初始化")
@@ -366,10 +363,7 @@ def get_export(
         and "1d" in meta.get("timeframes", ["1d"])
     }
     try:
-        monitor = getattr(request.app.state, "monitor_engine", None)
-        realtime = monitor.latest_strategy_results(for_export=True) if monitor else {}
-        payload = build_export(strategy_cache.read_cache(data_dir) or {}, names, strategy_id,
-                               as_of, realtime_results=realtime)
+        payload = build_export(strategy_cache.read_cache(data_dir) or {}, names, strategy_id, as_of)
     except ExportError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     headers = {"Cache-Control": "no-store"}
@@ -611,8 +605,6 @@ def run_all(request: Request, body: Optional[dict] = None):
             "as_of": str(as_of),
             "asset_type": asset_type,
             "timeframe": timeframe,
-            "scope": "all",
-            "computed_at_ns": time.time_ns(),
             "rows": safe_rows,
         }
 
