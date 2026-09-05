@@ -332,3 +332,42 @@ def test_limited_single_run_cannot_be_exported_as_complete(client, monkeypatch):
         "strategy_id": "alpha", "as_of": DAY, "pool": ["000001.SZ"],
     }).status_code == 200
     assert client.get("/api/screener/export").status_code == 409
+
+
+@pytest.mark.parametrize("method", ["set_rules", "add_rule"])
+def test_rule_publication_cannot_pair_old_rule_with_new_version(client, monkeypatch, method):
+    from threading import Event, Thread
+
+    instance, rule, quotes = configure_monitor(client, monkeypatch)
+    published, resume = Event(), Event()
+
+    class PausingMonitor(type(instance)):
+        def __setattr__(self, name, value):
+            super().__setattr__(name, value)
+            if name == "_rule_versions":
+                published.set()
+                assert resume.wait(timeout=5)
+
+    class PausingVersions(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            published.set()
+            assert resume.wait(timeout=5)
+
+    replacement = {**rule, "scope": "symbols"}
+    if method == "set_rules":
+        instance.__class__ = PausingMonitor
+        worker = Thread(target=instance.set_rules, args=([replacement],))
+    else:
+        instance._rule_versions = PausingVersions(instance._rule_versions)
+        worker = Thread(target=instance.add_rule, args=(replacement,))
+    worker.start()
+    try:
+        assert published.wait(timeout=5)
+        # 规则发布线程暂停时, 行情线程仍可以完成一次旧规则评估。
+        instance.evaluate(quotes)
+    finally:
+        resume.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert client.get("/api/screener/export").status_code == 404

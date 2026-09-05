@@ -324,8 +324,8 @@ class MonitorRuleEngine:
     def __init__(self, alert_handler: Callable[[dict], None] | None = None):
         self._alert_handler = alert_handler
         self._rules: dict[str, dict] = {}  # rule_id → rule
-        # 规则版本使撤销、替换及计算过程中变更的监控结果不能继续用于导出。
-        self._rule_versions: dict[str, int] = {}
+        # 版本与规则对象绑定发布, 避免行情线程把旧规则计算标为新版本。
+        self._rule_versions: dict[str, tuple[int, dict]] = {}
         # (rule_id, symbol, event_type) → 上次触发时间戳(秒)。用于 cooldown 去重。
         self._last_fire: dict[tuple[str, str, str], float] = {}
         self._strategy_engine = None  # 延迟注入, type=strategy 规则用它跑选股
@@ -367,7 +367,7 @@ class MonitorRuleEngine:
 
     def invalidate_strategy_state(self) -> None:
         """策略注册表变更后清除选股池、结果和矩阵快照。"""
-        self._rule_versions = {rid: time.time_ns() for rid in self._rules}
+        self._rule_versions = {rid: (time.time_ns(), rule) for rid, rule in self._rules.items()}
         self._strategy_pools.clear()
         self._strategy_signal_state.clear()
         self._strategy_signal_seen.clear()
@@ -436,9 +436,11 @@ class MonitorRuleEngine:
             and self._rule_state_signature(self._rules[rule_id])
             != self._rule_state_signature(rule)
         }
+        previous_versions = dict(self._rule_versions)
         self._rule_versions = {
-            rid: self._rule_versions[rid]
-            if rid in self._rule_versions and self._rules.get(rid) == rule else time.time_ns()
+            rid: (previous_versions[rid][0]
+                  if rid in previous_versions and previous_versions[rid][1] == rule
+                  else time.time_ns(), rule)
             for rid, rule in new_rules.items()
         }
         self._rules = new_rules
@@ -463,7 +465,7 @@ class MonitorRuleEngine:
 
     def add_rule(self, rule: dict) -> None:
         if rule.get("enabled") is not False:
-            self._rule_versions[rule["id"]] = time.time_ns()
+            self._rule_versions[rule["id"]] = (time.time_ns(), rule)
             self._rules[rule["id"]] = rule
         else:
             self._rule_versions.pop(rule["id"], None)
@@ -508,7 +510,7 @@ class MonitorRuleEngine:
         """
         if not for_export:
             return self._latest_strategy_results
-        versions = dict(self._rule_versions)
+        versions = {rid: version[0] for rid, version in dict(self._rule_versions).items()}
         return {
             sid: result for sid, result in self._latest_strategy_results.items()
             if result.get("scope") == "all"
@@ -806,9 +808,8 @@ class MonitorRuleEngine:
         """
         if self._strategy_engine is None:
             return []
-        rule_version = self._rule_versions.get(rule.get("id"))
-        if self._rules.get(rule.get("id")) is not rule:
-            rule_version = None
+        binding = self._rule_versions.get(rule.get("id"))
+        rule_version = binding[0] if binding and binding[1] is rule else None
         sid = rule.get("strategy_id")
         if not sid:
             return []
