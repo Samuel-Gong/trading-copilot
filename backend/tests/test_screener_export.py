@@ -362,3 +362,53 @@ def test_historical_batch_run_without_cache_is_not_export_snapshot(client, monke
     assert response.json()["results"]["alpha"]["rows"][0]["symbol"] == "000003.SZ"
     assert strategy_cache.read_cache(client.app.state.repo.store.data_dir) is None
     assert client.get("/api/screener/export").status_code == 404
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_stale_run_cannot_replace_newer_snapshot(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    latest = {"date": date(2026, 9, 4)}
+    client.app.state.repo.enriched_latest_date = lambda: latest["date"]
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    old_result = ScreenerResult(
+        as_of=date(2026, 9, 4), strategy="alpha", rows=[{"symbol": "000001.SZ"}], total=1,
+    )
+
+    def complete_newer_run(*_args, **_kwargs):
+        strategy_cache.write_cache(data_dir, "2026-09-07", {
+            "alpha": result([{"symbol": "000007.SZ"}], day="2026-09-07"),
+            "beta": result([{"symbol": "600007.SH"}], day="2026-09-07"),
+        })
+        latest["date"] = date(2026, 9, 7)
+        return old_result if run_kind == "single" else {"alpha": old_result}
+
+    if run_kind == "single":
+        engine.run = complete_newer_run
+    else:
+        engine.run_all = complete_newer_run
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000001.SZ"]}),
+        ),
+    )
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-04",
+        })
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-04",
+        })
+
+    assert response.status_code == 200
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached["as_of"] == "2026-09-07"
+    assert set(cached["results"]) == {"alpha", "beta"}

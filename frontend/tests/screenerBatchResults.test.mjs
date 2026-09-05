@@ -20,6 +20,7 @@ const {
   requiresTransientBatchRows,
   resultsForSelectedDate,
   shouldRefreshTransientBatchForColumns,
+  transientBatchColumnRefreshKey,
   updateTransientBatchResult,
 } = await import(moduleUrl)
 
@@ -80,4 +81,6 @@ test('历史临时明细在扩展列配置变化后需要重新读取', () => {
   assert.equal(shouldRefreshTransientBatchForColumns(transient, '2026-09-03', 'synthetic__new'), true)
   assert.equal(shouldRefreshTransientBatchForColumns(transient, '2026-09-03', 'synthetic__old'), false)
   assert.equal(shouldRefreshTransientBatchForColumns(transient, '2026-09-04', 'synthetic__new'), false)
+  assert.equal(transientBatchColumnRefreshKey(transient, '2026-09-03', 'synthetic__new'), '2026-09-03\u0000synthetic__new')
+  assert.equal(transientBatchColumnRefreshKey(transient, '2026-09-03', 'synthetic__old'), null)
 })

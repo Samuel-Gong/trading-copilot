@@ -49,3 +49,12 @@ export function shouldRefreshTransientBatchForColumns(
 ) {
   return source?.as_of === asOf && (source.ext_columns ?? '') !== (extColumns ?? '')
 }
+
+export function transientBatchColumnRefreshKey(
+  source: ScreenerBatchResultSource | null,
+  asOf: string,
+  extColumns?: string,
+) {
+  if (!shouldRefreshTransientBatchForColumns(source, asOf, extColumns)) return null
+  return `${asOf}\u0000${extColumns ?? ''}`
+}

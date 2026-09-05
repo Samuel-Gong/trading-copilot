@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
-import { requiresTransientBatchRows, resultsForSelectedDate, shouldRefreshTransientBatchForColumns, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
+import { requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -98,6 +98,7 @@ export function Screener() {
   const [transientBatchResults, setTransientBatchResults] = useState<ScreenerBatchResultSource | null>(null)
   const filterMap = useRef<Map<string, ScreenerFilterType>>(new Map())
   const runAllDateRef = useRef<string | null>(null)
+  const transientColumnRefreshRef = useRef<string | null>(null)
   const qc = useQueryClient()
 
   // 结果列配置 — 默认内置列，异步合并后端/localStorage 偏好
@@ -308,11 +309,9 @@ export function Screener() {
   // 避免“全部”视图继续展示旧列；历史请求仍不会写入共享导出快照。
   useEffect(() => {
     const transient = transientBatchResults
-    if (
-      !transient
-      || !shouldRefreshTransientBatchForColumns(transient, asOf, extColumnsParam)
-      || runAll.isPending
-    ) return
+    const refreshKey = transientBatchColumnRefreshKey(transient, asOf, extColumnsParam)
+    if (!transient || !refreshKey || transientColumnRefreshRef.current === refreshKey || runAll.isPending) return
+    transientColumnRefreshRef.current = refreshKey
     requestRunAll({ date: asOf, strategyIds: Object.keys(transient.results) })
   }, [asOf, extColumnsParam, transientBatchResults, runAll.isPending, requestRunAll])
 
@@ -565,6 +564,7 @@ export function Screener() {
     setAsOf(newDate)
     setTransientBatchResults(null)
     runAllDateRef.current = null
+    transientColumnRefreshRef.current = null
     setResult(null)
   }
 

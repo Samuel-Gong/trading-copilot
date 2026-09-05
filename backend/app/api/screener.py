@@ -305,7 +305,6 @@ def run_preset(req: PresetRequest, request: Request):
 
     # 加载用户保存的策略配置
     data_dir = request.app.state.repo.store.data_dir
-    latest_available = svc.latest_date()
     ext_values = _load_ext_value_maps(repo, req.ext_columns)
     overrides = strategy_config.load_override(data_dir, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
@@ -337,6 +336,9 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
+    # 策略执行可能耗时较长, 写入前重新读取日期, 不能用运行开始时的旧快照
+    # 判断而覆盖并发完成的较新日线结果。
+    latest_available = svc.latest_date()
     if (
         req.asset_type == "stock"
         and req.timeframe == "1d"
@@ -584,8 +586,6 @@ def run_all(request: Request, body: Optional[dict] = None):
         return {"as_of": None, "results": {}}
 
     data_dir = request.app.state.repo.store.data_dir
-    latest_available = svc.latest_date()
-
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
@@ -647,6 +647,8 @@ def run_all(request: Request, body: Optional[dict] = None):
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
     # 写入策略缓存 (供页面秒加载)
+    # 以执行结束时的数据日期判断, 避免较早任务在较新任务完成后回退共享快照。
+    latest_available = svc.latest_date()
     if (
         results
         and asset_type == "stock"
