@@ -614,7 +614,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     # 写入策略缓存 (供页面秒加载)
     if results and asset_type == "stock" and timeframe == "1d":
         try:
-            strategy_cache.write_cache(data_dir, str(as_of), results)
+            strategy_cache.write_cache(data_dir, str(as_of), results, preserve_newer=True)
         except Exception:  # noqa: BLE001
             pass
 

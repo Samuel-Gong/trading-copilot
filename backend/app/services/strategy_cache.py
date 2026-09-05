@@ -119,7 +119,7 @@ def write_cache(
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
-    - 单跑可设置 preserve_newer, 防止历史日期覆盖较新的共享快照
+    - 设置 preserve_newer 时, 防止历史日期覆盖较新的共享快照
     """
     path = _cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -246,7 +246,8 @@ def test_export_matches_real_engine_result_limits(client, monkeypatch, overrides
 
 
 @pytest.mark.parametrize("format", ["json", "csv", "txt"])
-def test_historical_single_run_keeps_newer_pool_cache(client, monkeypatch, format):
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_run_keeps_newer_pool_cache(client, monkeypatch, format, run_kind):
     from app.strategy.engine import StrategyResult
 
     data_dir = client.app.state.repo.store.data_dir
@@ -257,16 +258,27 @@ def test_historical_single_run_keeps_newer_pool_cache(client, monkeypatch, forma
     original = strategy_cache.read_cache(data_dir)
     engine = client.app.state.strategy_engine
     engine.has = lambda _: True
-    engine.run = lambda sid, context, **_: StrategyResult(
-        as_of=date(2026, 9, 3), strategy_id=sid,
+    historical_result = StrategyResult(
+        as_of=date(2026, 9, 3), strategy_id="alpha",
         rows=[{"symbol": "000003.SZ"}], total=1,
     )
+    if run_kind == "single":
+        engine.run = lambda sid, context, **_: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
     monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
-    historical = client.post("/api/screener/run_preset", json={
-        "strategy_id": "alpha", "as_of": "2026-09-03",
-    })
+    if run_kind == "single":
+        historical = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03",
+        })
+        rows = historical.json()["rows"]
+    else:
+        historical = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03",
+        })
+        rows = historical.json()["results"]["alpha"]["rows"]
     assert historical.status_code == 200
-    assert historical.json()["rows"][0]["symbol"] == "000003.SZ"
+    assert rows[0]["symbol"] == "000003.SZ"
     assert strategy_cache.read_cache(data_dir) == original
     exported = client.get("/api/screener/export", params={"format": format})
     assert exported.status_code == 200
