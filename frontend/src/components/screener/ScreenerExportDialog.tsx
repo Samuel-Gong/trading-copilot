@@ -70,7 +70,7 @@ export function ScreenerExportDialog({ asOf, activeStrategy, strategyNames, pool
           </label>
           <span className="text-xs text-muted num">{asOf || '未选择日期'}</span>
         </div>
-        <p className="text-xs leading-6 text-muted">导出所选策略的完整当前命中结果，不含今日已失效股票。页面的临时筛选、排序和显示条数不影响导出。</p>
+        <p className="text-xs leading-6 text-muted">导出所选策略已完成的选股结果，保留策略配置的数量上限，不含今日已失效股票。页面的临时筛选和排序不影响导出。</p>
         <div className="rounded-btn border border-border bg-elevated/50 px-4 py-3 space-y-3">
           {!ready ? <p className="text-muted">请先选择日期并向策略池添加策略。</p>
             : busy ? <p role="status" className="text-muted">{download.isPending ? '正在生成文件…' : '正在读取选股结果…'}</p>

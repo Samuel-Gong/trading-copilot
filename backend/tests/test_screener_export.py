@@ -371,3 +371,41 @@ def test_rule_publication_cannot_pair_old_rule_with_new_version(client, monkeypa
         worker.join(timeout=5)
     assert not worker.is_alive()
     assert client.get("/api/screener/export").status_code == 404
+
+
+@pytest.mark.parametrize(("overrides", "expected_count"), [
+    ({}, 2), ({"display_limit": 3}, 3), ({"display_limit": None}, 5),
+])
+@pytest.mark.parametrize("format", ["json", "csv", "txt"])
+def test_export_matches_real_engine_result_limits(client, monkeypatch, overrides, expected_count, format):
+    import polars as pl
+
+    from app.strategy.engine import StrategyDataContext, StrategyDef, StrategyEngine
+
+    engine = StrategyEngine(strategy_dirs=[])
+    engine._strategies["alpha"] = StrategyDef(
+        meta={"id": "alpha", "name": "合成策略", "limit": 2, "scoring": {}},
+        basic_filter={"enabled": False}, entry_signals=[], exit_signals=[],
+        stop_loss=None, trailing_stop=None, trailing_take_profit_activate=None,
+        trailing_take_profit_drawdown=None, max_hold_days=None, alerts=[],
+        filter_fn=lambda df, params: pl.col("close") > 0, filter_history_fn=None,
+        lookback_days=1, source="custom",
+    )
+    client.app.state.strategy_engine = engine
+    quotes = pl.DataFrame({"symbol": [f"{i:06d}.SZ" for i in range(1, 6)], "close": [10.] * 5})
+    context = StrategyDataContext("stock", "1d", date.fromisoformat(DAY), current=quotes)
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: context)
+    monkeypatch.setattr(api.strategy_config, "load_override", lambda *_: overrides)
+    run = client.post("/api/screener/run_preset", json={"strategy_id": "alpha", "as_of": DAY})
+    assert run.status_code == 200
+    selected = [row["symbol"] for row in run.json()["rows"]]
+    assert len(selected) == expected_count
+    exported = client.get("/api/screener/export", params={"format": format})
+    assert exported.status_code == 200
+    if format == "json":
+        assert exported.json()["symbols"] == selected
+    elif format == "csv":
+        rows = csv.DictReader(io.StringIO(exported.content.decode("utf-8-sig")))
+        assert [row["symbol"] for row in rows] == selected
+    else:
+        assert exported.text.splitlines() == selected
