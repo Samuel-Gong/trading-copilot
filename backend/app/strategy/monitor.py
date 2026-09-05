@@ -890,6 +890,8 @@ class MonitorRuleEngine:
                 self._building_strategy_results[sid] = {
                     "total": result.total,
                     "as_of": str(cn_today()),
+                    "asset_type": "stock",
+                    "timeframe": "1d",
                     "rows": [
                         {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
                          for k, v in row.items()}

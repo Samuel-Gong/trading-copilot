@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X } from 'lucide-react'
+import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
@@ -22,6 +22,7 @@ import {
 } from '@/lib/strategyPoolPersistence'
 import { StrategyCard, CardSize, loadCardSize, cardWrapCls } from '@/components/screener/StrategyCard'
 import { ScreenerTable } from '@/components/screener/ScreenerTable'
+import { ScreenerExportDialog } from '@/components/screener/ScreenerExportDialog'
 import { ScreenerFilter as ScreenerFilterType, defaultFilter, filterActive, countActiveFilters, applyFilter, FilterPanel } from '@/components/screener/ScreenerFilter'
 import { StrategySettingsDialog } from '@/components/screener/StrategySettingsDialog'
 import { StrategyPoolDialog } from '@/components/screener/StrategyPoolDialog'
@@ -55,6 +56,7 @@ export function Screener() {
   const [builderMode, setBuilderMode] = useState<'create' | 'modify'>('create')
   const [showStore, setShowStore] = useState(false)
   const [showComposite, setShowComposite] = useState(false)
+  const [showExport, setShowExport] = useState(false)
   const {
     pool,
     isReady: strategyPoolReady,
@@ -748,6 +750,14 @@ export function Screener() {
       />
 
       <div className="px-8 py-4 space-y-3">
+        <div className="flex justify-end">
+          <button
+            onClick={() => setShowExport(true)}
+            disabled={assetType !== 'stock' || !strategyPoolReady || run.isPending || runAll.isPending || reloadStrategies.isPending}
+            title={assetType !== 'stock' ? '目前支持股票日线策略导出' : '导出 CSV、股票代码或获取 API 地址'}
+            className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn border border-border bg-surface text-xs text-secondary hover:text-accent hover:border-accent/50 disabled:opacity-50 disabled:cursor-not-allowed"
+          ><Download className="h-3.5 w-3.5" />导出选股结果</button>
+        </div>
         {/* 策略卡片 */}
         {cardSize !== 'hidden' && (
         <section>
@@ -997,6 +1007,16 @@ export function Screener() {
         builtinSectionLabel="策略内置列"
         extColumnAlign="center"
       />
+
+      {showExport && (
+        <ScreenerExportDialog
+          asOf={asOf}
+          activeStrategy={activeStrategy}
+          strategyNames={strategyIdToName}
+          pool={visiblePool}
+          onClose={() => setShowExport(false)}
+        />
+      )}
 
       <StockPreviewDialog
         symbol={previewSymbol}

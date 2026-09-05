@@ -9,14 +9,16 @@ import re
 import time
 from dataclasses import asdict
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import strategy_cache
 from app.services.screener import ScreenerService
+from app.services.screener_export import ExportError, build_export, export_csv
 from app.strategy import config as strategy_config
 
 logger = logging.getLogger(__name__)
@@ -213,16 +215,15 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
 
 def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
-    from app.services import strategy_cache
-    cached = strategy_cache.read_cache(data_dir)
-    if cached and cached.get("as_of") == as_of:
-        results = cached.get("results", {})
-        results[strategy_id] = {
+    strategy_cache.write_cache(data_dir, as_of, {
+        strategy_id: {
             "total": safe_data.get("total", 0),
             "as_of": as_of,
+            "asset_type": "stock",
+            "timeframe": "1d",
             "rows": safe_data.get("rows", []),
         }
-        strategy_cache.write_cache(data_dir, as_of, results)
+    })
 
 
 @router.get("/strategies")
@@ -313,12 +314,13 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
-    _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
+    if req.asset_type == "stock" and req.timeframe == "1d":
+        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
 
     return _result_with_ext(safe_data, ext_values)
 
 
-def _cached_with_realtime(request: Request) -> dict:
+def _cached_with_realtime(request: Request, as_of: Optional[date] = None) -> dict:
     """读取盘后缓存，并用监控引擎的实时结果覆盖同策略。"""
     data_dir = request.app.state.repo.store.data_dir
     cached = strategy_cache.read_cache(data_dir)
@@ -329,6 +331,12 @@ def _cached_with_realtime(request: Request) -> dict:
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     if monitor_engine is not None:
         realtime_results = monitor_engine.latest_strategy_results()
+        if as_of is not None:
+            # 导出指定日期时保留仍可用的盘后快照, 不让另一天的监控结果遮住它。
+            realtime_results = {
+                sid: result for sid, result in realtime_results.items()
+                if result.get("as_of") == str(as_of)
+            }
         if realtime_results:
             results = dict(cached.get("results") or {})
             results.update(realtime_results)
@@ -339,6 +347,39 @@ def _cached_with_realtime(request: Request) -> dict:
             cached["updated_at"] = int(_time.time() * 1000)
 
     return cached
+
+
+@router.get("/export")
+def get_export(
+    request: Request,
+    format: Literal["json", "csv", "txt"] = "json",
+    strategy_id: Annotated[list[str] | None, Query(description="可重复传入; 省略时导出已有结果的股票策略")] = None,
+    as_of: Annotated[date | None, Query(description="要求所有结果属于此日期; 省略时要求日期一致")] = None,
+):
+    """导出已完成的股票日线选股结果, 不触发计算, 不包含今日失效行。"""
+    engine = getattr(request.app.state, "strategy_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="策略引擎未初始化")
+    data_dir = request.app.state.repo.store.data_dir
+    overrides = strategy_config.list_overrides(data_dir)
+    names = {
+        meta["id"]: (overrides.get(meta["id"]) or {}).get("name") or meta["name"]
+        for meta in engine.list_strategies()
+        if "stock" in meta.get("asset_types", ["stock"])
+        and "1d" in meta.get("timeframes", ["1d"])
+    }
+    try:
+        payload = build_export(_cached_with_realtime(request, as_of), names, strategy_id, as_of)
+    except ExportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    headers = {"Cache-Control": "no-store"}
+    if format == "json":
+        return JSONResponse(payload, headers=headers)
+    headers["Content-Disposition"] = f'attachment; filename="screener-{payload["as_of"]}.{format}"'
+    if format == "csv":
+        return Response(export_csv(payload), media_type="text/csv", headers=headers)
+    content = "".join(f"{symbol}\r\n" for symbol in payload["symbols"])
+    return Response(content, media_type="text/plain", headers=headers)
 
 
 @router.get("/cached")
@@ -568,6 +609,8 @@ def run_all(request: Request, body: Optional[dict] = None):
         results[sid] = {
             "total": result.total,
             "as_of": str(as_of),
+            "asset_type": asset_type,
+            "timeframe": timeframe,
             "rows": safe_rows,
         }
 
@@ -575,7 +618,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
     # 写入策略缓存 (供页面秒加载)
-    if results:
+    if results and asset_type == "stock" and timeframe == "1d":
         try:
             strategy_cache.write_cache(data_dir, str(as_of), results)
         except Exception:  # noqa: BLE001
