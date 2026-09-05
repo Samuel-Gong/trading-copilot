@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
+import { requiresTransientBatchRows, resultsForSelectedDate, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -94,6 +95,7 @@ export function Screener() {
   const [showAll, setShowAll] = useState(false)
   const [showFilter, setShowFilter] = useState(false)
   const [filter, setFilter] = useState<ScreenerFilterType>(defaultFilter)
+  const [transientBatchResults, setTransientBatchResults] = useState<ScreenerBatchResultSource | null>(null)
   const filterMap = useRef<Map<string, ScreenerFilterType>>(new Map())
   const runAllDateRef = useRef<string | null>(null)
   const qc = useQueryClient()
@@ -243,15 +245,28 @@ export function Screener() {
 
   // 进入页面自动跑策略池中的策略，获取命中数
   const runAll = useMutation({
-    mutationFn: ({ date, strategyIds }: { date?: string; strategyIds?: string[] } = {}) =>
-      api.screenerRunAll(
+    mutationFn: ({ date, strategyIds }: { date?: string; strategyIds?: string[] } = {}) => {
+      const includeRows = requiresTransientBatchRows(date, summaryQuery.data?.as_of)
+      return api.screenerRunAll(
         date,
         strategyIds ?? visiblePool,
         assetType,
-      ),
+        !includeRows,
+        includeRows ? extColumnsParam || undefined : undefined,
+      )
+    },
     onSuccess: (data) => {
       if (data.as_of) setAsOf(data.as_of)
       const counts: Record<string, number> = {}
+      const rows: ScreenerBatchResultSource['results'] = {}
+      for (const [id, item] of Object.entries(data.results)) {
+        if (Array.isArray(item.rows)) {
+          rows[id] = { as_of: item.as_of, total: item.total, rows: item.rows }
+        }
+      }
+      setTransientBatchResults(data.as_of && Object.keys(rows).length
+        ? { as_of: data.as_of, results: rows }
+        : null)
       for (const [id, item] of Object.entries(data.results)) {
         counts[id] = item.total
       }
@@ -286,7 +301,15 @@ export function Screener() {
 
   // 摘要只同步当前日期的卡片数量，避免旧日期缓存短暂显示成当前结果。
   useEffect(() => {
-    if (!summaryQuery.data || !asOf) return
+    if (!asOf) return
+    if (transientBatchResults?.as_of === asOf) {
+      setHitCounts(Object.fromEntries(
+        Object.entries(transientBatchResults.results).map(([id, result]) => [id, result.total]),
+      ))
+      setExpiredCounts({})
+      return
+    }
+    if (!summaryQuery.data) return
     const counts: Record<string, number> = {}
     const expired: Record<string, number> = {}
     for (const [id, r] of Object.entries(summaryQuery.data.results)) {
@@ -298,7 +321,7 @@ export function Screener() {
     }
     setHitCounts(counts)
     setExpiredCounts(expired)
-  }, [summaryQuery.data, asOf])
+  }, [summaryQuery.data, asOf, transientBatchResults])
 
   // 当前单策略缓存更新后同步明细；参数保存的强制重算结果仍由 run 直接覆盖。
   useEffect(() => {
@@ -310,12 +333,10 @@ export function Screener() {
     }
   }, [singleCachedQuery.data, showAll, activeStrategy, asOf])
 
-  const effectiveResults = useMemo(() => {
-    if (fullCachedQuery.data?.as_of !== asOf) return null
-    const entries = Object.entries(fullCachedQuery.data.results)
-      .filter(([, item]) => item.as_of === asOf)
-    return Object.fromEntries(entries)
-  }, [fullCachedQuery.data, asOf])
+  const effectiveResults = useMemo(
+    () => resultsForSelectedDate(asOf, transientBatchResults, fullCachedQuery.data),
+    [asOf, fullCachedQuery.data, transientBatchResults],
+  )
 
   // symbol → 所属策略列表。单策略接口同时返回轻量归属映射，保留策略列原有展示。
   const symbolStrategyMap = useMemo(() => {
@@ -520,6 +541,7 @@ export function Screener() {
   // 日期变化交给统一 effect 计算一次，避免这里与 effect 重复请求。
   const handleDateChange = (newDate: string) => {
     setAsOf(newDate)
+    setTransientBatchResults(null)
     runAllDateRef.current = null
     setResult(null)
   }

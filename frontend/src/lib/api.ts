@@ -819,6 +819,12 @@ export interface ScreenerResultSummary {
   as_of: string
 }
 
+export interface ScreenerRunAllResult {
+  total: number
+  as_of: string
+  rows?: any[]
+}
+
 export interface ScreenerCachedSummary {
   as_of: string | null
   results: Record<string, ScreenerResultSummary>
@@ -2243,9 +2249,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ conditions, order_by: orderBy, limit, pool, ext_columns: extColumns || null, asset_type: assetType }),
     }),
-  screenerRunAll: (asOf?: string, strategyIds?: string[], assetType: 'stock' | 'etf' = 'stock') =>
-    request<{ as_of: string | null; results: Record<string, ScreenerResultSummary> }>(
-      '/api/screener/run_all', { method: 'POST', body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe: '1d', summary_only: true }) },
+  screenerRunAll: (
+    asOf?: string,
+    strategyIds?: string[],
+    assetType: 'stock' | 'etf' = 'stock',
+    summaryOnly = true,
+    extColumns?: string,
+  ) =>
+    request<{ as_of: string | null; results: Record<string, ScreenerRunAllResult> }>(
+      '/api/screener/run_all', { method: 'POST', body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe: '1d', summary_only: summaryOnly, ext_columns: extColumns || null }) },
     ),
   screenerCachedSummary: () =>
     request<ScreenerCachedSummary>('/api/screener/cached-summary'),
