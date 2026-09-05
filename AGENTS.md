@@ -8,11 +8,21 @@
 - 保持实现简单、改动范围最小，不处理无关问题。
 - 不覆盖工作区已有修改，不虚构测试或审查结果。
 - 以实际验证结果作为完成标准。
-- Issue/PR 驱动的开发执行 [`CONTRIBUTING.md` 的 Issue-first 与评论闭环](CONTRIBUTING.md#91-issue-first-开发与评论闭环)：修改前和每轮反馈后都重新读取关联 Issue、PR 评论及未解决 Review threads，作者与最终 Review Agent 分离。
-- 同时开发多个需求时，必须完整读取并执行 [`CONTRIBUTING.md` 的并行需求开发流程](CONTRIBUTING.md#92-并行需求开发)，按其中要求隔离 Worktree、分支、端口、数据、依赖关系与复审。
 - GitHub 认证或推送结果在 Codex 与用户终端不一致时，必须完整执行 [`GitHub 认证分层诊断`](docs/github-auth-troubleshooting.md)；连接器、`gh` CLI 与 HTTPS Git Keychain 分开判断，不能根据沙箱内单次失败要求用户重新登录。
 - 登录本地 TickFlow 面板（`localhost` / `127.0.0.1`）时，读取根目录的 [`.agent-secrets.md`](.agent-secrets.md)，其中凭据仅限本机登录使用，不得复制到提交内容、日志或对外请求。
 - 启动本项目应用进程时，必须在启动命令中清除大小写的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`，避免应用继承 Codex shell 代理；该例外仅适用于应用进程，其他外部网络请求仍遵循全局代理约定。
+
+## 开发流程与交付标准
+
+所有产生仓库改动的需求，包括代码、配置和文档，默认按以下顺序执行；纯咨询和不修改仓库的排查除外。详细要求以 `CONTRIBUTING.md` 为准。
+
+1. **先建 Issue**：创建或关联一个聚焦的 Issue，写明问题、验收标准和非目标。修改前读取正文及全部最新评论；需求变化先在 Issue 中确认边界。执行 [Issue-first 与评论闭环](CONTRIBUTING.md#91-issue-first-开发与评论闭环)。
+2. **同步基线并隔离开发**：先检查并保护已有改动，工作区干净后获取远端更新，将本地 `main` fast-forward 到 `origin/main`，确认两者差异为 `0 0`。从该基线建立独立 Worktree 和 `codex/<issue>-<slug>` 分支，同一需求的实现、测试和反馈修复留在同一 Worktree。已有未提交改动不得作为其他需求的基线；先在所属分支安全保存，再同步。多个需求并行时完整执行 [并行需求开发流程](CONTRIBUTING.md#92-并行需求开发)，隔离任务、依赖、端口和运行时数据。
+3. **理解后实现**：先检查调用链、现有测试和受影响的数据契约、缓存，再给出简短实施与验证计划；每项改动对应 Issue 的验收标准。
+4. **完成验证并保留证据**：执行 [验证矩阵](CONTRIBUTING.md#9-验证矩阵) 中适用的检查；前端变化提供桌面宽屏下浅色、深色的修改前后界面证据。提交前检查完整 diff、敏感数据和 `git diff --check`，记录实际命令与结果。
+5. **交付 PR**：在当前会话已授权范围内完成提交、推送并创建以 `main` 为目标的 PR，用 `Closes #<issue>` 关联唯一主 Issue，按 [PR 提交要求](CONTRIBUTING.md#10-pr-提交要求) 填写说明。交付必须推进到可审查的 PR；需要授权或遇到权限限制时，先完成不受影响的准备，说明具体待执行动作，不能将其报告为已完成。已有授权继续有效，无需重复确认。
+6. **独立复审并关闭反馈**：代码作者与最终 Review Agent 分离，由独立代理按 [PR 复审流程](CONTRIBUTING.md#11-pr-复审流程) 检查相对 `main` 的完整 diff。每轮修复前重读 Issue 评论、PR 普通评论、Review summaries 和未解决的 inline threads；逐项修复或说明不采纳理由。追加提交后重新验证受影响范围，并复审完整 diff。GitHub 原生 Codex Review 是额外审查，不能替代独立复审和 CI。
+7. **核实状态再交接**：交付时列出 Issue、PR、分支、当前提交 SHA、测试、CI、独立复审结论及未解决项。只有 CI 通过、讨论已解决、P0/P1/P2 阻断项全部修复并复审后，才能报告可合并；合并由维护者人工执行。仍有失败或待处理项时继续处理，确实受阻则明确原因和所需下一步。
 
 ## Code Review Rules
 
