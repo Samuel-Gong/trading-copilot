@@ -112,18 +112,21 @@ def write_cache(
     data_dir: Path,
     as_of: str,
     results: dict[str, Any],
+    *,
+    preserve_newer: bool = False,
 ) -> None:
     """将策略结果写入缓存文件，同时更新今日曾命中集合。
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
+    - 单跑可设置 preserve_newer, 防止历史日期覆盖较新的共享快照
     """
     path = _cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
     with _file_lock:
-        _write_cache_locked(path, data_dir, as_of, results)
+        _write_cache_locked(path, data_dir, as_of, results, preserve_newer)
 
 
 def _write_cache_locked(
@@ -131,11 +134,19 @@ def _write_cache_locked(
     data_dir: Path,
     as_of: str,
     results: dict[str, Any],
+    preserve_newer: bool,
 ) -> None:
     """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。"""
     # 读取旧缓存 (已持锁, 走不重入的 _read_cache_unlocked)
     old = _read_cache_unlocked(data_dir)
     old_as_of = old.get("as_of") if old else None
+    if preserve_newer and old_as_of:
+        try:
+            if date.fromisoformat(old_as_of) > date.fromisoformat(as_of):
+                return
+        except (TypeError, ValueError):
+            # 无效的旧日期不应妨碍新运行修复缓存。
+            pass
     old_ever_rows: dict[str, dict[str, dict]] = old.get("today_ever_rows", {}) if old else {}
 
     if old_as_of == as_of:

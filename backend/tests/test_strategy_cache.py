@@ -3,10 +3,10 @@ from __future__ import annotations
 from app.services import strategy_cache
 
 
-def _result(*symbols: str) -> dict:
+def _result(*symbols: str, as_of: str = "2026-07-20") -> dict:
     return {
         "total": len(symbols),
-        "as_of": "2026-07-20",
+        "as_of": as_of,
         "rows": [{"symbol": symbol, "close": index + 1.0} for index, symbol in enumerate(symbols)],
     }
 
@@ -47,3 +47,26 @@ def test_new_date_resets_results_and_ever_rows(tmp_path):
     assert cached["as_of"] == "2026-07-21"
     assert set(cached["results"]) == {"strategy_b"}
     assert set(cached["today_ever_rows"]) == {"strategy_b"}
+
+
+def test_guarded_write_preserves_newer_date_but_allows_initial_same_and_next_day(tmp_path):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")}, preserve_newer=True)
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"b": _result("600000.SH")}, preserve_newer=True)
+    original = strategy_cache.read_cache(tmp_path)
+    assert set(original["results"]) == {"a", "b"}
+    strategy_cache.write_cache(tmp_path, "2026-07-19", {
+        "a": _result("000002.SZ", as_of="2026-07-19"),
+    }, preserve_newer=True)
+    assert strategy_cache.read_cache(tmp_path) == original
+    strategy_cache.write_cache(tmp_path, "2026-07-21", {
+        "a": _result("000003.SZ", as_of="2026-07-21"),
+    }, preserve_newer=True)
+    latest = strategy_cache.read_cache(tmp_path)
+    assert latest["as_of"] == "2026-07-21"
+    assert set(latest["results"]) == {"a"}
+
+
+def test_guarded_write_can_replace_invalid_old_date(tmp_path):
+    strategy_cache.write_cache(tmp_path, "invalid", {"a": _result("000001.SZ")})
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000002.SZ")}, preserve_newer=True)
+    assert strategy_cache.read_cache(tmp_path)["as_of"] == "2026-07-20"

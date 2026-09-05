@@ -409,3 +409,33 @@ def test_export_matches_real_engine_result_limits(client, monkeypatch, overrides
         assert [row["symbol"] for row in rows] == selected
     else:
         assert exported.text.splitlines() == selected
+
+
+@pytest.mark.parametrize("format", ["json", "csv", "txt"])
+def test_historical_single_run_keeps_newer_pool_cache(client, monkeypatch, format):
+    from app.strategy.engine import StrategyResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result([{"symbol": "000001.SZ"}]),
+        "beta": result([{"symbol": "600000.SH"}]),
+    })
+    original = strategy_cache.read_cache(data_dir)
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    engine.run = lambda sid, context, **_: StrategyResult(
+        as_of=date(2026, 9, 3), strategy_id=sid,
+        rows=[{"symbol": "000003.SZ"}], total=1,
+    )
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
+    historical = client.post("/api/screener/run_preset", json={
+        "strategy_id": "alpha", "as_of": "2026-09-03",
+    })
+    assert historical.status_code == 200
+    assert historical.json()["rows"][0]["symbol"] == "000003.SZ"
+    assert strategy_cache.read_cache(data_dir) == original
+    exported = client.get("/api/screener/export", params={"format": format})
+    assert exported.status_code == 200
+    assert "000001.SZ" in exported.text and "600000.SH" in exported.text
+    assert "000003.SZ" not in exported.text
+    assert client.get("/api/screener/export?as_of=2026-09-03").status_code == 409

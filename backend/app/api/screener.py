@@ -225,7 +225,7 @@ def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: di
             "computed_at_ns": time.time_ns(),
             "rows": safe_data.get("rows", []),
         }
-    })
+    }, preserve_newer=True)
 
 
 @router.get("/strategies")
