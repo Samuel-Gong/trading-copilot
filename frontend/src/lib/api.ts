@@ -10,10 +10,11 @@ const BASE = ''
 type RequestOptions = RequestInit & {
   /** 为 true 时不弹错误 toast（由调用方自行汇总提示，如多图串行队列） */
   quiet?: boolean
+  responseType?: 'json' | 'blob'
 }
 
 async function request<T>(path: string, init?: RequestOptions): Promise<T> {
-  const { quiet, ...fetchInit } = init ?? {}
+  const { quiet, responseType = 'json', ...fetchInit } = init ?? {}
   const isFormData = fetchInit.body instanceof FormData
   const headers: Record<string, string> = {}
   if (!isFormData) headers['Content-Type'] = 'application/json'
@@ -39,7 +40,7 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
     if (res.status !== 401 && !quiet) toast(msg, 'error')
     throw new Error(msg)
   }
-  return res.json() as Promise<T>
+  return (responseType === 'blob' ? res.blob() : res.json()) as Promise<T>
 }
 
 // ===== Capabilities =====
@@ -797,9 +798,31 @@ export interface ScreenerResult {
   elapsed_ms: number
 }
 
+export interface ScreenerExport {
+  as_of: string
+  asset_type: 'stock'
+  timeframe: '1d'
+  total: number
+  symbols: string[]
+  results: Record<string, { name: string; as_of: string; total: number; rows: Record<string, unknown>[] }>
+}
+
+export function screenerExportPath(strategyIds: string[], asOf?: string, format: 'json' | 'csv' | 'txt' = 'json') {
+  const params = new URLSearchParams({ format })
+  for (const id of strategyIds) params.append('strategy_id', id)
+  if (asOf) params.set('as_of', asOf)
+  return `/api/screener/export?${params}`
+}
+
 export interface ScreenerResultSummary {
   total: number
   as_of: string
+}
+
+export interface ScreenerRunAllResult {
+  total: number
+  as_of: string
+  rows?: any[]
 }
 
 export interface ScreenerCachedSummary {
@@ -2226,12 +2249,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ conditions, order_by: orderBy, limit, pool, ext_columns: extColumns || null, asset_type: assetType }),
     }),
-  screenerRunAll: (asOf?: string, strategyIds?: string[], assetType: 'stock' | 'etf' = 'stock') =>
-    request<{ as_of: string | null; results: Record<string, ScreenerResultSummary> }>(
-      '/api/screener/run_all', { method: 'POST', body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe: '1d', summary_only: true }) },
+  screenerRunAll: (
+    asOf?: string,
+    strategyIds?: string[],
+    assetType: 'stock' | 'etf' = 'stock',
+    summaryOnly = true,
+    extColumns?: string,
+  ) =>
+    request<{ as_of: string | null; results: Record<string, ScreenerRunAllResult> }>(
+      '/api/screener/run_all', { method: 'POST', body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe: '1d', summary_only: summaryOnly, ext_columns: extColumns || null }) },
     ),
   screenerCachedSummary: () =>
     request<ScreenerCachedSummary>('/api/screener/cached-summary'),
+  screenerExport: (strategyIds: string[], asOf: string) =>
+    request<ScreenerExport>(screenerExportPath(strategyIds, asOf), { quiet: true }),
+  screenerExportFile: (strategyIds: string[], asOf: string, format: 'csv' | 'txt') =>
+    request<Blob>(screenerExportPath(strategyIds, asOf, format), { responseType: 'blob', quiet: true }),
   screenerCachedResult: (strategyId: string, extColumns?: string) =>
     request<ScreenerCachedResult>(
       extColumns

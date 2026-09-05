@@ -9,14 +9,16 @@ import re
 import time
 from dataclasses import asdict
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import strategy_cache
 from app.services.screener import ScreenerService
+from app.services.screener_export import ExportError, build_export, export_csv
 from app.strategy import config as strategy_config
 
 logger = logging.getLogger(__name__)
@@ -211,18 +213,37 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
     return payload
 
 
-def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
+def _ensure_context_has_current_data(context, as_of: date) -> None:
+    """拒绝没有当日输入数据的策略运行, 避免空结果成为可导出的快照。"""
+    current = getattr(context, "current", None)
+    if current is not None and current.is_empty():
+        raise HTTPException(status_code=400, detail=f"{as_of} 无可用选股数据")
+
+
+def _update_cache_strategy(
+    data_dir,
+    as_of: str,
+    strategy_id: str,
+    safe_data: dict,
+    latest_available_as_of=None,
+) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
-    from app.services import strategy_cache
-    cached = strategy_cache.read_cache(data_dir)
-    if cached and cached.get("as_of") == as_of:
-        results = cached.get("results", {})
-        results[strategy_id] = {
-            "total": safe_data.get("total", 0),
-            "as_of": as_of,
-            "rows": safe_data.get("rows", []),
-        }
-        strategy_cache.write_cache(data_dir, as_of, results)
+    strategy_cache.write_cache(
+        data_dir,
+        as_of,
+        {
+            strategy_id: {
+                "total": safe_data.get("total", 0),
+                "as_of": as_of,
+                "asset_type": "stock",
+                "timeframe": "1d",
+                "rows": safe_data.get("rows", []),
+            }
+        },
+        preserve_newer=True,
+        latest_available_as_of=latest_available_as_of,
+        only_latest_available=True,
+    )
 
 
 @router.get("/strategies")
@@ -301,6 +322,7 @@ def run_preset(req: PresetRequest, request: Request):
             params_map={req.strategy_id: params},
             overrides_map={req.strategy_id: overrides or {}},
         )
+        _ensure_context_has_current_data(context, as_of)
         result = engine.run(
             req.strategy_id,
             context,
@@ -313,7 +335,14 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
-    _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
+    if req.asset_type == "stock" and req.timeframe == "1d":
+        _update_cache_strategy(
+            data_dir,
+            str(as_of),
+            req.strategy_id,
+            safe_data,
+            svc.latest_date,
+        )
 
     return _result_with_ext(safe_data, ext_values)
 
@@ -339,6 +368,39 @@ def _cached_with_realtime(request: Request) -> dict:
             cached["updated_at"] = int(_time.time() * 1000)
 
     return cached
+
+
+@router.get("/export")
+def get_export(
+    request: Request,
+    format: Literal["json", "csv", "txt"] = "json",
+    strategy_id: Annotated[list[str] | None, Query(description="可重复传入; 省略时导出已有结果的股票策略")] = None,
+    as_of: Annotated[date | None, Query(description="要求所有结果属于此日期; 省略时要求日期一致")] = None,
+):
+    """导出已保存的股票日线选股结果, 不触发计算或追加今日曾命中历史行。"""
+    engine = getattr(request.app.state, "strategy_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="策略引擎未初始化")
+    data_dir = request.app.state.repo.store.data_dir
+    overrides = strategy_config.list_overrides(data_dir)
+    names = {
+        meta["id"]: (overrides.get(meta["id"]) or {}).get("name") or meta["name"]
+        for meta in engine.list_strategies()
+        if "stock" in meta.get("asset_types", ["stock"])
+        and "1d" in meta.get("timeframes", ["1d"])
+    }
+    try:
+        payload = build_export(strategy_cache.read_cache(data_dir) or {}, names, strategy_id, as_of)
+    except ExportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    headers = {"Cache-Control": "no-store"}
+    if format == "json":
+        return JSONResponse(payload, headers=headers)
+    headers["Content-Disposition"] = f'attachment; filename="screener-{payload["as_of"]}.{format}"'
+    if format == "csv":
+        return Response(export_csv(payload), media_type="text/csv", headers=headers)
+    content = "".join(f"{symbol}\r\n" for symbol in payload["symbols"])
+    return Response(content, media_type="text/plain", headers=headers)
 
 
 @router.get("/cached")
@@ -516,7 +578,6 @@ def run_all(request: Request, body: Optional[dict] = None):
         return {"as_of": None, "results": {}}
 
     data_dir = request.app.state.repo.store.data_dir
-
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
@@ -553,6 +614,7 @@ def run_all(request: Request, body: Optional[dict] = None):
             params_map=params_map,
             overrides_map=overrides_map,
         )
+        _ensure_context_has_current_data(context, as_of)
         engine_results = engine.run_all(
             context,
             params_map=params_map,
@@ -568,16 +630,26 @@ def run_all(request: Request, body: Optional[dict] = None):
         results[sid] = {
             "total": result.total,
             "as_of": str(as_of),
+            "asset_type": asset_type,
+            "timeframe": timeframe,
             "rows": safe_rows,
         }
 
     elapsed = (time.perf_counter() - t_total) * 1000
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
-    # 写入策略缓存 (供页面秒加载)
-    if results:
+    # 写入策略缓存 (供页面秒加载)。最新日期判断在缓存写锁内完成，避免较早
+    # 任务在较新任务完成后回退共享快照。
+    if results and asset_type == "stock" and timeframe == "1d":
         try:
-            strategy_cache.write_cache(data_dir, str(as_of), results)
+            strategy_cache.write_cache(
+                data_dir,
+                str(as_of),
+                results,
+                preserve_newer=True,
+                latest_available_as_of=svc.latest_date,
+                only_latest_available=True,
+            )
         except Exception:  # noqa: BLE001
             pass
 
