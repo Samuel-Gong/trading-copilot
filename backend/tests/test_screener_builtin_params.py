@@ -157,7 +157,6 @@ def test_batch_summary_response_still_writes_full_cache(monkeypatch, tmp_path):
         "results": {"builtin_strategy": {"total": 0, "as_of": "2026-07-15"}},
     }
     assert written[0][0][2]["builtin_strategy"]["rows"] == []
-    assert written[0][1] == {
-        "preserve_newer": True,
-        "latest_available_as_of": "2026-07-15",
-    }
+    assert written[0][1]["preserve_newer"] is True
+    assert written[0][1]["only_latest_available"] is True
+    assert written[0][1]["latest_available_as_of"]() == date(2026, 7, 15)

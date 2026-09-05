@@ -220,31 +220,30 @@ def _ensure_context_has_current_data(context, as_of: date) -> None:
         raise HTTPException(status_code=400, detail=f"{as_of} 无可用选股数据")
 
 
-def _can_persist_daily_result(as_of: date, latest_available: date | None) -> bool:
-    """只有最新可用交易日的股票日线结果才更新共享导出快照。"""
-    return latest_available is None or as_of >= latest_available
-
-
 def _update_cache_strategy(
     data_dir,
     as_of: str,
     strategy_id: str,
     safe_data: dict,
-    latest_available_as_of: str | None = None,
+    latest_available_as_of=None,
 ) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
-    strategy_cache.write_cache(data_dir, as_of, {
-        strategy_id: {
-            "total": safe_data.get("total", 0),
-            "as_of": as_of,
-            "asset_type": "stock",
-            "timeframe": "1d",
-            "rows": safe_data.get("rows", []),
-        }
-    }, preserve_newer=True, **(
-        {"latest_available_as_of": latest_available_as_of}
-        if latest_available_as_of else {}
-    ))
+    strategy_cache.write_cache(
+        data_dir,
+        as_of,
+        {
+            strategy_id: {
+                "total": safe_data.get("total", 0),
+                "as_of": as_of,
+                "asset_type": "stock",
+                "timeframe": "1d",
+                "rows": safe_data.get("rows", []),
+            }
+        },
+        preserve_newer=True,
+        latest_available_as_of=latest_available_as_of,
+        only_latest_available=True,
+    )
 
 
 @router.get("/strategies")
@@ -336,20 +335,13 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
-    # 策略执行可能耗时较长, 写入前重新读取日期, 不能用运行开始时的旧快照
-    # 判断而覆盖并发完成的较新日线结果。
-    latest_available = svc.latest_date()
-    if (
-        req.asset_type == "stock"
-        and req.timeframe == "1d"
-        and _can_persist_daily_result(as_of, latest_available)
-    ):
+    if req.asset_type == "stock" and req.timeframe == "1d":
         _update_cache_strategy(
             data_dir,
             str(as_of),
             req.strategy_id,
             safe_data,
-            str(latest_available) if latest_available else None,
+            svc.latest_date,
         )
 
     return _result_with_ext(safe_data, ext_values)
@@ -646,22 +638,17 @@ def run_all(request: Request, body: Optional[dict] = None):
     elapsed = (time.perf_counter() - t_total) * 1000
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
-    # 写入策略缓存 (供页面秒加载)
-    # 以执行结束时的数据日期判断, 避免较早任务在较新任务完成后回退共享快照。
-    latest_available = svc.latest_date()
-    if (
-        results
-        and asset_type == "stock"
-        and timeframe == "1d"
-        and _can_persist_daily_result(as_of, latest_available)
-    ):
+    # 写入策略缓存 (供页面秒加载)。最新日期判断在缓存写锁内完成，避免较早
+    # 任务在较新任务完成后回退共享快照。
+    if results and asset_type == "stock" and timeframe == "1d":
         try:
             strategy_cache.write_cache(
                 data_dir,
                 str(as_of),
                 results,
                 preserve_newer=True,
-                **({"latest_available_as_of": str(latest_available)} if latest_available else {}),
+                latest_available_as_of=svc.latest_date,
+                only_latest_available=True,
             )
         except Exception:  # noqa: BLE001
             pass

@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -114,22 +115,33 @@ def write_cache(
     results: dict[str, Any],
     *,
     preserve_newer: bool = False,
-    latest_available_as_of: str | None = None,
+    latest_available_as_of: str | date | Callable[[], str | date | None] | None = None,
+    only_latest_available: bool = False,
 ) -> None:
     """将策略结果写入缓存文件，同时更新今日曾命中集合。
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
     - 设置 preserve_newer 时, 防止历史日期覆盖较新的共享快照
-    - latest_available_as_of 标记已知最新数据日期; 早于它的正常运行可替换
-      意外写入的未来日期缓存, 避免异常缓存永久阻止后续日常选股保存
+    - latest_available_as_of 可为日期或延迟读取函数. 函数在写锁内调用, 避免
+      过期日期快照放行较早任务覆盖并发完成的新结果
+    - only_latest_available 仅保存最新可用交易日的结果; 异常未来日期缓存仍可
+      被正常最新交易日替换
     """
     path = _cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
     with _file_lock:
-        _write_cache_locked(path, data_dir, as_of, results, preserve_newer, latest_available_as_of)
+        _write_cache_locked(
+            path,
+            data_dir,
+            as_of,
+            results,
+            preserve_newer,
+            latest_available_as_of,
+            only_latest_available,
+        )
 
 
 def _write_cache_locked(
@@ -138,27 +150,36 @@ def _write_cache_locked(
     as_of: str,
     results: dict[str, Any],
     preserve_newer: bool,
-    latest_available_as_of: str | None,
+    latest_available_as_of: str | date | Callable[[], str | date | None] | None,
+    only_latest_available: bool,
 ) -> None:
     """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。"""
     # 读取旧缓存 (已持锁, 走不重入的 _read_cache_unlocked)
     old = _read_cache_unlocked(data_dir)
     old_as_of = old.get("as_of") if old else None
-    if preserve_newer and old_as_of:
-        try:
+    try:
+        latest_available = (
+            latest_available_as_of()
+            if callable(latest_available_as_of) else latest_available_as_of
+        )
+        latest_available_date = (
+            latest_available
+            if isinstance(latest_available, date)
+            else date.fromisoformat(latest_available)
+            if latest_available else None
+        )
+        incoming_date = date.fromisoformat(as_of)
+        if only_latest_available and latest_available_date and incoming_date < latest_available_date:
+            return
+        if preserve_newer and old_as_of:
             old_date = date.fromisoformat(old_as_of)
-            incoming_date = date.fromisoformat(as_of)
-            latest_available_date = (
-                date.fromisoformat(latest_available_as_of)
-                if latest_available_as_of else None
-            )
             if old_date > incoming_date and (
                 latest_available_date is None or old_date <= latest_available_date
             ):
                 return
-        except (TypeError, ValueError):
-            # 无效的旧日期不应妨碍新运行修复缓存。
-            pass
+    except (TypeError, ValueError):
+        # 无效日期不应妨碍新运行修复缓存。
+        pass
     old_ever_rows: dict[str, dict[str, dict]] = old.get("today_ever_rows", {}) if old else {}
 
     if old_as_of == as_of:
