@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
-import { requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
+import { requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -352,6 +352,10 @@ export function Screener() {
   const effectiveResults = useMemo(
     () => resultsForSelectedDate(asOf, transientBatchResults, fullCachedQuery.data),
     [asOf, fullCachedQuery.data, transientBatchResults],
+  )
+  const transientColumnRetryParams = useMemo(
+    () => transientBatchColumnRetryParams(transientBatchResults, asOf, extColumnsParam),
+    [asOf, extColumnsParam, transientBatchResults],
   )
 
   // symbol → 所属策略列表。单策略接口同时返回轻量归属映射，保留策略列原有展示。
@@ -857,6 +861,21 @@ export function Screener() {
           {run.isError && (
             <div className="text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">
               {String((run.error as any).message)}
+            </div>
+          )}
+          {runAll.isError && (
+            <div role="alert" className="flex items-center gap-3 text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">
+              <span>{String((runAll.error as any).message)}</span>
+              {transientColumnRetryParams && (
+                <button
+                  type="button"
+                  onClick={() => requestRunAll(transientColumnRetryParams)}
+                  disabled={runAll.isPending}
+                  className="text-xs font-medium underline underline-offset-2 hover:text-foreground disabled:opacity-50"
+                >
+                  重试
+                </button>
+              )}
             </div>
           )}
 

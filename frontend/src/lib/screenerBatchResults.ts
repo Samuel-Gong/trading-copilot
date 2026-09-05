@@ -58,3 +58,16 @@ export function transientBatchColumnRefreshKey(
   if (!shouldRefreshTransientBatchForColumns(source, asOf, extColumns)) return null
   return `${asOf}\u0000${extColumns ?? ''}`
 }
+
+export function transientBatchColumnRetryParams(
+  source: ScreenerBatchResultSource | null,
+  asOf: string,
+  extColumns?: string,
+) {
+  if (!source || !transientBatchColumnRefreshKey(source, asOf, extColumns)) return null
+  return {
+    date: asOf,
+    strategyIds: Object.keys(source.results),
+    extColumns: extColumns ?? '',
+  }
+}

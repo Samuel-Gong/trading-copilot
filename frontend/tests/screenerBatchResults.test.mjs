@@ -9,6 +9,10 @@ const source = await readFile(
   new URL('../src/lib/screenerBatchResults.ts', import.meta.url),
   'utf8',
 )
+const pageSource = await readFile(
+  new URL('../src/pages/Screener.tsx', import.meta.url),
+  'utf8',
+)
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.ES2022,
@@ -21,6 +25,7 @@ const {
   resultsForSelectedDate,
   shouldRefreshTransientBatchForColumns,
   transientBatchColumnRefreshKey,
+  transientBatchColumnRetryParams,
   updateTransientBatchResult,
 } = await import(moduleUrl)
 
@@ -83,4 +88,18 @@ test('历史临时明细在扩展列配置变化后需要重新读取', () => {
   assert.equal(shouldRefreshTransientBatchForColumns(transient, '2026-09-04', 'synthetic__new'), false)
   assert.equal(transientBatchColumnRefreshKey(transient, '2026-09-03', 'synthetic__new'), '2026-09-03\u0000synthetic__new')
   assert.equal(transientBatchColumnRefreshKey(transient, '2026-09-03', 'synthetic__old'), null)
+
+  assert.deepEqual(transientBatchColumnRetryParams(transient, '2026-09-03', 'synthetic__new'), {
+    date: '2026-09-03',
+    strategyIds: ['alpha'],
+    extColumns: 'synthetic__new',
+  })
+  assert.equal(transientBatchColumnRetryParams(transient, '2026-09-03', 'synthetic__old'), null)
+})
+
+
+test('历史扩展列刷新失败显示直接重试入口', () => {
+  assert.match(pageSource, /runAll\.isError/)
+  assert.match(pageSource, /onClick=\{\(\) => requestRunAll\(transientColumnRetryParams\)\}/)
+  assert.match(pageSource, />\s*重试\s*<\/button>/)
 })

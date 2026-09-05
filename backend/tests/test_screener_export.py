@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import threading
 from datetime import date
 from types import SimpleNamespace
 
@@ -409,6 +410,82 @@ def test_stale_run_cannot_replace_newer_snapshot(client, monkeypatch, run_kind):
         })
 
     assert response.status_code == 200
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached["as_of"] == "2026-09-07"
+    assert set(cached["results"]) == {"alpha", "beta"}
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_latest_date_check_is_serialized_with_cache_write(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    old_result = ScreenerResult(
+        as_of=date(2026, 9, 4), strategy="alpha", rows=[{"symbol": "000001.SZ"}], total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_args, **_kwargs: old_result
+    else:
+        engine.run_all = lambda *_args, **_kwargs: {"alpha": old_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000001.SZ"]}),
+        ),
+    )
+
+    old_latest_read = threading.Event()
+    release_old = threading.Event()
+
+    def blocked_latest_date(_self):
+        old_latest_read.set()
+        assert release_old.wait(timeout=2)
+        return date(2026, 9, 4)
+
+    monkeypatch.setattr(api.ScreenerService, "latest_date", blocked_latest_date)
+    response: dict[str, object] = {}
+
+    def run_old_request():
+        if run_kind == "single":
+            response["value"] = client.post("/api/screener/run_preset", json={
+                "strategy_id": "alpha", "as_of": "2026-09-04",
+            })
+        else:
+            response["value"] = client.post("/api/screener/run_all", json={
+                "strategy_ids": ["alpha"], "as_of": "2026-09-04",
+            })
+
+    old_thread = threading.Thread(target=run_old_request)
+    old_thread.start()
+    assert old_latest_read.wait(timeout=2)
+
+    newer_write_started = threading.Event()
+    newer_write_finished = threading.Event()
+
+    def write_newer_snapshot():
+        newer_write_started.set()
+        strategy_cache.write_cache(data_dir, "2026-09-07", {
+            "alpha": result([{"symbol": "000007.SZ"}], day="2026-09-07"),
+            "beta": result([{"symbol": "600007.SH"}], day="2026-09-07"),
+        })
+        newer_write_finished.set()
+
+    newer_thread = threading.Thread(target=write_newer_snapshot)
+    newer_thread.start()
+    assert newer_write_started.wait(timeout=2)
+    # 最新日期读取和旧快照写入必须同处缓存锁内, 否则新快照会先完成并被旧任务覆盖。
+    assert not newer_write_finished.wait(timeout=0.5)
+    release_old.set()
+    old_thread.join(timeout=2)
+    newer_thread.join(timeout=2)
+
+    assert not old_thread.is_alive() and not newer_thread.is_alive()
+    assert response["value"].status_code == 200
     cached = strategy_cache.read_cache(data_dir)
     assert cached["as_of"] == "2026-09-07"
     assert set(cached["results"]) == {"alpha", "beta"}
