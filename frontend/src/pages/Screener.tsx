@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
-import { requiresTransientBatchRows, resultsForSelectedDate, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
+import { requiresTransientBatchRows, resultsForSelectedDate, shouldRefreshTransientBatchForColumns, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -245,17 +245,22 @@ export function Screener() {
 
   // 进入页面自动跑策略池中的策略，获取命中数
   const runAll = useMutation({
-    mutationFn: ({ date, strategyIds }: { date?: string; strategyIds?: string[] } = {}) => {
-      const includeRows = requiresTransientBatchRows(date, summaryQuery.data?.as_of)
+    mutationFn: ({ date, strategyIds, extColumns }: {
+      date?: string
+      strategyIds?: string[]
+      extColumns?: string
+    } = {}) => {
+      const latestDataDate = tradingDatesQuery.data?.latest_date ?? dataStatus.data?.enriched?.latest_date
+      const includeRows = requiresTransientBatchRows(date, latestDataDate)
       return api.screenerRunAll(
         date,
         strategyIds ?? visiblePool,
         assetType,
         !includeRows,
-        includeRows ? extColumnsParam || undefined : undefined,
+        includeRows ? extColumns || undefined : undefined,
       )
     },
-    onSuccess: (data) => {
+    onSuccess: (data, vars) => {
       if (data.as_of) setAsOf(data.as_of)
       const counts: Record<string, number> = {}
       const rows: ScreenerBatchResultSource['results'] = {}
@@ -265,7 +270,7 @@ export function Screener() {
         }
       }
       setTransientBatchResults(data.as_of && Object.keys(rows).length
-        ? { as_of: data.as_of, results: rows }
+        ? { as_of: data.as_of, results: rows, ext_columns: vars.extColumns ?? '' }
         : null)
       for (const [id, item] of Object.entries(data.results)) {
         counts[id] = item.total
@@ -285,19 +290,31 @@ export function Screener() {
   // 用 ref 同步门闩，避免同一渲染周期内 isPending 尚未更新导致重复触发
   const runAllPendingRef = useRef(false)
   const requestRunAll = useCallback((
-    vars: { date?: string; strategyIds?: string[] } = {},
+    vars: { date?: string; strategyIds?: string[]; extColumns?: string } = {},
     options?: Parameters<typeof runAll.mutate>[1],
   ) => {
     if (runAllPendingRef.current || runAll.isPending) return
     runAllPendingRef.current = true
-    runAll.mutate(vars, {
+    runAll.mutate({ ...vars, extColumns: vars.extColumns ?? extColumnsParam }, {
       ...options,
       onSettled: (...args) => {
         runAllPendingRef.current = false
         options?.onSettled?.(...args)
       },
     })
-  }, [runAll])
+  }, [runAll, extColumnsParam])
+
+  // 历史结果只驻留在页面内存。用户变更扩展列后重新读取该日期的明细，
+  // 避免“全部”视图继续展示旧列；历史请求仍不会写入共享导出快照。
+  useEffect(() => {
+    const transient = transientBatchResults
+    if (
+      !transient
+      || !shouldRefreshTransientBatchForColumns(transient, asOf, extColumnsParam)
+      || runAll.isPending
+    ) return
+    requestRunAll({ date: asOf, strategyIds: Object.keys(transient.results) })
+  }, [asOf, extColumnsParam, transientBatchResults, runAll.isPending, requestRunAll])
 
   // 摘要只同步当前日期的卡片数量，避免旧日期缓存短暂显示成当前结果。
   useEffect(() => {
@@ -515,6 +532,11 @@ export function Screener() {
       api.screenerRunPreset(id, undefined, date || undefined, extColumnsParam || undefined, assetType),
     onSuccess: (data, vars) => {
       setResult(data)
+      setTransientBatchResults(current => updateTransientBatchResult(current, vars.id, {
+        as_of: data.as_of,
+        total: data.total,
+        rows: data.rows,
+      }))
       // 同步更新卡片上的命中数
       setHitCounts(prev => ({ ...prev, [vars.id]: data.total }))
       // 单策略重跑后刷新摘要和当前按需明细，避免参数保存后回退到旧缓存。

@@ -114,19 +114,22 @@ def write_cache(
     results: dict[str, Any],
     *,
     preserve_newer: bool = False,
+    latest_available_as_of: str | None = None,
 ) -> None:
     """将策略结果写入缓存文件，同时更新今日曾命中集合。
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
     - 设置 preserve_newer 时, 防止历史日期覆盖较新的共享快照
+    - latest_available_as_of 标记已知最新数据日期; 早于它的正常运行可替换
+      意外写入的未来日期缓存, 避免异常缓存永久阻止后续日常选股保存
     """
     path = _cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
     with _file_lock:
-        _write_cache_locked(path, data_dir, as_of, results, preserve_newer)
+        _write_cache_locked(path, data_dir, as_of, results, preserve_newer, latest_available_as_of)
 
 
 def _write_cache_locked(
@@ -135,6 +138,7 @@ def _write_cache_locked(
     as_of: str,
     results: dict[str, Any],
     preserve_newer: bool,
+    latest_available_as_of: str | None,
 ) -> None:
     """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。"""
     # 读取旧缓存 (已持锁, 走不重入的 _read_cache_unlocked)
@@ -142,7 +146,15 @@ def _write_cache_locked(
     old_as_of = old.get("as_of") if old else None
     if preserve_newer and old_as_of:
         try:
-            if date.fromisoformat(old_as_of) > date.fromisoformat(as_of):
+            old_date = date.fromisoformat(old_as_of)
+            incoming_date = date.fromisoformat(as_of)
+            latest_available_date = (
+                date.fromisoformat(latest_available_as_of)
+                if latest_available_as_of else None
+            )
+            if old_date > incoming_date and (
+                latest_available_date is None or old_date <= latest_available_date
+            ):
                 return
         except (TypeError, ValueError):
             # 无效的旧日期不应妨碍新运行修复缓存。

@@ -213,7 +213,25 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
     return payload
 
 
-def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
+def _ensure_context_has_current_data(context, as_of: date) -> None:
+    """拒绝没有当日输入数据的策略运行, 避免空结果成为可导出的快照。"""
+    current = getattr(context, "current", None)
+    if current is not None and current.is_empty():
+        raise HTTPException(status_code=400, detail=f"{as_of} 无可用选股数据")
+
+
+def _can_persist_daily_result(as_of: date, latest_available: date | None) -> bool:
+    """只有最新可用交易日的股票日线结果才更新共享导出快照。"""
+    return latest_available is None or as_of >= latest_available
+
+
+def _update_cache_strategy(
+    data_dir,
+    as_of: str,
+    strategy_id: str,
+    safe_data: dict,
+    latest_available_as_of: str | None = None,
+) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
     strategy_cache.write_cache(data_dir, as_of, {
         strategy_id: {
@@ -223,7 +241,10 @@ def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: di
             "timeframe": "1d",
             "rows": safe_data.get("rows", []),
         }
-    }, preserve_newer=True)
+    }, preserve_newer=True, **(
+        {"latest_available_as_of": latest_available_as_of}
+        if latest_available_as_of else {}
+    ))
 
 
 @router.get("/strategies")
@@ -284,6 +305,7 @@ def run_preset(req: PresetRequest, request: Request):
 
     # 加载用户保存的策略配置
     data_dir = request.app.state.repo.store.data_dir
+    latest_available = svc.latest_date()
     ext_values = _load_ext_value_maps(repo, req.ext_columns)
     overrides = strategy_config.load_override(data_dir, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
@@ -302,6 +324,7 @@ def run_preset(req: PresetRequest, request: Request):
             params_map={req.strategy_id: params},
             overrides_map={req.strategy_id: overrides or {}},
         )
+        _ensure_context_has_current_data(context, as_of)
         result = engine.run(
             req.strategy_id,
             context,
@@ -314,8 +337,18 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
-    if req.asset_type == "stock" and req.timeframe == "1d":
-        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
+    if (
+        req.asset_type == "stock"
+        and req.timeframe == "1d"
+        and _can_persist_daily_result(as_of, latest_available)
+    ):
+        _update_cache_strategy(
+            data_dir,
+            str(as_of),
+            req.strategy_id,
+            safe_data,
+            str(latest_available) if latest_available else None,
+        )
 
     return _result_with_ext(safe_data, ext_values)
 
@@ -551,6 +584,7 @@ def run_all(request: Request, body: Optional[dict] = None):
         return {"as_of": None, "results": {}}
 
     data_dir = request.app.state.repo.store.data_dir
+    latest_available = svc.latest_date()
 
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
@@ -588,6 +622,7 @@ def run_all(request: Request, body: Optional[dict] = None):
             params_map=params_map,
             overrides_map=overrides_map,
         )
+        _ensure_context_has_current_data(context, as_of)
         engine_results = engine.run_all(
             context,
             params_map=params_map,
@@ -612,9 +647,20 @@ def run_all(request: Request, body: Optional[dict] = None):
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
     # 写入策略缓存 (供页面秒加载)
-    if results and asset_type == "stock" and timeframe == "1d":
+    if (
+        results
+        and asset_type == "stock"
+        and timeframe == "1d"
+        and _can_persist_daily_result(as_of, latest_available)
+    ):
         try:
-            strategy_cache.write_cache(data_dir, str(as_of), results, preserve_newer=True)
+            strategy_cache.write_cache(
+                data_dir,
+                str(as_of),
+                results,
+                preserve_newer=True,
+                **({"latest_available_as_of": str(latest_available)} if latest_available else {}),
+            )
         except Exception:  # noqa: BLE001
             pass
 

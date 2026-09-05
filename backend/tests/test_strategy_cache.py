@@ -70,3 +70,21 @@ def test_guarded_write_can_replace_invalid_old_date(tmp_path):
     strategy_cache.write_cache(tmp_path, "invalid", {"a": _result("000001.SZ")})
     strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000002.SZ")}, preserve_newer=True)
     assert strategy_cache.read_cache(tmp_path)["as_of"] == "2026-07-20"
+
+
+def test_guarded_write_replaces_future_cache_beyond_latest_available_data(tmp_path):
+    strategy_cache.write_cache(tmp_path, "2099-01-01", {
+        "a": _result("000001.SZ", as_of="2099-01-01"),
+    })
+
+    strategy_cache.write_cache(
+        tmp_path,
+        "2026-07-20",
+        {"a": _result("000002.SZ")},
+        preserve_newer=True,
+        latest_available_as_of="2026-07-20",
+    )
+
+    cached = strategy_cache.read_cache(tmp_path)
+    assert cached["as_of"] == "2026-07-20"
+    assert cached["results"]["a"]["rows"][0]["symbol"] == "000002.SZ"

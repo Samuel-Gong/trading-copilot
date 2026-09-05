@@ -81,7 +81,11 @@ def test_export_rejects_incomplete_or_wrong_context(cached, ids, as_of, status):
 def client(tmp_path, monkeypatch):
     app = FastAPI()
     app.include_router(api.router)
-    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
+    app.state.repo = SimpleNamespace(
+        store=SimpleNamespace(data_dir=tmp_path),
+        enriched_latest_date=lambda: date.fromisoformat(DAY),
+        get_enriched_latest_asset=lambda _asset_type: (None, None),
+    )
     app.state.strategy_engine = SimpleNamespace(list_strategies=lambda: [
         {"id": sid, "name": name, "asset_types": ["stock"], "timeframes": ["1d"]}
         for sid, name in NAMES.items()
@@ -285,3 +289,76 @@ def test_historical_run_keeps_newer_pool_cache(client, monkeypatch, format, run_
     assert "000001.SZ" in exported.text and "600000.SH" in exported.text
     assert "000003.SZ" not in exported.text
     assert client.get("/api/screener/export?as_of=2026-09-03").status_code == 409
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_empty_input_date_cannot_replace_export_cache(client, monkeypatch, run_kind):
+    import polars as pl
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {"alpha": result()})
+    original = strategy_cache.read_cache(data_dir)
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    calls: list[str] = []
+
+    def unexpected_run(*_args, **_kwargs):
+        calls.append(run_kind)
+        raise AssertionError("空输入不应执行策略")
+
+    if run_kind == "single":
+        engine.run = unexpected_run
+    else:
+        engine.run_all = unexpected_run
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(current=pl.DataFrame()),
+    )
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2099-01-01",
+        })
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2099-01-01",
+        })
+
+    assert response.status_code == 400
+    assert "无可用选股数据" in response.json()["detail"]
+    assert calls == []
+    assert strategy_cache.read_cache(data_dir) == original
+
+
+def test_historical_batch_run_without_cache_is_not_export_snapshot(client, monkeypatch):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    engine.run_all = lambda *_, **__: {
+        "alpha": ScreenerResult(
+            as_of=date(2026, 9, 3),
+            strategy="alpha",
+            rows=[{"symbol": "000003.SZ"}],
+            total=1,
+        ),
+    }
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+
+    response = client.post("/api/screener/run_all", json={
+        "strategy_ids": ["alpha"], "as_of": "2026-09-03",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["results"]["alpha"]["rows"][0]["symbol"] == "000003.SZ"
+    assert strategy_cache.read_cache(client.app.state.repo.store.data_dir) is None
+    assert client.get("/api/screener/export").status_code == 404
