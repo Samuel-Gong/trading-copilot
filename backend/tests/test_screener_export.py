@@ -14,6 +14,7 @@ from app.api import screener as api
 from app.api import strategy as strategy_api
 from app.services import strategy_cache
 from app.services.screener_export import ExportError, build_export, export_csv
+from app.strategy.engine import StrategyEngine
 
 DAY = "2026-09-04"
 NAMES = {"alpha": "测试策略甲", "beta": "测试策略乙"}
@@ -713,6 +714,60 @@ def test_strategy_config_change_only_invalidates_affected_export_snapshot(client
     assert cached is not None
     assert cached["results"] == {"gamma": result()}
     assert invalidations == [None]
+
+
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_change_invalidates_composite_using_override_child(client, operation):
+    data_dir = client.app.state.repo.store.data_dir
+    custom_dir = data_dir / "strategies" / "custom"
+    composite_dir = data_dir / "strategies" / "composite"
+    custom_dir.mkdir(parents=True)
+    composite_dir.mkdir(parents=True)
+    for strategy_id in ("alpha", "beta"):
+        (custom_dir / f"{strategy_id}.py").write_text(
+            f'''import polars as pl
+META = {{"id": "{strategy_id}", "name": "{strategy_id}", "asset_types": ["stock"], "timeframes": ["1d"]}}
+EXECUTION_BACKEND = "polars_expr"
+def filter(df, params):
+    return pl.lit(True)
+''',
+            encoding="utf-8",
+        )
+    (composite_dir / "blend.py").write_text(
+        '''META = {
+    "id": "blend", "name": "blend", "asset_types": ["stock"], "timeframes": ["1d"],
+    "children": [{"strategy_id": "beta", "weight": 1.0}],
+}
+EXECUTION_BACKEND = "composite"
+''',
+        encoding="utf-8",
+    )
+    engine = StrategyEngine(
+        strategy_dirs=[custom_dir, composite_dir],
+        override_loader=lambda strategy_id: strategy_api.strategy_config.load_override(data_dir, strategy_id),
+    )
+    client.app.state.strategy_engine = engine
+    strategy_api.strategy_config.save_override(data_dir, "blend", {
+        "children": [{"strategy_id": "alpha", "weight": 1.0}],
+    })
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+        "blend": result(rows=[{"symbol": "000001.SZ"}]),
+    })
+
+    if operation == "save":
+        response = client.post("/api/strategies/config", json={
+            "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+        })
+    else:
+        response = client.delete("/api/strategies/config/alpha")
+
+    assert response.status_code == 200
+    assert response.json()["invalidated_strategy_ids"] == ["alpha", "blend"]
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached is not None
+    assert cached["results"] == {"beta": result(rows=[{"symbol": "600000.SH"}])}
 
 
 @pytest.mark.parametrize("operation", ["save", "reset"])
