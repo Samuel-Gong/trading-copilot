@@ -257,6 +257,57 @@ test('同一上下文的视图切换会重绑配置重跑并刷新摘要', () =>
 })
 
 
+test('普通局部批跑会合并已排队的配置重跑策略', () => {
+  const coordinator = createScreenerRequestCoordinator()
+  const context = createScreenerRequestContext({ asOf: '2026-09-03', assetType: 'stock' })
+  const started = []
+  const start = request => started.push(request)
+  let configRerunStrategyIds = ['alpha']
+
+  coordinator.request({ vars: { strategyIds: ['old'], context: context.current() } }, start)
+
+  context.invalidate()
+  coordinator.invalidate()
+  coordinator.request({
+    vars: { strategyIds: configRerunStrategyIds, context: context.current() },
+  }, start)
+
+  assert.equal(shouldPreserveScreenerConfigReruns(context.current()), true)
+  context.invalidate()
+  coordinator.invalidate()
+  const requestedStrategyIds = mergeScreenerRunAllStrategyIds(
+    configRerunStrategyIds,
+    ['beta'],
+  )
+  coordinator.request({
+    vars: { strategyIds: requestedStrategyIds, context: context.current() },
+  }, start)
+
+  coordinator.settle(start)
+  assert.deepEqual(started[1], {
+    vars: {
+      strategyIds: ['alpha', 'beta'],
+      context: { asOf: '2026-09-03', assetType: 'stock', version: 2 },
+    },
+    epoch: 2,
+  })
+
+  const completed = new Set(started[1].vars.strategyIds)
+  configRerunStrategyIds = configRerunStrategyIds.filter(id => !completed.has(id))
+  assert.deepEqual(configRerunStrategyIds, [])
+
+  const summaryInvalidations = []
+  if (isCurrentScreenerRequest(
+    { ...started[1].vars, epoch: started[1].epoch },
+    context.current(),
+    coordinator.currentEpoch(),
+  )) {
+    summaryInvalidations.push('screener-cached')
+  }
+  assert.deepEqual(summaryInvalidations, ['screener-cached'])
+})
+
+
 test('日期、资产或策略池变化会清空配置重跑队列', () => {
   const context = { asOf: '2026-09-03', assetType: 'stock' }
 

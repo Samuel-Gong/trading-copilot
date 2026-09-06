@@ -416,7 +416,10 @@ export function Screener() {
     vars: RunAllRequestVariables = {},
   ) => {
     const context = requestContext.current()
-    const bound = bindScreenerRequestContext(vars, context)
+    const strategyIds = vars.strategyIds
+      ? mergeScreenerRunAllStrategyIds(configRerunStrategyIdsRef.current, vars.strategyIds)
+      : undefined
+    const bound = bindScreenerRequestContext({ ...vars, strategyIds }, context)
     if (!bound) return
     requestCoordinator.request({
       vars: {
