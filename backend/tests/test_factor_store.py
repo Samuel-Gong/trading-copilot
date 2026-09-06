@@ -146,3 +146,64 @@ def test_unregister_builtin_rejected() -> None:
         unregister_factor("rsi_14")
     spec = get_factor("rsi_14")
     assert isinstance(spec, FactorSpec)
+
+
+def test_atomic_save_preserves_old_file_when_replace_fails(tmp_path, monkeypatch) -> None:
+    """原子替换失败时旧定义完整保留, 不留下半截 JSON。"""
+    original = {
+        "id": "uf_atomic", "kind": "custom", "version": 1, "label": "旧定义",
+        "formula": "close", "status": "draft",
+    }
+    store.save_one(tmp_path, original)
+
+    def _fail_replace(source, target):  # noqa: ARG001
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(store.os, "replace", _fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        store.save_one(tmp_path, {**original, "label": "新定义"})
+
+    assert store.load_all(tmp_path) == [original]
+
+
+def test_persist_definition_writes_before_registry_mutation(
+    tmp_path, monkeypatch, cleanup_registry,
+) -> None:
+    """落盘失败时不得把新因子留在进程注册表。"""
+    definition = {
+        "id": "uf_write_fail", "kind": "custom", "version": 1, "label": "写失败",
+        "formula": "close", "status": "draft",
+    }
+    cleanup_registry.add("uf_write_fail")
+
+    def _fail_save(data_dir, value):  # noqa: ARG001
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "save_one", _fail_save)
+    with pytest.raises(OSError, match="disk full"):
+        store.persist_definition(tmp_path, definition)
+
+    assert get_factor("uf_write_fail") is None
+
+
+def test_persist_definition_rolls_back_file_when_registration_fails(
+    tmp_path, cleanup_registry,
+) -> None:
+    """注册表拒绝新定义时恢复旧文件, 保持磁盘与内存一致。"""
+    original = {
+        "id": "uf_register_fail",
+        "kind": "custom",
+        "version": 1,
+        "label": "旧定义",
+        "formula": "close",
+        "status": "draft",
+    }
+    store.save_one(tmp_path, original)
+    store.register_definition(original)
+    cleanup_registry.add("uf_register_fail")
+
+    with pytest.raises(ValueError, match="版本未提升"):
+        store.persist_definition(tmp_path, {**original, "label": "不应落盘"})
+
+    assert store.load_all(tmp_path) == [original]
+    assert get_factor("uf_register_fail").label == "旧定义"

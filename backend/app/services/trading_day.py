@@ -115,7 +115,6 @@ def is_trading_day(now: datetime | None = None) -> bool | None:
     with _CACHE_LOCK:
         if (
             _CACHE.day == now.date()
-            and _CACHE.verdict is not None
             and (time.monotonic() - _CACHE.probed_at) < _ttl_of(_CACHE.verdict)
         ):
             return _CACHE.verdict

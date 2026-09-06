@@ -373,8 +373,9 @@ def clear_ai_settings() -> dict:
         "ai_codex_model",
         "ai_codex_command",
         "ai_codex_reasoning_effort",
+        "ai_max_output_tokens",
+        "ai_context_window",
     )
-    secrets_store.clear("ai_provider", "ai_base_url", "ai_api_key", "ai_model", "ai_codex_command", "ai_codex_reasoning_effort", "ai_max_output_tokens", "ai_context_window")
     # 同步重置运行时内存(provider 回默认值,其余置空)
     settings.ai_provider = "openai_compat"
     settings.ai_base_url = ""
@@ -391,7 +392,7 @@ def clear_ai_settings() -> dict:
 # ===== 偏好设置 =====
 
 def _realtime_allowed() -> bool:
-    """当前档位是否允许实时行情(none/free 不允许)。"""
+    """当前数据源与档位是否允许实时行情。"""
     from app.services.quote_service import QuoteService
     return QuoteService.is_realtime_allowed()
 
@@ -969,8 +970,8 @@ class RealtimeQuoteScopePrefs(BaseModel):
 def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
     """保存全局实时行情开关。
 
-    无实时能力的档位(TickFlow none/free)开关回弹强制关闭;
-    starter+ 或自定义实时源(如 fuyao)为全市场实时。前端据此把开关置灰 / 回弹。
+    TickFlow none 档开关回弹强制关闭; Free 档为自选实时;
+    starter+ 或自定义实时源(如 fuyao)为全市场实时。
     """
     from app.services import preferences
     qs = getattr(request.app.state, "quote_service", None)

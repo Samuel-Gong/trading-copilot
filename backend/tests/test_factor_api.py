@@ -275,7 +275,7 @@ def test_delete_custom_and_composite_factor(tmp_path, cleanup_registry) -> None:
 
 
 def test_delete_with_strategy_reference_requires_force(tmp_path, cleanup_registry) -> None:
-    """策略文件引用同样拦截: 409 列出 strategies/*.json, force=true 放行。"""
+    """策略文件引用同样拦截: 409 且不产生删除副作用, force=true 放行。"""
     import json
     from pathlib import Path
     from types import SimpleNamespace
@@ -307,3 +307,41 @@ def test_delete_with_strategy_reference_requires_force(tmp_path, cleanup_registr
     assert forced.status_code == 200
     assert forced.json()["removed_references"] == ["strategies/my_strategy.json"]
     assert get_factor("uf_strat_ref") is None
+
+
+def test_delete_with_nested_python_strategy_reference_is_side_effect_free(
+    tmp_path, cleanup_registry,
+) -> None:
+    """实际 custom/ai/composite Python 策略引用必须在删除前被发现。"""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.factors import store
+    from app.factors.registry import get_factor
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=Path(tmp_path)))
+    client = TestClient(app)
+    data_dir = Path(tmp_path)
+
+    response = client.post("/api/factors/custom", json={
+        "id": "uf_python_ref",
+        "label": "Python 策略引用",
+        "formula": "rank(-ts_sum(change_pct, 5))",
+    })
+    assert response.status_code == 200
+    cleanup_registry.add("uf_python_ref")
+
+    strategy_dir = data_dir / "strategies" / "custom"
+    strategy_dir.mkdir(parents=True)
+    (strategy_dir / "my_strategy.py").write_text(
+        'REQUIRED_FEATURES = {"uf_python_ref"}\n', encoding="utf-8",
+    )
+
+    blocked = client.delete("/api/factors/custom/uf_python_ref")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["references"] == ["strategies/custom/my_strategy.py"]
+    assert get_factor("uf_python_ref") is not None
+    assert store.exists(data_dir, "uf_python_ref")

@@ -448,7 +448,7 @@ def fetch_quotes(symbols: list[str], capset: CapabilitySet, timeout_s: float = 8
     elif capset.has(Cap.QUOTE_BY_SYMBOL):
         batch_size = resolve_limit(capset, Cap.QUOTE_BY_SYMBOL, default_batch=5).batch
     else:
-        # 无任何实时行情能力(none/free 档走 free-api 服务器,不提供实时行情)
+        # 无任何实时行情能力时提前返回,避免发起注定失败的请求。
         # 提前返回空,避免发起注定失败的请求
         return []
 

@@ -215,6 +215,29 @@ def get_realtime_quote_interval() -> float:
     return load().get("realtime_quote_interval", 6.0)
 
 
+def get_realtime_watchlist_symbols() -> list[str]:
+    """Free 档自选实时监控标的: 直接取自选页前 5 个。"""
+    try:
+        from app.services import watchlist
+        rows = watchlist.list_symbols()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("load watchlist for realtime failed: %s", e)
+        return []
+    out: list[str] = []
+    for row in rows:
+        symbol = str((row or {}).get("symbol") or "").strip().upper()
+        if symbol and symbol not in out:
+            out.append(symbol)
+        if len(out) >= 5:
+            break
+    return out
+
+
+def set_realtime_watchlist_symbols(symbols: list[str]) -> list[str]:  # noqa: ARG001
+    """兼容旧接口: Free 实时标的现在由自选页前 5 个决定。"""
+    return get_realtime_watchlist_symbols()
+
+
 def set_realtime_quote_interval(interval: float) -> float:
     """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。"""
     save({"realtime_quote_interval": interval})

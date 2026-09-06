@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 from app.factors.dsl import compile_formula
-from app.factors.registry import FactorSpec, factor_dependencies, get_factor, register_factor
+from app.factors.registry import (
+    FactorSpec,
+    factor_dependencies,
+    get_factor,
+    register_factor,
+    unregister_factor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +53,32 @@ def load_all(data_dir: Path) -> list[dict]:
 
 
 def save_one(data_dir: Path, definition: dict) -> None:
+    """原子保存单个定义；写入失败时保留旧文件。"""
     target = _path(data_dir, str(definition["id"]))
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(definition, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(definition, ensure_ascii=False, indent=2)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary_path.unlink(missing_ok=True)
+
+
+def exists(data_dir: Path, factor_id: str) -> bool:
+    """定义文件是否存在，不产生任何副作用。"""
+    return _path(data_dir, factor_id).is_file()
 
 
 def delete_one(data_dir: Path, factor_id: str) -> bool:
@@ -160,6 +191,55 @@ def register_definition(definition: dict) -> FactorSpec:
     spec = to_spec(definition)
     register_factor(spec)
     return spec
+
+
+def persist_definition(
+    data_dir: Path,
+    definition: dict,
+    *,
+    replace_registered: bool = False,
+) -> FactorSpec:
+    """先原子落盘再注册；注册失败时恢复磁盘和既有注册表状态。"""
+    spec = to_spec(definition)
+    target = _path(data_dir, str(definition["id"]))
+    previous = target.read_bytes() if target.exists() else None
+    save_one(data_dir, definition)
+
+    previous_spec: FactorSpec | None = None
+    try:
+        if replace_registered:
+            previous_spec = unregister_factor(spec.id)
+        register_factor(spec)
+    except Exception:
+        if previous is None:
+            target.unlink(missing_ok=True)
+        else:
+            _write_bytes_atomically(target, previous)
+        if replace_registered and previous_spec is not None and get_factor(spec.id) is None:
+            register_factor(previous_spec)
+        raise
+    return spec
+
+
+def _write_bytes_atomically(target: Path, payload: bytes) -> None:
+    """回滚辅助：以同目录临时文件原子恢复原始字节。"""
+    fd, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".rollback",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary_path.unlink(missing_ok=True)
 
 
 def load_into_registry(data_dir: Path) -> list[str]:

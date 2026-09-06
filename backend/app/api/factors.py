@@ -276,10 +276,9 @@ def create_custom_factor(req: CustomFactorCreateRequest, request: Request) -> di
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _trial_nonempty(request, req.formula)
     try:
-        store.register_definition(definition)
+        store.persist_definition(data_dir, definition)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, definition)
     return {"ok": True, "id": factor_id, "version": definition["version"]}
 
 
@@ -302,10 +301,9 @@ def create_composite_factor(req: CompositeFactorCreateRequest, request: Request)
         "updated_at": store._now(),
     }
     try:
-        store.register_definition(definition)
+        store.persist_definition(data_dir, definition)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, definition)
     return {"ok": True, "id": factor_id, "version": definition["version"]}
 
 
@@ -347,10 +345,9 @@ def update_custom_factor(factor_id: str, req: CustomFactorUpdateRequest, request
         "updated_at": store._now(),
     })
     try:
-        store.register_definition(target)
+        store.persist_definition(data_dir, target)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, target)
     return {"ok": True, "id": factor_id, "version": target["version"], "status": target["status"]}
 
 
@@ -359,19 +356,28 @@ def _find_references(data_dir, factor_id: str) -> list[str]:
     references: list[str] = []
     strategies_dir = data_dir / "strategies"
     if strategies_dir.is_dir():
-        for file in strategies_dir.glob("*.json"):
+        for file in sorted(strategies_dir.rglob("*")):
+            if not file.is_file() or file.suffix not in {".json", ".py"}:
+                continue
+            relative = file.relative_to(data_dir).as_posix()
             try:
                 text = file.read_text(encoding="utf-8")
                 if factor_id in text:
-                    references.append(f"strategies/{file.name}")
-            except OSError:
+                    references.append(relative)
+            except (OSError, UnicodeError):
+                # 无法验证也视为引用风险；非 force 删除必须失败闭合。
+                references.append(f"{relative} (无法验证)")
+    factors_dir = data_dir / "user_data" / "custom_factors"
+    if factors_dir.is_dir():
+        for file in sorted(factors_dir.glob("*.json")):
+            if file.stem == factor_id:
                 continue
-    for definition in store.load_all(data_dir):
-        if str(definition.get("id")) == factor_id:
-            continue
-        members = definition.get("members")
-        if isinstance(members, dict) and factor_id in members:
-            references.append(f"custom_factors/{definition.get('id')}.json")
+            relative = f"custom_factors/{file.name}"
+            try:
+                if factor_id in file.read_text(encoding="utf-8"):
+                    references.append(relative)
+            except (OSError, UnicodeError):
+                references.append(f"{relative} (无法验证)")
     return references
 
 
@@ -381,7 +387,7 @@ def delete_custom_factor(factor_id: str, request: Request, force: bool = Query(d
     data_dir = _data_dir(request)
     from app.factors.registry import get_factor
 
-    if get_factor(factor_id) is None and not store.delete_one(data_dir, factor_id):
+    if get_factor(factor_id) is None and not store.exists(data_dir, factor_id):
         raise HTTPException(status_code=404, detail=f"因子不存在: {factor_id}")
     references = _find_references(data_dir, factor_id)
     if references and not force:
@@ -389,11 +395,17 @@ def delete_custom_factor(factor_id: str, request: Request, force: bool = Query(d
             status_code=409,
             detail={"message": "该因子仍有引用, 拒绝删除 (可带 force=true 强制)", "references": references},
         )
+    definition = next(
+        (item for item in store.load_all(data_dir) if str(item.get("id")) == factor_id),
+        None,
+    )
+    deleted = store.delete_one(data_dir, factor_id)
     try:
         unregister_factor(factor_id)
     except ValueError as exc:
+        if deleted and definition is not None:
+            store.save_one(data_dir, definition)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.delete_one(data_dir, factor_id)
     return {"ok": True, "id": factor_id, "removed_references": references}
 
 
@@ -417,11 +429,9 @@ def update_factor_status(factor_id: str, req: FactorStatusRequest, request: Requ
     try:
         # 动态因子先注销再注册: 元数据变更 (status/group) 不提升版本,
         # 直接 register 会因"版本未提升"被拒 (启动加载后的真实路径)
-        unregister_factor(factor_id)
-        store.register_definition(target)  # 状态与 stability 联动
+        store.persist_definition(data_dir, target, replace_registered=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, target)
     return {"ok": True, "id": factor_id, "status": req.status}
 
 
@@ -446,9 +456,7 @@ def update_factor_group(factor_id: str, req: FactorGroupRequest, request: Reques
     target["group"] = group
     target["updated_at"] = store._now()
     try:
-        unregister_factor(factor_id)
-        store.register_definition(target)
+        store.persist_definition(data_dir, target, replace_registered=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    store.save_one(data_dir, target)
     return {"ok": True, "id": factor_id, "group": group}
