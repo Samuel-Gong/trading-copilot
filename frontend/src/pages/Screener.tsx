@@ -246,17 +246,18 @@ export function Screener() {
 
   // 进入页面自动跑策略池中的策略，获取命中数
   const runAll = useMutation({
-    mutationFn: ({ date, strategyIds, extColumns }: {
+    mutationFn: ({ date, strategyIds, extColumns, assetType: requestedAssetType }: {
       date?: string
       strategyIds?: string[]
       extColumns?: string
+      assetType?: 'stock' | 'etf'
     } = {}) => {
       const latestDataDate = tradingDatesQuery.data?.latest_date ?? dataStatus.data?.enriched?.latest_date
       const includeRows = requiresTransientBatchRows(date, latestDataDate)
       return api.screenerRunAll(
         date,
         strategyIds ?? visiblePool,
-        assetType,
+        requestedAssetType ?? assetType,
         !includeRows,
         includeRows ? extColumns || undefined : undefined,
       )
@@ -271,7 +272,12 @@ export function Screener() {
         }
       }
       setTransientBatchResults(data.as_of && Object.keys(rows).length
-        ? { as_of: data.as_of, results: rows, ext_columns: vars.extColumns ?? '' }
+        ? {
+            as_of: data.as_of,
+            results: rows,
+            asset_type: vars.assetType ?? assetType,
+            ext_columns: vars.extColumns ?? '',
+          }
         : null)
       for (const [id, item] of Object.entries(data.results)) {
         counts[id] = item.total
@@ -291,34 +297,34 @@ export function Screener() {
   // 用 ref 同步门闩，避免同一渲染周期内 isPending 尚未更新导致重复触发
   const runAllPendingRef = useRef(false)
   const requestRunAll = useCallback((
-    vars: { date?: string; strategyIds?: string[]; extColumns?: string } = {},
+    vars: { date?: string; strategyIds?: string[]; extColumns?: string; assetType?: 'stock' | 'etf' } = {},
     options?: Parameters<typeof runAll.mutate>[1],
   ) => {
     if (runAllPendingRef.current || runAll.isPending) return
     runAllPendingRef.current = true
-    runAll.mutate({ ...vars, extColumns: vars.extColumns ?? extColumnsParam }, {
+    runAll.mutate({ ...vars, assetType: vars.assetType ?? assetType, extColumns: vars.extColumns ?? extColumnsParam }, {
       ...options,
       onSettled: (...args) => {
         runAllPendingRef.current = false
         options?.onSettled?.(...args)
       },
     })
-  }, [runAll, extColumnsParam])
+  }, [runAll, assetType, extColumnsParam])
 
   // 历史结果只驻留在页面内存。用户变更扩展列后重新读取该日期的明细，
   // 避免“全部”视图继续展示旧列；历史请求仍不会写入共享导出快照。
   useEffect(() => {
     const transient = transientBatchResults
-    const refreshKey = transientBatchColumnRefreshKey(transient, asOf, extColumnsParam)
+    const refreshKey = transientBatchColumnRefreshKey(transient, asOf, extColumnsParam, assetType)
     if (!transient || !refreshKey || transientColumnRefreshRef.current === refreshKey || runAll.isPending) return
     transientColumnRefreshRef.current = refreshKey
     requestRunAll({ date: asOf, strategyIds: Object.keys(transient.results) })
-  }, [asOf, extColumnsParam, transientBatchResults, runAll.isPending, requestRunAll])
+  }, [asOf, assetType, extColumnsParam, transientBatchResults, runAll.isPending, requestRunAll])
 
   // 摘要只同步当前日期的卡片数量，避免旧日期缓存短暂显示成当前结果。
   useEffect(() => {
     if (!asOf) return
-    if (transientBatchResults?.as_of === asOf) {
+    if (transientBatchResults?.as_of === asOf && transientBatchResults.asset_type === assetType) {
       setHitCounts(Object.fromEntries(
         Object.entries(transientBatchResults.results).map(([id, result]) => [id, result.total]),
       ))
@@ -337,7 +343,7 @@ export function Screener() {
     }
     setHitCounts(counts)
     setExpiredCounts(expired)
-  }, [summaryQuery.data, asOf, transientBatchResults])
+  }, [summaryQuery.data, asOf, assetType, transientBatchResults])
 
   // 当前单策略缓存更新后同步明细；参数保存的强制重算结果仍由 run 直接覆盖。
   useEffect(() => {
@@ -350,12 +356,12 @@ export function Screener() {
   }, [singleCachedQuery.data, showAll, activeStrategy, asOf])
 
   const effectiveResults = useMemo(
-    () => resultsForSelectedDate(asOf, transientBatchResults, fullCachedQuery.data),
-    [asOf, fullCachedQuery.data, transientBatchResults],
+    () => resultsForSelectedDate(asOf, transientBatchResults, fullCachedQuery.data, assetType),
+    [asOf, assetType, fullCachedQuery.data, transientBatchResults],
   )
   const transientColumnRetryParams = useMemo(
-    () => transientBatchColumnRetryParams(transientBatchResults, asOf, extColumnsParam),
-    [asOf, extColumnsParam, transientBatchResults],
+    () => transientBatchColumnRetryParams(transientBatchResults, asOf, extColumnsParam, assetType),
+    [asOf, assetType, extColumnsParam, transientBatchResults],
   )
 
   // symbol → 所属策略列表。单策略接口同时返回轻量归属映射，保留策略列原有展示。
@@ -1093,7 +1099,12 @@ export function Screener() {
         onSaved={(limit) => {
           if (settingsStrategyId) {
             setStrategyLimits(prev => ({ ...prev, [settingsStrategyId]: limit }))
-            run.mutate({ id: settingsStrategyId, date: asOf })
+            setTransientBatchResults(current => {
+              if (!current) return current
+              const { [settingsStrategyId]: _changed, ...remaining } = current.results
+              return { ...current, results: remaining }
+            })
+            run.mutate({ id: settingsStrategyId, date: assetType === 'stock' ? asOf : '' })
           }
         }}
         onAiModify={async () => {

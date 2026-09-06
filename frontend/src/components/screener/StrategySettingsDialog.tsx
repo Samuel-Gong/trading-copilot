@@ -329,6 +329,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
         setDisplayLimit(d.display_limit ?? null)
         setBasicFilterEnabled(d.basic_filter?.enabled !== false)
         setCompositeChildren(d.composite_children ?? [])
+        onSaved?.(d.display_limit ?? null)
       } finally {
         setResetting(false)
       }

@@ -103,21 +103,46 @@ def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
         return None
 
 
-def _as_of_is_latest(repo, as_of: date | str | None) -> bool:
+def _as_of_is_latest(repo, as_of: date | str | None, asset_type: str = "stock") -> bool:
     """未指定业务日期时视作当前快照, 否则只接受当前最新交易日。"""
     if as_of is None:
         return True
     try:
-        latest = repo.enriched_latest_date()
+        if asset_type == "stock":
+            latest = repo.enriched_latest_date()
+        else:
+            _, latest = repo.get_enriched_latest_asset(asset_type)
     except Exception:
         return False
     return latest is not None and str(as_of) == str(latest)
+
+
+def _timeseries_snapshot_date(cfg, data_dir, as_of: date | str) -> str | None:
+    """返回不晚于业务日期的最近时序分区，缺失时拒绝读取未来数据。"""
+    try:
+        requested = date.fromisoformat(str(as_of))
+        base = data_dir / "ext_data" / cfg.id / "timeseries"
+        partitions = list(base.iterdir())
+    except (OSError, TypeError, ValueError):
+        return None
+    candidates: list[date] = []
+    for part in partitions:
+        if not part.is_dir() or not part.name.startswith("date=") or not (part / "part.parquet").exists():
+            continue
+        try:
+            partition_date = date.fromisoformat(part.name.removeprefix("date="))
+        except ValueError:
+            continue
+        if partition_date <= requested:
+            candidates.append(partition_date)
+    return max(candidates).isoformat() if candidates else None
 
 
 def _load_ext_value_maps(
     repo,
     ext_columns: str | None,
     as_of: date | str | None = None,
+    asset_type: str = "stock",
 ) -> dict[str, dict[str, Any]]:
     """按请求加载扩展列，返回 {输出列名: {symbol: value}}。
 
@@ -130,7 +155,7 @@ def _load_ext_value_maps(
     ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []
     if not ext_specs:
         return {}
-    allow_snapshot_columns = _as_of_is_latest(repo, as_of)
+    allow_snapshot_columns = _as_of_is_latest(repo, as_of, asset_type)
 
     import polars as pl
 
@@ -150,11 +175,11 @@ def _load_ext_value_maps(
             continue
         if cfg is not None and cfg.mode == "snapshot" and not allow_snapshot_columns:
             continue
-        snapshot_date = (
-            str(as_of)
-            if cfg is not None and cfg.mode == "timeseries" and as_of is not None
-            else None
-        )
+        snapshot_date = None
+        if cfg is not None and cfg.mode == "timeseries" and as_of is not None:
+            snapshot_date = _timeseries_snapshot_date(cfg, data_dir, as_of)
+            if snapshot_date is None:
+                continue
         cache_key = (config_id, field_name, snapshot_date)
         sig = _ext_parquet_signature(cfg, data_dir) if cfg else None
         try:
@@ -318,7 +343,7 @@ def run_custom(req: CustomRequest, request: Request):
         pool=req.pool,
     )
     safe_data = _safe(asdict(result))
-    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of)
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of, req.asset_type)
     return _result_with_ext(safe_data, ext_values)
 
 
@@ -337,7 +362,7 @@ def run_preset(req: PresetRequest, request: Request):
         if req.asset_type == "stock" and req.timeframe == "1d"
         else None
     )
-    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of)
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of, req.asset_type)
     overrides = strategy_config.load_override(data_dir, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
     if not engine:
@@ -706,7 +731,7 @@ def run_all(request: Request, body: Optional[dict] = None):
             },
         }
 
-    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"), as_of)
+    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"), as_of, asset_type)
     return {"as_of": str(as_of), "results": _results_with_ext(results, ext_values)}
 
 

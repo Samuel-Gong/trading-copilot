@@ -49,10 +49,24 @@ def _data_dir(request: Request) -> Path:
     return request.app.state.repo.store.data_dir
 
 
-def _invalidate_strategy_runtime(request: Request) -> None:
+def _strategy_and_dependents(engine, strategy_id: str) -> set[str]:
+    """返回配置变更后必须重跑的策略及其直接叠加策略。"""
+    affected = {strategy_id}
+    try:
+        affected.update(engine.find_dependents(strategy_id))
+    except (AttributeError, TypeError):
+        # 兼容启动期或轻量测试替身；至少不能保留被直接修改策略的旧结果。
+        pass
+    return affected
+
+
+def _invalidate_strategy_runtime(request: Request, strategy_ids: set[str] | None = None) -> None:
     from app.services import strategy_cache
 
-    strategy_cache.clear_cache(_data_dir(request))
+    if strategy_ids is None:
+        strategy_cache.clear_cache(_data_dir(request))
+    else:
+        strategy_cache.clear_strategy_results(_data_dir(request), strategy_ids)
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     if monitor_engine is not None:
         monitor_engine.invalidate_strategy_state()
@@ -414,7 +428,7 @@ def save_config(req: SaveConfigRequest, request: Request):
     overrides = _strip_defaults(req.strategy_id, req.overrides, engine)
 
     strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
-    _invalidate_strategy_runtime(request)
+    _invalidate_strategy_runtime(request, _strategy_and_dependents(engine, req.strategy_id))
     return {"ok": True}
 
 
@@ -449,7 +463,10 @@ def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
 @router.delete("/config/{strategy_id}")
 def reset_config(strategy_id: str, request: Request):
     strategy_config.delete_override(_data_dir(request), strategy_id)
-    _invalidate_strategy_runtime(request)
+    _invalidate_strategy_runtime(
+        request,
+        _strategy_and_dependents(_get_engine(request), strategy_id),
+    )
     return {"ok": True}
 
 

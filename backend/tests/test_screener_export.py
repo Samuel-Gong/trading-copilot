@@ -425,7 +425,7 @@ def test_historical_run_without_latest_date_never_creates_export_snapshot(client
 
 
 @pytest.mark.parametrize("run_kind", ["single", "batch"])
-def test_historical_timeseries_ext_columns_use_requested_date(client, monkeypatch, run_kind):
+def test_historical_timeseries_ext_columns_use_latest_partition_at_or_before_requested_date(client, monkeypatch, run_kind):
     import polars as pl
 
     from app.api import ext_data as ext_data_api
@@ -467,6 +467,11 @@ def test_historical_timeseries_ext_columns_use_requested_date(client, monkeypatc
 
     api._ext_value_map_cache.clear()
     monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+    data_dir = client.app.state.repo.store.data_dir
+    for snapshot_date in ("2026-09-01", "2026-09-05"):
+        part = data_dir / "ext_data" / "forecast" / "timeseries" / f"date={snapshot_date}" / "part.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.touch()
 
     if run_kind == "single":
         response = client.post("/api/screener/run_preset", json={
@@ -480,8 +485,8 @@ def test_historical_timeseries_ext_columns_use_requested_date(client, monkeypatc
         rows = response.json()["results"]["alpha"]["rows"]
 
     assert response.status_code == 200
-    assert requested_dates == ["2026-09-03"]
-    assert rows[0]["forecast__signal"] == "2026-09-03"
+    assert requested_dates == ["2026-09-01"]
+    assert rows[0]["forecast__signal"] == "2026-09-01"
 
 
 @pytest.mark.parametrize("run_kind", ["single", "batch"])
@@ -597,10 +602,52 @@ def test_current_snapshot_ext_column_without_as_of_is_preserved(client, monkeypa
     assert value_maps == {"snapshot__signal": {"000003.SZ": "current-value"}}
 
 
+def test_etf_latest_date_allows_current_snapshot_ext_column(client, monkeypatch):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    client.app.state.repo.get_enriched_latest_asset = lambda asset_type: (
+        None,
+        date(2026, 9, 3) if asset_type == "etf" else None,
+    )
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="snapshot", mode="snapshot")],
+        ),
+    )
+    requested_dates: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        requested_dates.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["510300.SH"], "signal": ["etf-current"]}), None
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+
+    value_maps = api._load_ext_value_maps(
+        client.app.state.repo,
+        "snapshot.signal",
+        "2026-09-03",
+        "etf",
+    )
+
+    assert requested_dates == [None]
+    assert value_maps == {"snapshot__signal": {"510300.SH": "etf-current"}}
+
+
 @pytest.mark.parametrize("operation", ["save", "reset"])
-def test_strategy_config_change_invalidates_export_snapshot(client, operation):
+def test_strategy_config_change_only_invalidates_affected_export_snapshot(client, operation):
     data_dir = client.app.state.repo.store.data_dir
-    strategy_cache.write_cache(data_dir, DAY, {"alpha": result()})
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(),
+        "gamma": result(),
+    })
     invalidations: list[None] = []
     client.app.state.monitor_engine.invalidate_strategy_state = lambda: invalidations.append(None)
 
@@ -608,16 +655,34 @@ def test_strategy_config_change_invalidates_export_snapshot(client, operation):
         engine = client.app.state.strategy_engine
         engine.has = lambda _: True
         engine.get = lambda _: SimpleNamespace(basic_filter={})
+        engine.find_dependents = lambda _: ["beta"]
         response = client.post("/api/strategies/config", json={
             "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
         })
     else:
+        client.app.state.strategy_engine.find_dependents = lambda _: ["beta"]
         response = client.delete("/api/strategies/config/alpha")
 
     assert response.status_code == 200
-    assert strategy_cache.read_cache(data_dir) is None
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached is not None
+    assert cached["results"] == {"gamma": result()}
     assert invalidations == [None]
-    assert client.get("/api/screener/export").status_code == 404
+
+
+def test_clear_strategy_results_preserves_unaffected_cached_rows(tmp_path):
+    strategy_cache.write_cache(tmp_path, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+    })
+
+    strategy_cache.clear_strategy_results(tmp_path, {"alpha"})
+
+    cached = strategy_cache.read_cache(tmp_path)
+    assert cached is not None
+    assert cached["results"] == {"beta": result(rows=[{"symbol": "600000.SH"}])}
+    assert cached["today_ever_matched"] == {"beta": ["600000.SH"]}
+    assert cached["today_ever_rows"] == {"beta": {"600000.SH": {"symbol": "600000.SH"}}}
 
 
 @pytest.mark.parametrize("run_kind", ["single", "batch"])

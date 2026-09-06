@@ -90,6 +90,48 @@ def clear_cache(data_dir: Path) -> None:
         path.with_name(path.name + ".tmp").unlink(missing_ok=True)
 
 
+def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
+    """仅删除指定策略的缓存结果，同时保留未受配置变更影响的策略。"""
+    if not strategy_ids:
+        return
+
+    path = _cache_path(data_dir)
+    with _file_lock:
+        # 即使当前文件内没有目标策略，也要推进代际，拒绝配置变更前已经开始的回写。
+        _cache_generations[path] = _cache_generations.get(path, 0) + 1
+        cached = _read_cache_unlocked(data_dir)
+        if not cached:
+            return
+
+        results = dict(cached.get("results") or {})
+        removed = False
+        for strategy_id in strategy_ids:
+            if results.pop(strategy_id, None) is not None:
+                removed = True
+        if not removed:
+            return
+        if not results:
+            path.unlink(missing_ok=True)
+            path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+            return
+
+        payload = dict(cached)
+        payload["results"] = results
+        for key in ("today_ever_matched", "today_ever_rows"):
+            values = dict(cached.get(key) or {})
+            for strategy_id in strategy_ids:
+                values.pop(strategy_id, None)
+            payload[key] = values
+        payload["updated_at"] = int(time.time() * 1000)
+
+        try:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("按策略清理策略缓存失败: %s", e)
+
+
 def _read_cache_unlocked(data_dir: Path) -> dict | None:
     """实际读取逻辑 (不持锁)。供 read_cache 与 write_cache 复用, 避免重入死锁。"""
     path = _cache_path(data_dir)

@@ -7,6 +7,7 @@ export interface ScreenerBatchRowsResult {
 export interface ScreenerBatchResultSource {
   as_of: string | null
   results: Record<string, ScreenerBatchRowsResult>
+  asset_type?: 'stock' | 'etf'
   ext_columns?: string
 }
 
@@ -18,10 +19,11 @@ export function resultsForSelectedDate(
   asOf: string,
   transient: ScreenerBatchResultSource | null,
   cached: ScreenerBatchResultSource | undefined,
+  assetType: 'stock' | 'etf' = 'stock',
 ) {
-  const source = transient?.as_of === asOf
+  const source = transient?.as_of === asOf && (transient.asset_type ?? 'stock') === assetType
     ? transient
-    : cached?.as_of === asOf
+    : cached?.as_of === asOf && (cached.asset_type ?? 'stock') === assetType
       ? cached
       : null
   if (!source) return null
@@ -46,25 +48,31 @@ export function shouldRefreshTransientBatchForColumns(
   source: ScreenerBatchResultSource | null,
   asOf: string,
   extColumns?: string,
+  assetType: 'stock' | 'etf' = 'stock',
 ) {
-  return source?.as_of === asOf && (source.ext_columns ?? '') !== (extColumns ?? '')
+  return source?.as_of === asOf && (
+    (source.ext_columns ?? '') !== (extColumns ?? '')
+    || (source.asset_type ?? 'stock') !== assetType
+  )
 }
 
 export function transientBatchColumnRefreshKey(
   source: ScreenerBatchResultSource | null,
   asOf: string,
   extColumns?: string,
+  assetType: 'stock' | 'etf' = 'stock',
 ) {
-  if (!shouldRefreshTransientBatchForColumns(source, asOf, extColumns)) return null
-  return `${asOf}\u0000${extColumns ?? ''}`
+  if (!shouldRefreshTransientBatchForColumns(source, asOf, extColumns, assetType)) return null
+  return `${asOf}\u0000${assetType}\u0000${extColumns ?? ''}`
 }
 
 export function transientBatchColumnRetryParams(
   source: ScreenerBatchResultSource | null,
   asOf: string,
   extColumns?: string,
+  assetType: 'stock' | 'etf' = 'stock',
 ) {
-  if (!source || !transientBatchColumnRefreshKey(source, asOf, extColumns)) return null
+  if (!source || !transientBatchColumnRefreshKey(source, asOf, extColumns, assetType)) return null
   return {
     date: asOf,
     strategyIds: Object.keys(source.results),
