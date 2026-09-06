@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
-import { removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
+import { mergeTransientBatchResults, removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
 import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
@@ -352,14 +352,19 @@ export function Screener() {
           rows[id] = { as_of: item.as_of, total: item.total, rows: item.rows }
         }
       }
-      setTransientBatchResults(data.as_of && Object.keys(rows).length
+      const nextTransient = data.as_of && Object.keys(rows).length
         ? {
             as_of: data.as_of,
             results: rows,
             asset_type: vars.context.assetType,
             ext_columns: vars.extColumns,
           }
-        : null)
+        : null
+      setTransientBatchResults(current => mergeTransientBatchResults(
+        current,
+        nextTransient,
+        vars.strategyIds,
+      ))
       for (const [id, item] of Object.entries(data.results)) {
         counts[id] = item.total
       }

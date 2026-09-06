@@ -58,6 +58,28 @@ export function removeTransientBatchResults(
   }
 }
 
+export function mergeTransientBatchResults(
+  source: ScreenerBatchResultSource | null,
+  next: ScreenerBatchResultSource | null,
+  requestedStrategyIds?: readonly string[],
+) {
+  if (!next || !source || !requestedStrategyIds?.length) return next
+  if (
+    source.as_of !== next.as_of
+    || (source.asset_type ?? 'stock') !== (next.asset_type ?? 'stock')
+    || (source.ext_columns ?? '') !== (next.ext_columns ?? '')
+  ) return next
+
+  const requested = new Set(requestedStrategyIds)
+  const replacesWholeSource = Object.keys(source.results).every(id => requested.has(id))
+  if (replacesWholeSource) return next
+
+  return {
+    ...next,
+    results: { ...source.results, ...next.results },
+  }
+}
+
 export function shouldRefreshTransientBatchForColumns(
   source: ScreenerBatchResultSource | null,
   asOf: string,

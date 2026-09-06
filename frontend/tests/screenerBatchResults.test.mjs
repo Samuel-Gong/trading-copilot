@@ -41,6 +41,7 @@ const {
   shouldRefreshTransientBatchForColumns,
   transientBatchColumnRefreshKey,
   transientBatchColumnRetryParams,
+  mergeTransientBatchResults,
   removeTransientBatchResults,
   updateTransientBatchResult,
 } = await import(moduleUrl)
@@ -116,6 +117,34 @@ test('配置变更会移除目标策略及叠加策略的历史临时结果', ()
     ...transient,
     results: { beta: transient.results.beta },
   })
+})
+
+
+test('历史策略局部重跑保留未受影响的临时明细', () => {
+  const transient = {
+    as_of: '2026-09-03',
+    asset_type: 'stock',
+    results: {
+      alpha: { as_of: '2026-09-03', total: 1, rows: [{ symbol: '000001.SZ' }] },
+      beta: { as_of: '2026-09-03', total: 1, rows: [{ symbol: '000002.SZ' }] },
+    },
+  }
+  const afterConfigSave = removeTransientBatchResults(transient, ['alpha'])
+  const rerunAlpha = {
+    as_of: '2026-09-03',
+    asset_type: 'stock',
+    results: {
+      alpha: { as_of: '2026-09-03', total: 1, rows: [{ symbol: '000003.SZ' }] },
+    },
+  }
+
+  assert.deepEqual(
+    mergeTransientBatchResults(afterConfigSave, rerunAlpha, ['alpha']),
+    {
+      ...rerunAlpha,
+      results: { alpha: rerunAlpha.results.alpha, beta: transient.results.beta },
+    },
+  )
 })
 
 
