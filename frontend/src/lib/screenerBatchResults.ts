@@ -44,6 +44,20 @@ export function updateTransientBatchResult(
   }
 }
 
+export function removeTransientBatchResults(
+  source: ScreenerBatchResultSource | null,
+  strategyIds: readonly string[],
+) {
+  if (!source) return source
+  const removed = new Set(strategyIds)
+  return {
+    ...source,
+    results: Object.fromEntries(
+      Object.entries(source.results).filter(([strategyId]) => !removed.has(strategyId)),
+    ),
+  }
+}
+
 export function shouldRefreshTransientBatchForColumns(
   source: ScreenerBatchResultSource | null,
   asOf: string,

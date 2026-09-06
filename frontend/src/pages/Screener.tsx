@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
-import { requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
+import { removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -96,6 +96,7 @@ export function Screener() {
   const [showFilter, setShowFilter] = useState(false)
   const [filter, setFilter] = useState<ScreenerFilterType>(defaultFilter)
   const [transientBatchResults, setTransientBatchResults] = useState<ScreenerBatchResultSource | null>(null)
+  const screenerRunEpochRef = useRef(0)
   const filterMap = useRef<Map<string, ScreenerFilterType>>(new Map())
   const runAllDateRef = useRef<string | null>(null)
   const transientColumnRefreshRef = useRef<string | null>(null)
@@ -246,12 +247,14 @@ export function Screener() {
 
   // 进入页面自动跑策略池中的策略，获取命中数
   const runAll = useMutation({
-    mutationFn: ({ date, strategyIds, extColumns, assetType: requestedAssetType }: {
+    mutationFn: (vars: {
       date?: string
       strategyIds?: string[]
       extColumns?: string
       assetType?: 'stock' | 'etf'
+      epoch?: number
     } = {}) => {
+      const { date, strategyIds, extColumns, assetType: requestedAssetType } = vars
       const latestDataDate = tradingDatesQuery.data?.latest_date ?? dataStatus.data?.enriched?.latest_date
       const includeRows = requiresTransientBatchRows(date, latestDataDate)
       return api.screenerRunAll(
@@ -263,6 +266,7 @@ export function Screener() {
       )
     },
     onSuccess: (data, vars) => {
+      if (vars.epoch !== screenerRunEpochRef.current) return
       if (data.as_of) setAsOf(data.as_of)
       const counts: Record<string, number> = {}
       const rows: ScreenerBatchResultSource['results'] = {}
@@ -297,12 +301,17 @@ export function Screener() {
   // 用 ref 同步门闩，避免同一渲染周期内 isPending 尚未更新导致重复触发
   const runAllPendingRef = useRef(false)
   const requestRunAll = useCallback((
-    vars: { date?: string; strategyIds?: string[]; extColumns?: string; assetType?: 'stock' | 'etf' } = {},
+    vars: { date?: string; strategyIds?: string[]; extColumns?: string; assetType?: 'stock' | 'etf'; epoch?: number } = {},
     options?: Parameters<typeof runAll.mutate>[1],
   ) => {
     if (runAllPendingRef.current || runAll.isPending) return
     runAllPendingRef.current = true
-    runAll.mutate({ ...vars, assetType: vars.assetType ?? assetType, extColumns: vars.extColumns ?? extColumnsParam }, {
+    runAll.mutate({
+      ...vars,
+      assetType: vars.assetType ?? assetType,
+      epoch: vars.epoch ?? screenerRunEpochRef.current,
+      extColumns: vars.extColumns ?? extColumnsParam,
+    }, {
       ...options,
       onSettled: (...args) => {
         runAllPendingRef.current = false
@@ -537,9 +546,15 @@ export function Screener() {
   }, [strategyPoolReady, asOf, strategyPresets.length, summaryQuery.isSuccess, visiblePool, cacheCoversPool, missingStrategyIds, screenerAutoRun, assetType, runAll.isPending, requestRunAll])
 
   const run = useMutation({
-    mutationFn: ({ id, date }: { id: string; date: string }) =>
-      api.screenerRunPreset(id, undefined, date || undefined, extColumnsParam || undefined, assetType),
+    mutationFn: ({ id, date, assetType: requestedAssetType }: {
+      id: string
+      date: string
+      assetType: 'stock' | 'etf'
+      epoch: number
+    }) =>
+      api.screenerRunPreset(id, undefined, date || undefined, extColumnsParam || undefined, requestedAssetType),
     onSuccess: (data, vars) => {
+      if (vars.epoch !== screenerRunEpochRef.current) return
       setResult(data)
       setTransientBatchResults(current => updateTransientBatchResult(current, vars.id, {
         as_of: data.as_of,
@@ -561,21 +576,36 @@ export function Screener() {
     // ETF 模式: 无股票盘后缓存, 始终实时单跑。
     // 传空日期让后端用 ETF 自己的最新交易日 (asOf 跟随的是股票 enriched, 两者可能不同日)。
     if (assetType !== 'stock') {
-      run.mutate({ id: s.id, date: '' })
+      run.mutate({ id: s.id, date: '', assetType, epoch: screenerRunEpochRef.current })
       return
     }
     // 摘要命中时由 singleCachedQuery 按需加载明细；缺失时才单独计算。
     if (summaryQuery.data?.results[s.id]?.as_of === asOf || runAll.isPending) return
-    run.mutate({ id: s.id, date: asOf })
+    run.mutate({ id: s.id, date: asOf, assetType, epoch: screenerRunEpochRef.current })
   }
 
   // 日期变化交给统一 effect 计算一次，避免这里与 effect 重复请求。
   const handleDateChange = (newDate: string) => {
+    screenerRunEpochRef.current += 1
     setAsOf(newDate)
     setTransientBatchResults(null)
     runAllDateRef.current = null
     transientColumnRefreshRef.current = null
     setResult(null)
+  }
+
+  const handleAssetTypeChange = (nextAssetType: 'stock' | 'etf') => {
+    if (nextAssetType === assetType) return
+    screenerRunEpochRef.current += 1
+    runAllDateRef.current = null
+    transientColumnRefreshRef.current = null
+    setTransientBatchResults(null)
+    setHitCounts({})
+    setExpiredCounts({})
+    setAssetType(nextAssetType)
+    setActiveStrategy(null)
+    setResult(null)
+    setShowAll(false)
   }
 
   const minDate = tradingDatesQuery.data?.earliest_date ?? dataStatus.data?.enriched?.earliest_date ?? ''
@@ -681,7 +711,7 @@ export function Screener() {
               {(['stock', 'etf'] as const).map(t => (
                 <button
                   key={t}
-                  onClick={() => { setAssetType(t); setActiveStrategy(null); setResult(null); setShowAll(false) }}
+                  onClick={() => handleAssetTypeChange(t)}
                   className={`h-full px-2.5 text-xs font-medium transition-colors cursor-pointer
                     ${assetType === t
                       ? 'bg-accent/10 text-accent'
@@ -1096,15 +1126,23 @@ export function Screener() {
       <StrategySettingsDialog
         strategyId={settingsStrategyId}
         onClose={() => setSettingsStrategyId(null)}
-        onSaved={(limit) => {
+        onSaved={(limit, invalidatedStrategyIds) => {
           if (settingsStrategyId) {
             setStrategyLimits(prev => ({ ...prev, [settingsStrategyId]: limit }))
-            setTransientBatchResults(current => {
-              if (!current) return current
-              const { [settingsStrategyId]: _changed, ...remaining } = current.results
-              return { ...current, results: remaining }
+            const affected = invalidatedStrategyIds.length ? invalidatedStrategyIds : [settingsStrategyId]
+            if (result?.strategy && affected.includes(result.strategy)) setResult(null)
+            const transient = transientBatchResults
+            if (transient?.asset_type === assetType && affected.some(id => id in transient.results)) {
+              setTransientBatchResults(removeTransientBatchResults(transient, affected))
+              requestRunAll({ date: asOf, strategyIds: Object.keys(transient.results) })
+              return
+            }
+            run.mutate({
+              id: settingsStrategyId,
+              date: assetType === 'stock' ? asOf : '',
+              assetType,
+              epoch: screenerRunEpochRef.current,
             })
-            run.mutate({ id: settingsStrategyId, date: assetType === 'stock' ? asOf : '' })
           }
         }}
         onAiModify={async () => {

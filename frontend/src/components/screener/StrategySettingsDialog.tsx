@@ -27,7 +27,7 @@ Object.assign(FIELD_LABEL, {
 interface Props {
   strategyId: string | null
   onClose: () => void
-  onSaved?: (displayLimit: number | null) => void
+  onSaved?: (displayLimit: number | null, invalidatedStrategyIds: string[]) => void
   onAiModify?: () => void
   onDeleted?: () => void
 }
@@ -283,7 +283,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
     if (!strategyId) return
     setSaving(true)
     try {
-      await api.strategySaveConfig(strategyId, {
+      const saved = await api.strategySaveConfig(strategyId, {
         name: strategyName,
         description: strategyDesc,
         basic_filter: { ...basicFilter, enabled: basicFilterEnabled },
@@ -299,7 +299,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
           ? { children: compositeChildren.map(c => ({ strategy_id: c.id, weight: c.weight })) }
           : {}),
       })
-      onSaved?.(displayLimit)
+      onSaved?.(displayLimit, saved.invalidated_strategy_ids)
       onClose()
     } finally {
       setSaving(false)
@@ -311,7 +311,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
     if (!strategyId) return
     setResetting(true)
     try {
-      await api.strategyResetConfig(strategyId)
+      const reset = await api.strategyResetConfig(strategyId)
       // 重新加载默认值
       const d = await api.strategyGet(strategyId)
       setDetail(d)
@@ -329,7 +329,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
         setDisplayLimit(d.display_limit ?? null)
         setBasicFilterEnabled(d.basic_filter?.enabled !== false)
         setCompositeChildren(d.composite_children ?? [])
-        onSaved?.(d.display_limit ?? null)
+        onSaved?.(d.display_limit ?? null, reset.invalidated_strategy_ids)
       } finally {
         setResetting(false)
       }

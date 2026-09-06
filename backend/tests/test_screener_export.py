@@ -664,6 +664,7 @@ def test_strategy_config_change_only_invalidates_affected_export_snapshot(client
         response = client.delete("/api/strategies/config/alpha")
 
     assert response.status_code == 200
+    assert response.json()["invalidated_strategy_ids"] == ["alpha", "beta"]
     cached = strategy_cache.read_cache(data_dir)
     assert cached is not None
     assert cached["results"] == {"gamma": result()}
@@ -683,6 +684,16 @@ def test_clear_strategy_results_preserves_unaffected_cached_rows(tmp_path):
     assert cached["results"] == {"beta": result(rows=[{"symbol": "600000.SH"}])}
     assert cached["today_ever_matched"] == {"beta": ["600000.SH"]}
     assert cached["today_ever_rows"] == {"beta": {"600000.SH": {"symbol": "600000.SH"}}}
+
+
+def test_clear_strategy_results_fails_closed_when_atomic_replace_fails(tmp_path, monkeypatch):
+    strategy_cache.write_cache(tmp_path, DAY, {"alpha": result(), "beta": result()})
+    monkeypatch.setattr(strategy_cache.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("synthetic failure")))
+
+    with pytest.raises(OSError, match="synthetic failure"):
+        strategy_cache.clear_strategy_results(tmp_path, {"alpha"})
+
+    assert strategy_cache.read_cache(tmp_path) is None
 
 
 @pytest.mark.parametrize("run_kind", ["single", "batch"])

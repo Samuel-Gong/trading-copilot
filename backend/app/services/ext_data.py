@@ -477,6 +477,31 @@ def _config_dir(config_id: str, data_dir: Path) -> Path:
     return data_dir / "ext_data" / config_id
 
 
+def latest_timeseries_partition_on_or_before(
+    config: ExtConfig,
+    data_dir: Path,
+    as_of: date | str,
+) -> str | None:
+    """返回不晚于业务日期的最近时序分区，缺失时不读取未来数据。"""
+    try:
+        requested = date.fromisoformat(str(as_of))
+        partitions = list((_config_dir(config.id, data_dir) / "timeseries").iterdir())
+    except (OSError, TypeError, ValueError):
+        return None
+
+    candidates: list[date] = []
+    for part in partitions:
+        if not part.is_dir() or not part.name.startswith("date=") or not (part / "part.parquet").exists():
+            continue
+        try:
+            partition_date = date.fromisoformat(part.name.removeprefix("date="))
+        except ValueError:
+            continue
+        if partition_date <= requested:
+            candidates.append(partition_date)
+    return max(candidates).isoformat() if candidates else None
+
+
 def write_ext_parquet(
     df: pl.DataFrame,
     config: ExtConfig,

@@ -2865,13 +2865,13 @@ export const api = {
     ),
 
   strategySaveConfig: (strategyId: string, overrides: Record<string, any>) =>
-    request<{ ok: boolean }>('/api/strategies/config', {
+    request<{ ok: boolean; invalidated_strategy_ids: string[] }>('/api/strategies/config', {
       method: 'POST',
       body: JSON.stringify({ strategy_id: strategyId, overrides }),
     }),
 
   strategyResetConfig: (strategyId: string) =>
-    request<{ ok: boolean }>(`/api/strategies/config/${strategyId}`, { method: 'DELETE' }),
+    request<{ ok: boolean; invalidated_strategy_ids: string[] }>(`/api/strategies/config/${strategyId}`, { method: 'DELETE' }),
 
   /** 删除自定义策略（内置策略不可删除） */
   strategyDelete: (strategyId: string) =>

@@ -30,6 +30,7 @@ const {
   shouldRefreshTransientBatchForColumns,
   transientBatchColumnRefreshKey,
   transientBatchColumnRetryParams,
+  removeTransientBatchResults,
   updateTransientBatchResult,
 } = await import(moduleUrl)
 
@@ -84,6 +85,24 @@ test('历史单策略重跑同步替换临时批量明细及扩展列', () => {
 })
 
 
+test('配置变更会移除目标策略及叠加策略的历史临时结果', () => {
+  const transient = {
+    as_of: '2026-09-03',
+    asset_type: 'stock',
+    results: {
+      alpha: { as_of: '2026-09-03', total: 1, rows: [{ symbol: '000001.SZ' }] },
+      blend: { as_of: '2026-09-03', total: 1, rows: [{ symbol: '000002.SZ' }] },
+      beta: { as_of: '2026-09-03', total: 1, rows: [{ symbol: '000003.SZ' }] },
+    },
+  }
+
+  assert.deepEqual(removeTransientBatchResults(transient, ['alpha', 'blend']), {
+    ...transient,
+    results: { beta: transient.results.beta },
+  })
+})
+
+
 test('历史临时明细在扩展列配置变化后需要重新读取', () => {
   const transient = {
     as_of: '2026-09-03',
@@ -116,6 +135,14 @@ test('历史扩展列刷新失败显示直接重试入口', () => {
 
 
 test('重置策略配置会通知页面清理历史批量明细', () => {
-  assert.match(settingsSource, /await api\.strategyResetConfig\(strategyId\)[\s\S]*?onSaved\?\.\(d\.display_limit \?\? null\)/)
-  assert.match(pageSource, /onSaved=\{\(limit\) => \{[\s\S]*?setTransientBatchResults[\s\S]*?run\.mutate\(\{ id: settingsStrategyId, date: assetType === 'stock' \? asOf : '' \}\)/)
+  assert.match(settingsSource, /const reset = await api\.strategyResetConfig\(strategyId\)[\s\S]*?onSaved\?\.\(d\.display_limit \?\? null, reset\.invalidated_strategy_ids\)/)
+  assert.match(settingsSource, /invalidated_strategy_ids/)
+  assert.match(pageSource, /onSaved=\{\(limit, invalidatedStrategyIds\) => \{[\s\S]*?removeTransientBatchResults/)
+})
+
+
+test('切换资产类型会废弃旧请求和历史批量结果', () => {
+  assert.match(pageSource, /const screenerRunEpochRef = useRef\(0\)/)
+  assert.match(pageSource, /if \(vars\.epoch !== screenerRunEpochRef\.current\) return/)
+  assert.match(pageSource, /screenerRunEpochRef\.current \+= 1[\s\S]*?setTransientBatchResults\(null\)[\s\S]*?setAssetType\(nextAssetType\)/)
 })

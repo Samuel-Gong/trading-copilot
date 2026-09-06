@@ -130,6 +130,9 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
             os.replace(tmp, path)
         except Exception as e:  # noqa: BLE001
             logger.warning("按策略清理策略缓存失败: %s", e)
+            path.unlink(missing_ok=True)
+            path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+            raise
 
 
 def _read_cache_unlocked(data_dir: Path) -> dict | None:

@@ -117,27 +117,6 @@ def _as_of_is_latest(repo, as_of: date | str | None, asset_type: str = "stock") 
     return latest is not None and str(as_of) == str(latest)
 
 
-def _timeseries_snapshot_date(cfg, data_dir, as_of: date | str) -> str | None:
-    """返回不晚于业务日期的最近时序分区，缺失时拒绝读取未来数据。"""
-    try:
-        requested = date.fromisoformat(str(as_of))
-        base = data_dir / "ext_data" / cfg.id / "timeseries"
-        partitions = list(base.iterdir())
-    except (OSError, TypeError, ValueError):
-        return None
-    candidates: list[date] = []
-    for part in partitions:
-        if not part.is_dir() or not part.name.startswith("date=") or not (part / "part.parquet").exists():
-            continue
-        try:
-            partition_date = date.fromisoformat(part.name.removeprefix("date="))
-        except ValueError:
-            continue
-        if partition_date <= requested:
-            candidates.append(partition_date)
-    return max(candidates).isoformat() if candidates else None
-
-
 def _load_ext_value_maps(
     repo,
     ext_columns: str | None,
@@ -160,7 +139,7 @@ def _load_ext_value_maps(
     import polars as pl
 
     from app.api.ext_data import _read_ext_dataframe
-    from app.services.ext_data import ExtConfigStore
+    from app.services.ext_data import ExtConfigStore, latest_timeseries_partition_on_or_before
 
     db = repo.store.db
     data_dir = repo.store.data_dir
@@ -177,7 +156,7 @@ def _load_ext_value_maps(
             continue
         snapshot_date = None
         if cfg is not None and cfg.mode == "timeseries" and as_of is not None:
-            snapshot_date = _timeseries_snapshot_date(cfg, data_dir, as_of)
+            snapshot_date = latest_timeseries_partition_on_or_before(cfg, data_dir, as_of)
             if snapshot_date is None:
                 continue
         cache_key = (config_id, field_name, snapshot_date)
