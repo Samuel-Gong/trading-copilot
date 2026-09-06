@@ -38,6 +38,29 @@ def test_same_day_update_replaces_only_target_strategy_and_keeps_ever_rows(tmp_p
     assert set(cached["today_ever_rows"]["strategy_a"]) == {"000001.SZ", "000002.SZ"}
 
 
+def test_selective_invalidation_keeps_unaffected_rows_from_inflight_batch_write(tmp_path):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {
+        "alpha": _result("000001.SZ"),
+        "beta": _result("600000.SH"),
+    })
+    batch_generation = strategy_cache.cache_generation(tmp_path, ["alpha", "beta"])
+
+    strategy_cache.clear_strategy_results(tmp_path, {"alpha"})
+    strategy_cache.write_cache(
+        tmp_path,
+        "2026-07-20",
+        {
+            "alpha": _result("000002.SZ"),
+            "beta": _result("600001.SH"),
+        },
+        expected_generation=batch_generation,
+    )
+
+    cached = strategy_cache.read_cache(tmp_path)
+    assert set(cached["results"]) == {"beta"}
+    assert cached["results"]["beta"]["rows"][0]["symbol"] == "600001.SH"
+
+
 def test_new_date_resets_results_and_ever_rows(tmp_path):
     strategy_cache.write_cache(tmp_path, "2026-07-20", {"strategy_a": _result("000001.SZ")})
     next_day = _result("600000.SH")

@@ -256,7 +256,7 @@ def _update_cache_strategy(
     strategy_id: str,
     safe_data: dict,
     latest_available_as_of=None,
-    expected_generation: int | None = None,
+    expected_generation: strategy_cache.CacheGeneration | None = None,
 ) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
     strategy_cache.write_cache(
@@ -337,7 +337,7 @@ def run_preset(req: PresetRequest, request: Request):
     # 加载用户保存的策略配置
     data_dir = request.app.state.repo.store.data_dir
     cache_generation = (
-        strategy_cache.cache_generation(data_dir)
+        strategy_cache.cache_generation(data_dir, [req.strategy_id])
         if req.asset_type == "stock" and req.timeframe == "1d"
         else None
     )
@@ -620,11 +620,6 @@ def run_all(request: Request, body: Optional[dict] = None):
         return {"as_of": None, "results": {}}
 
     data_dir = request.app.state.repo.store.data_dir
-    cache_generation = (
-        strategy_cache.cache_generation(data_dir)
-        if asset_type == "stock" and timeframe == "1d"
-        else None
-    )
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
@@ -641,6 +636,12 @@ def run_all(request: Request, body: Optional[dict] = None):
 
     if not all_ids:
         return {"as_of": str(as_of), "results": {}}
+
+    cache_generation = (
+        strategy_cache.cache_generation(data_dir, all_ids)
+        if asset_type == "stock" and timeframe == "1d"
+        else None
+    )
 
     # 批量预加载所有 override 配置
     t0 = time.perf_counter()

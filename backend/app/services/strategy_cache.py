@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,8 @@ _CACHE_FILENAME = "strategy_cache.json"
 # _read_cache_unlocked 避免自死锁。写入用临时文件 + os.replace 做到原子替换。
 _file_lock = threading.Lock()
 _cache_generations: dict[Path, int] = {}
+_strategy_generations: dict[Path, dict[str, int]] = {}
+CacheGeneration = tuple[int, dict[str, int]]
 
 
 def _cache_path(data_dir: Path) -> Path:
@@ -75,10 +77,15 @@ def read_cache(data_dir: Path) -> dict | None:
         return _read_cache_unlocked(data_dir)
 
 
-def cache_generation(data_dir: Path) -> int:
-    """返回当前策略缓存代际, 供异步策略运行在回写前校验。"""
+def cache_generation(data_dir: Path, strategy_ids: Iterable[str]) -> CacheGeneration:
+    """返回全量与指定策略的缓存代际, 供异步策略运行在回写前校验。"""
+    path = _cache_path(data_dir)
     with _file_lock:
-        return _cache_generations.get(_cache_path(data_dir), 0)
+        versions = _strategy_generations.get(path, {})
+        return _cache_generations.get(path, 0), {
+            strategy_id: versions.get(strategy_id, 0)
+            for strategy_id in strategy_ids
+        }
 
 
 def clear_cache(data_dir: Path) -> None:
@@ -86,6 +93,7 @@ def clear_cache(data_dir: Path) -> None:
     path = _cache_path(data_dir)
     with _file_lock:
         _cache_generations[path] = _cache_generations.get(path, 0) + 1
+        _strategy_generations.pop(path, None)
         path.unlink(missing_ok=True)
         path.with_name(path.name + ".tmp").unlink(missing_ok=True)
 
@@ -97,8 +105,10 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
 
     path = _cache_path(data_dir)
     with _file_lock:
-        # 即使当前文件内没有目标策略，也要推进代际，拒绝配置变更前已经开始的回写。
-        _cache_generations[path] = _cache_generations.get(path, 0) + 1
+        # 即使当前文件内没有目标策略，也要推进该策略的代际，拒绝配置变更前已经开始的回写。
+        versions = _strategy_generations.setdefault(path, {})
+        for strategy_id in strategy_ids:
+            versions[strategy_id] = versions.get(strategy_id, 0) + 1
         cached = _read_cache_unlocked(data_dir)
         if not cached:
             return
@@ -170,7 +180,7 @@ def write_cache(
     preserve_newer: bool = False,
     latest_available_as_of: str | date | Callable[[], str | date | None] | None = None,
     only_latest_available: bool = False,
-    expected_generation: int | None = None,
+    expected_generation: CacheGeneration | int | None = None,
 ) -> None:
     """将策略结果写入缓存文件，同时更新今日曾命中集合。
 
@@ -181,7 +191,7 @@ def write_cache(
       过期日期快照放行较早任务覆盖并发完成的新结果
     - only_latest_available 仅在能确认且日期等于最新可用交易日时保存; 异常未来
       日期缓存仍可被正常最新交易日替换
-    - expected_generation 用于拒绝策略重载前已开始, 重载后才结束的旧结果回写
+    - expected_generation 用于拒绝全量重载前的旧回写, 并跳过配置已失效的策略结果
     """
     path = _cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,11 +218,25 @@ def _write_cache_locked(
     preserve_newer: bool,
     latest_available_as_of: str | date | Callable[[], str | date | None] | None,
     only_latest_available: bool,
-    expected_generation: int | None,
+    expected_generation: CacheGeneration | int | None,
 ) -> None:
     """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。"""
-    if expected_generation is not None and expected_generation != _cache_generations.get(path, 0):
-        return
+    if expected_generation is not None:
+        if isinstance(expected_generation, int):
+            if expected_generation != _cache_generations.get(path, 0):
+                return
+        else:
+            full_generation, strategy_generations = expected_generation
+            if full_generation != _cache_generations.get(path, 0):
+                return
+            current_strategy_generations = _strategy_generations.get(path, {})
+            results = {
+                strategy_id: result
+                for strategy_id, result in results.items()
+                if strategy_generations.get(strategy_id) == current_strategy_generations.get(strategy_id, 0)
+            }
+            if not results:
+                return
     # 读取旧缓存 (已持锁, 走不重入的 _read_cache_unlocked)
     old = _read_cache_unlocked(data_dir)
     old_as_of = old.get("as_of") if old else None
