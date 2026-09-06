@@ -568,6 +568,35 @@ def test_historical_unknown_ext_column_skips_stale_view(client, monkeypatch):
     assert queried_views == []
 
 
+def test_current_snapshot_ext_column_without_as_of_is_preserved(client, monkeypatch):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="snapshot", mode="snapshot")],
+        ),
+    )
+    requested_dates: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        requested_dates.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["000003.SZ"], "signal": ["current-value"]}), None
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+
+    value_maps = api._load_ext_value_maps(client.app.state.repo, "snapshot.signal")
+
+    assert requested_dates == [None]
+    assert value_maps == {"snapshot__signal": {"000003.SZ": "current-value"}}
+
+
 @pytest.mark.parametrize("operation", ["save", "reset"])
 def test_strategy_config_change_invalidates_export_snapshot(client, operation):
     data_dir = client.app.state.repo.store.data_dir

@@ -104,9 +104,9 @@ def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
 
 
 def _as_of_is_latest(repo, as_of: date | str | None) -> bool:
-    """仅在业务日期与当前最新交易日相同后允许拼接快照扩展列。"""
+    """未指定业务日期时视作当前快照, 否则只接受当前最新交易日。"""
     if as_of is None:
-        return False
+        return True
     try:
         latest = repo.enriched_latest_date()
     except Exception:
