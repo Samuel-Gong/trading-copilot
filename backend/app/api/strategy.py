@@ -52,11 +52,9 @@ def _data_dir(request: Request) -> Path:
 def _strategy_and_dependents(engine, strategy_id: str) -> set[str]:
     """返回配置变更后必须重跑的策略及其直接叠加策略。"""
     affected = {strategy_id}
-    try:
-        affected.update(engine.find_dependents(strategy_id))
-    except (AttributeError, TypeError):
-        # 兼容启动期或轻量测试替身；至少不能保留被直接修改策略的旧结果。
-        pass
+    find_dependents = getattr(engine, "find_dependents", None)
+    if find_dependents is not None:
+        affected.update(find_dependents(strategy_id))
     return affected
 
 
@@ -70,6 +68,21 @@ def _invalidate_strategy_runtime(request: Request, strategy_ids: set[str] | None
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
     if monitor_engine is not None:
         monitor_engine.invalidate_strategy_state()
+
+
+def _affected_strategies_or_invalidate_all(
+    request: Request, engine: StrategyEngine, strategy_id: str,
+) -> set[str]:
+    """解析依赖失败时全量失效, 避免叠加策略继续导出过期结果。"""
+    try:
+        return _strategy_and_dependents(engine, strategy_id)
+    except Exception:
+        logger.exception("解析策略 %s 的依赖失败, 改为全量清理运行缓存", strategy_id)
+        try:
+            _invalidate_strategy_runtime(request)
+        except Exception:
+            logger.exception("解析策略依赖失败后的全量缓存清理失败")
+        raise
 
 
 def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
@@ -428,7 +441,7 @@ def save_config(req: SaveConfigRequest, request: Request):
     overrides = _strip_defaults(req.strategy_id, req.overrides, engine)
 
     strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
-    affected = _strategy_and_dependents(engine, req.strategy_id)
+    affected = _affected_strategies_or_invalidate_all(request, engine, req.strategy_id)
     _invalidate_strategy_runtime(request, affected)
     return {"ok": True, "invalidated_strategy_ids": sorted(affected)}
 
@@ -464,7 +477,7 @@ def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
 @router.delete("/config/{strategy_id}")
 def reset_config(strategy_id: str, request: Request):
     strategy_config.delete_override(_data_dir(request), strategy_id)
-    affected = _strategy_and_dependents(_get_engine(request), strategy_id)
+    affected = _affected_strategies_or_invalidate_all(request, _get_engine(request), strategy_id)
     _invalidate_strategy_runtime(request, affected)
     return {"ok": True, "invalidated_strategy_ids": sorted(affected)}
 

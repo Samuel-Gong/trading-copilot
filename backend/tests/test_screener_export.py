@@ -715,6 +715,30 @@ def test_strategy_config_change_only_invalidates_affected_export_snapshot(client
     assert invalidations == [None]
 
 
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_dependency_error_invalidates_all_export_snapshot(client, operation):
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+    })
+    engine = client.app.state.strategy_engine
+    engine.find_dependents = lambda _: (_ for _ in ()).throw(TypeError("dependency failure"))
+
+    if operation == "save":
+        engine.has = lambda _: True
+        engine.get = lambda _: SimpleNamespace(basic_filter={})
+        with pytest.raises(TypeError, match="dependency failure"):
+            client.post("/api/strategies/config", json={
+                "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+            })
+    else:
+        with pytest.raises(TypeError, match="dependency failure"):
+            client.delete("/api/strategies/config/alpha")
+
+    assert strategy_cache.read_cache(data_dir) is None
+
+
 def test_clear_strategy_results_preserves_unaffected_cached_rows(tmp_path):
     strategy_cache.write_cache(tmp_path, DAY, {
         "alpha": result(),

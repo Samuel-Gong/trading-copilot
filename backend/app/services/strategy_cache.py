@@ -43,6 +43,7 @@ _CACHE_FILENAME = "strategy_cache.json"
 _file_lock = threading.Lock()
 _cache_generations: dict[Path, int] = {}
 _strategy_generations: dict[Path, dict[str, int]] = {}
+_invalid_cache_paths: set[Path] = set()
 CacheGeneration = tuple[int, dict[str, int]]
 
 
@@ -94,8 +95,7 @@ def clear_cache(data_dir: Path) -> None:
     with _file_lock:
         _cache_generations[path] = _cache_generations.get(path, 0) + 1
         _strategy_generations.pop(path, None)
-        path.unlink(missing_ok=True)
-        path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+        _invalidate_and_remove_cache_files(path)
 
 
 def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
@@ -121,8 +121,7 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
         if not removed:
             return
         if not results:
-            path.unlink(missing_ok=True)
-            path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+            _invalidate_and_remove_cache_files(path)
             return
 
         payload = dict(cached)
@@ -140,14 +139,15 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
             os.replace(tmp, path)
         except Exception as e:
             logger.warning("按策略清理策略缓存失败: %s", e)
-            path.unlink(missing_ok=True)
-            path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+            _invalidate_and_remove_cache_files(path)
             raise
 
 
 def _read_cache_unlocked(data_dir: Path) -> dict | None:
     """实际读取逻辑 (不持锁)。供 read_cache 与 write_cache 复用, 避免重入死锁。"""
     path = _cache_path(data_dir)
+    if path in _invalid_cache_paths:
+        return None
     if not path.exists():
         return None
     try:
@@ -160,6 +160,16 @@ def _read_cache_unlocked(data_dir: Path) -> dict | None:
         return None
 
     return cached
+
+
+def _invalidate_and_remove_cache_files(path: Path) -> None:
+    """使缓存立即不可读, 并尽力删除旧文件而不掩盖原始写入错误。"""
+    _invalid_cache_paths.add(path)
+    for candidate in (path, path.with_name(path.name + ".tmp")):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("删除失效策略缓存失败: %s", e)
 
 
 def _rows_to_symbol_map(rows: list[dict]) -> dict[str, dict]:
@@ -310,11 +320,11 @@ def _write_cache_locked(
         # 原子写: 先写临时文件再 os.replace, 避免读侧读到半写的 JSON
         tmp.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default), encoding="utf-8")
         os.replace(tmp, path)
+        _invalid_cache_paths.discard(path)
         total_rows = sum(len(r.get("rows", [])) for r in merged_results.values())
         total_ever = sum(len(v) for v in today_ever_matched.values())
         logger.info("策略缓存已写入: %s, %d 策略, %d 命中, %d 曾命中", as_of, len(merged_results), total_rows, total_ever)
     except Exception as e:
         logger.warning("写入策略缓存失败: %s", e)
-        path.unlink(missing_ok=True)
-        tmp.unlink(missing_ok=True)
+        _invalidate_and_remove_cache_files(path)
         raise
