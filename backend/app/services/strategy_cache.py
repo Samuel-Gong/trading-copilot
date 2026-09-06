@@ -82,10 +82,13 @@ def _process_file_lock(path: Path):
     """为缓存读改写操作加跨进程锁, 避免并发失效覆盖彼此的持久代际。"""
     lock_path = path.with_name(path.name + _LOCK_SUFFIX)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as lock_file:
+    lock_path.touch(exist_ok=True)
+    with lock_path.open("r+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
         lock_file.seek(0)
-        lock_file.write(b"\\0")
-        lock_file.flush()
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         elif msvcrt is not None:  # pragma: no cover - Windows 专用分支
@@ -116,6 +119,9 @@ def _read_generation_state(path: Path) -> CacheGeneration:
     if not isinstance(payload, dict):
         logger.warning("策略缓存代际格式无效")
         raise CacheGenerationStateError("策略缓存代际格式无效")
+    if "full_generation" not in payload or "strategy_generations" not in payload:
+        logger.warning("策略缓存代际缺少必要字段")
+        raise CacheGenerationStateError("策略缓存代际缺少必要字段")
     full_generation = payload.get("full_generation", 0)
     strategy_generations = payload.get("strategy_generations", {})
     if not isinstance(full_generation, int) or full_generation < 0:

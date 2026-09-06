@@ -243,6 +243,28 @@ def test_corrupt_generation_state_hides_cache_and_rejects_old_write(tmp_path):
     assert restarted_cache.read_cache(tmp_path) is None
 
 
+@pytest.mark.parametrize(
+    "invalid_state",
+    ["{}", '{"full_generation": 1}', '{"strategy_generations": {}}'],
+)
+def test_incomplete_generation_state_rejects_old_write(tmp_path, invalid_state):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    old_generation = strategy_cache.cache_generation(tmp_path, ["a"])
+    strategy_cache.clear_cache(tmp_path)
+    generation_path = strategy_cache._generation_path(strategy_cache._cache_path(tmp_path))
+    generation_path.write_text(invalid_state, encoding="utf-8")
+    restarted_cache = importlib.reload(strategy_cache)
+
+    with pytest.raises(restarted_cache.CacheGenerationStateError):
+        restarted_cache.write_cache(
+            tmp_path,
+            "2026-07-20",
+            {"a": _result("000002.SZ")},
+            expected_generation=old_generation,
+        )
+    assert restarted_cache.read_cache(tmp_path) is None
+
+
 def test_persisted_generation_hides_cache_when_marker_and_delete_both_fail(tmp_path, monkeypatch):
     strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
     old_generation = strategy_cache.cache_generation(tmp_path, ["a"])
@@ -307,6 +329,15 @@ def test_cache_lock_uses_windows_fallback_when_fcntl_is_unavailable(tmp_path, mo
 
     assert strategy_cache.cache_generation(tmp_path, ["a"]) == (0, {"a": 0})
     assert calls == [(FakeMsvcrt.LK_LOCK, 1), (FakeMsvcrt.LK_UNLCK, 1)]
+
+
+def test_cache_lock_file_size_stays_constant_across_repeated_reads(tmp_path):
+    for _ in range(100):
+        assert strategy_cache.read_cache(tmp_path) is None
+
+    cache_path = strategy_cache._cache_path(tmp_path)
+    lock_path = cache_path.with_name(cache_path.name + strategy_cache._LOCK_SUFFIX)
+    assert lock_path.stat().st_size == 1
 
 
 def test_cache_write_fails_when_tombstone_cannot_be_removed(tmp_path, monkeypatch):
