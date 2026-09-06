@@ -61,13 +61,25 @@ def _strategy_and_dependents(engine, strategy_id: str) -> set[str]:
 def _invalidate_strategy_runtime(request: Request, strategy_ids: set[str] | None = None) -> None:
     from app.services import strategy_cache
 
-    if strategy_ids is None:
-        strategy_cache.clear_cache(_data_dir(request))
-    else:
-        strategy_cache.clear_strategy_results(_data_dir(request), strategy_ids)
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
+    monitor_error: Exception | None = None
     if monitor_engine is not None:
-        monitor_engine.invalidate_strategy_state()
+        try:
+            monitor_engine.invalidate_strategy_state()
+        except Exception as e:
+            logger.exception("策略监控状态失效失败")
+            monitor_error = e
+    try:
+        if strategy_ids is None:
+            strategy_cache.clear_cache(_data_dir(request))
+        else:
+            strategy_cache.clear_strategy_results(_data_dir(request), strategy_ids)
+    except Exception as cache_error:
+        if monitor_error is not None:
+            raise monitor_error from cache_error
+        raise
+    if monitor_error is not None:
+        raise monitor_error
 
 
 def _affected_strategies_or_invalidate_all(

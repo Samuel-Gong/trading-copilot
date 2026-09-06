@@ -1,6 +1,7 @@
 """策略页实时结果刷新 SSE 回归测试。"""
 from __future__ import annotations
 
+import threading
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,6 +78,23 @@ class _FailingStrategyEngine(_EmptyResultStrategyEngine):
         raise RuntimeError("strategy failed")
 
 
+class _BlockingStrategyEngine(_EmptyResultStrategyEngine):
+    def __init__(self, started: threading.Event, release: threading.Event):
+        self.started = started
+        self.release = release
+
+    def run(self, strategy_id: str, context, **kwargs):
+        self.started.set()
+        assert self.release.wait(timeout=2)
+        return SimpleNamespace(
+            total=1,
+            as_of=cn_today(),
+            rows=[{"symbol": "600000.SH", "close": 10.0}],
+            entry_signal_hits=[],
+            exit_signal_hits=[],
+        )
+
+
 def test_successful_zero_match_strategy_marks_result_refresh():
     engine = MonitorRuleEngine()
     engine.set_strategy_engine(_EmptyResultStrategyEngine())
@@ -104,6 +122,32 @@ def test_failed_or_skipped_strategy_does_not_mark_result_refresh():
     assert skipped.evaluate(pl.DataFrame({"symbol": ["000001.SZ"]})) == []
     assert skipped.latest_strategy_results() == {}
     assert skipped.consume_strategy_result_updates() is False
+
+
+def test_strategy_invalidation_waits_for_inflight_evaluation_before_clearing_results():
+    started = threading.Event()
+    release = threading.Event()
+    invalidated = threading.Event()
+    monitor = MonitorRuleEngine()
+    monitor.set_strategy_engine(_BlockingStrategyEngine(started, release))
+    monitor.set_rules([_strategy_rule()])
+
+    evaluation = threading.Thread(target=lambda: monitor.evaluate(_quote_df()))
+    evaluation.start()
+    assert started.wait(timeout=2)
+    invalidation = threading.Thread(
+        target=lambda: (monitor.invalidate_strategy_state(), invalidated.set()),
+    )
+    invalidation.start()
+    assert not invalidated.wait(timeout=0.05)
+
+    release.set()
+    evaluation.join(timeout=2)
+    invalidation.join(timeout=2)
+
+    assert not evaluation.is_alive()
+    assert invalidated.is_set()
+    assert monitor.latest_strategy_results() == {}
 
 
 def test_matrix_strategy_monitor_reuses_live_matrix_and_updates_last_row():

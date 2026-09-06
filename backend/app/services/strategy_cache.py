@@ -36,6 +36,7 @@ def _json_default(obj: Any) -> Any:
 logger = logging.getLogger(__name__)
 
 _CACHE_FILENAME = "strategy_cache.json"
+_INVALID_CACHE_SUFFIX = ".invalid"
 
 # 读写同一 JSON 文件的进程内锁: write_cache 的 read-modify-write 与并发 read_cache
 # 无锁会丢更新/读到半写文件。read_cache 与 write_cache 共用此锁; write 内部复用
@@ -49,6 +50,10 @@ CacheGeneration = tuple[int, dict[str, int]]
 
 def _cache_path(data_dir: Path) -> Path:
     return data_dir / "user_data" / _CACHE_FILENAME
+
+
+def _invalid_cache_path(path: Path) -> Path:
+    return path.with_name(path.name + _INVALID_CACHE_SUFFIX)
 
 
 def _enriched_parquet_path(data_dir: Path, as_of: str) -> Path:
@@ -146,7 +151,7 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
 def _read_cache_unlocked(data_dir: Path) -> dict | None:
     """实际读取逻辑 (不持锁)。供 read_cache 与 write_cache 复用, 避免重入死锁。"""
     path = _cache_path(data_dir)
-    if path in _invalid_cache_paths:
+    if path in _invalid_cache_paths or _invalid_cache_path(path).exists():
         return None
     if not path.exists():
         return None
@@ -165,11 +170,25 @@ def _read_cache_unlocked(data_dir: Path) -> dict | None:
 def _invalidate_and_remove_cache_files(path: Path) -> None:
     """使缓存立即不可读, 并尽力删除旧文件而不掩盖原始写入错误。"""
     _invalid_cache_paths.add(path)
+    try:
+        _invalid_cache_path(path).write_text("", encoding="utf-8")
+    except OSError as e:
+        logger.warning("写入策略缓存失效标记失败: %s", e)
     for candidate in (path, path.with_name(path.name + ".tmp")):
         try:
             candidate.unlink(missing_ok=True)
         except OSError as e:
             logger.warning("删除失效策略缓存失败: %s", e)
+
+
+def _clear_invalid_cache_marker(path: Path) -> None:
+    """仅在新缓存已原子替换后移除跨进程失效标记。"""
+    try:
+        _invalid_cache_path(path).unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning("删除策略缓存失效标记失败: %s", e)
+        return
+    _invalid_cache_paths.discard(path)
 
 
 def _rows_to_symbol_map(rows: list[dict]) -> dict[str, dict]:
@@ -320,7 +339,7 @@ def _write_cache_locked(
         # 原子写: 先写临时文件再 os.replace, 避免读侧读到半写的 JSON
         tmp.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default), encoding="utf-8")
         os.replace(tmp, path)
-        _invalid_cache_paths.discard(path)
+        _clear_invalid_cache_marker(path)
         total_rows = sum(len(r.get("rows", [])) for r in merged_results.values())
         total_ever = sum(len(v) for v in today_ever_matched.values())
         logger.info("策略缓存已写入: %s, %d 策略, %d 命中, %d 曾命中", as_of, len(merged_results), total_rows, total_ever)

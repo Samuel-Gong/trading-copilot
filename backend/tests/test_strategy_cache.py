@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+
 import pytest
 
 from app.services import strategy_cache
@@ -146,6 +148,26 @@ def test_cache_write_failure_hides_previous_snapshot_when_cleanup_fails(tmp_path
         strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000002.SZ")})
 
     assert strategy_cache.read_cache(tmp_path) is None
+
+
+def test_cache_tombstone_hides_previous_snapshot_after_module_reload(tmp_path, monkeypatch):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    monkeypatch.setattr(
+        strategy_cache.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("replace denied")),
+    )
+    monkeypatch.setattr(
+        strategy_cache.Path,
+        "unlink",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("unlink denied")),
+    )
+
+    with pytest.raises(PermissionError, match="replace denied"):
+        strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000002.SZ")})
+
+    restarted_cache = importlib.reload(strategy_cache)
+    assert restarted_cache.read_cache(tmp_path) is None
 
 
 def test_selective_clear_hides_previous_snapshot_when_cleanup_fails(tmp_path, monkeypatch):

@@ -794,6 +794,51 @@ def test_strategy_config_dependency_error_invalidates_all_export_snapshot(client
     assert strategy_cache.read_cache(data_dir) is None
 
 
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_failure_still_clears_realtime_results(client, monkeypatch, operation):
+    class MonitorEngine:
+        def __init__(self):
+            self.results = {
+                "alpha": result(),
+                "beta": result(rows=[{"symbol": "600000.SH"}]),
+            }
+
+        def latest_strategy_results(self):
+            return self.results
+
+        def invalidate_strategy_state(self):
+            self.results = {}
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+        "gamma": result(rows=[{"symbol": "000003.SZ"}]),
+    })
+    client.app.state.monitor_engine = MonitorEngine()
+    engine = client.app.state.strategy_engine
+    engine.find_dependents = lambda _: ["beta"]
+    monkeypatch.setattr(
+        strategy_cache.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("cache replacement failed")),
+    )
+
+    if operation == "save":
+        engine.has = lambda _: True
+        engine.get = lambda _: SimpleNamespace(basic_filter={})
+        with pytest.raises(OSError, match="cache replacement failed"):
+            client.post("/api/strategies/config", json={
+                "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+            })
+    else:
+        with pytest.raises(OSError, match="cache replacement failed"):
+            client.delete("/api/strategies/config/alpha")
+
+    cached = api._cached_with_realtime(SimpleNamespace(app=client.app))
+    assert cached["results"] == {}
+
+
 def test_clear_strategy_results_preserves_unaffected_cached_rows(tmp_path):
     strategy_cache.write_cache(tmp_path, DAY, {
         "alpha": result(),

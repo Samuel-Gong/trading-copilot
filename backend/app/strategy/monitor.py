@@ -344,6 +344,8 @@ class MonitorRuleEngine:
         # ETF 版历史窗口加载器 (asset_type=etf 的规则用)。为 None 时 ETF filter_history 策略跳过。
         self._history_loader_etf: Callable[[_dt.date, int], "pl.DataFrame"] | None = None
         self._active_matrix_snapshots: dict[str, Any] = {}
+        # 配置变更失效与一次完整策略评估必须串行, 避免旧评估轮在失效后重新发布结果。
+        self._strategy_state_lock = threading.RLock()
         # 本轮 evaluate() 产出的策略选股结果: strategy_id → {rows, total, as_of}
         # 供策略页实时回显复用 (/api/screener/cached 端点直接读取, 避免重跑)。
         # 注意: 始终是「完整」的 dict —— evaluate 重算时先写到 _building_strategy_results,
@@ -365,13 +367,14 @@ class MonitorRuleEngine:
 
     def invalidate_strategy_state(self) -> None:
         """策略注册表变更后清除选股池、结果和矩阵快照。"""
-        self._strategy_pools.clear()
-        self._strategy_signal_state.clear()
-        self._strategy_signal_seen.clear()
-        self._latest_strategy_results = {}
-        self._building_strategy_results = {}
-        self._latest_strategy_result_ids.clear()
-        self._active_matrix_snapshots.clear()
+        with self._strategy_state_lock:
+            self._strategy_pools.clear()
+            self._strategy_signal_state.clear()
+            self._strategy_signal_seen.clear()
+            self._latest_strategy_results = {}
+            self._building_strategy_results = {}
+            self._latest_strategy_result_ids.clear()
+            self._active_matrix_snapshots.clear()
 
     def set_history_loader(self, fn) -> None:
         """注入历史窗口加载器, 用于声明 filter_history 的策略跑实时监控。
@@ -493,13 +496,15 @@ class MonitorRuleEngine:
         供策略页实时回显复用: /api/screener/cached 端点直接读取此内存结果,
         避免对被监控的策略重跑第二遍。无 type=strategy 规则时返回空 dict。
         """
-        return self._latest_strategy_results
+        with self._strategy_state_lock:
+            return self._latest_strategy_results
 
     def consume_strategy_result_updates(self) -> bool:
         """返回并清除本轮成功写入的股票策略实时结果标记。"""
-        updated = bool(self._latest_strategy_result_ids)
-        self._latest_strategy_result_ids.clear()
-        return updated
+        with self._strategy_state_lock:
+            updated = bool(self._latest_strategy_result_ids)
+            self._latest_strategy_result_ids.clear()
+            return updated
 
     def has_rule_type(self, rtype: str) -> bool:
         """是否存在指定类型的 (已启用) 规则。供 quote_service 判断是否需要注入特殊数据。"""
@@ -554,6 +559,12 @@ class MonitorRuleEngine:
 
     def evaluate(self, df: pl.DataFrame, asset_type: str = "stock",
                  reset_strategy_results: bool = True) -> list[dict]:
+        """串行执行策略评估, 避免配置失效与在途发布交错。"""
+        with self._strategy_state_lock:
+            return self._evaluate_unlocked(df, asset_type, reset_strategy_results)
+
+    def _evaluate_unlocked(self, df: pl.DataFrame, asset_type: str = "stock",
+                           reset_strategy_results: bool = True) -> list[dict]:
         """行情更新后评估规则。
 
         按 asset_type 只评估匹配资产类型的规则; ETF 规则应传 ETF enriched 快照。
