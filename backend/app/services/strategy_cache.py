@@ -1,4 +1,4 @@
-"""策略结果缓存 — 写入本地文件，供策略页面秒加载。
+"""策略结果缓存 — 写入本地文件, 供策略页面秒加载。
 
 缓存结构:
   {
@@ -29,6 +29,11 @@ try:
 except ImportError:  # pragma: no cover - Windows 开发环境没有 fcntl
     fcntl = None
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - 非 Windows 环境没有 msvcrt
+    msvcrt = None
+
 
 def _json_default(obj: Any) -> Any:
     """处理 date/datetime 等 JSON 不认识的类型。"""
@@ -45,15 +50,19 @@ _CACHE_FILENAME = "strategy_cache.json"
 _INVALID_CACHE_SUFFIX = ".invalid"
 _GENERATION_SUFFIX = ".generation.json"
 _LOCK_SUFFIX = ".lock"
+_CACHE_GENERATION_KEY = "_cache_generation"
+_STRATEGY_GENERATIONS_KEY = "_strategy_generations"
 
 # 读写同一 JSON 文件的进程内锁: write_cache 的 read-modify-write 与并发 read_cache
 # 无锁会丢更新/读到半写文件。read_cache 与 write_cache 共用此锁; write 内部复用
 # _read_cache_unlocked 避免自死锁。写入用临时文件 + os.replace 做到原子替换。
 _file_lock = threading.Lock()
-_cache_generations: dict[Path, int] = {}
-_strategy_generations: dict[Path, dict[str, int]] = {}
 _invalid_cache_paths: set[Path] = set()
 CacheGeneration = tuple[int, dict[str, int]]
+
+
+class CacheGenerationStateError(RuntimeError):
+    """缓存代际状态损坏或无法读取, 必须拒绝缓存读取和回写。"""
 
 
 def _cache_path(data_dir: Path) -> Path:
@@ -73,14 +82,25 @@ def _process_file_lock(path: Path):
     """为缓存读改写操作加跨进程锁, 避免并发失效覆盖彼此的持久代际。"""
     lock_path = path.with_name(path.name + _LOCK_SUFFIX)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0)
+        lock_file.write(b"\\0")
+        lock_file.flush()
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:  # pragma: no cover - Windows 专用分支
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:  # pragma: no cover - 所有受支持平台都应提供一种文件锁
+            raise RuntimeError("当前平台不支持策略缓存跨进程锁")
         try:
             yield
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows 专用分支
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _read_generation_state(path: Path) -> CacheGeneration:
@@ -91,20 +111,30 @@ def _read_generation_state(path: Path) -> CacheGeneration:
         return 0, {}
     except Exception as e:
         logger.warning("读取策略缓存代际失败: %s", e)
-        return 0, {}
+        raise CacheGenerationStateError("策略缓存代际无法读取") from e
 
+    if not isinstance(payload, dict):
+        logger.warning("策略缓存代际格式无效")
+        raise CacheGenerationStateError("策略缓存代际格式无效")
     full_generation = payload.get("full_generation", 0)
     strategy_generations = payload.get("strategy_generations", {})
     if not isinstance(full_generation, int) or full_generation < 0:
         logger.warning("策略缓存代际格式无效")
-        return 0, {}
+        raise CacheGenerationStateError("策略缓存代际格式无效")
     if not isinstance(strategy_generations, dict):
         logger.warning("策略缓存策略代际格式无效")
-        return full_generation, {}
+        raise CacheGenerationStateError("策略缓存策略代际格式无效")
+    if any(
+        not isinstance(strategy_id, str)
+        or not isinstance(generation, int)
+        or generation < 0
+        for strategy_id, generation in strategy_generations.items()
+    ):
+        logger.warning("策略缓存策略代际格式无效")
+        raise CacheGenerationStateError("策略缓存策略代际格式无效")
     return full_generation, {
         strategy_id: generation
         for strategy_id, generation in strategy_generations.items()
-        if isinstance(strategy_id, str) and isinstance(generation, int) and generation >= 0
     }
 
 
@@ -151,61 +181,54 @@ def read_cache(data_dir: Path) -> dict | None:
     保护价值有限。故移除: 盘后缓存总能读出, 实时新鲜度由 /api/screener/cached
     端点叠加监控引擎的内存实时结果 (latest_strategy_results) 来保证。
     """
-    with _file_lock:
-        return _read_cache_unlocked(data_dir)
+    path = _cache_path(data_dir)
+    with _file_lock, _process_file_lock(path):
+        try:
+            return _read_cache_unlocked(data_dir)
+        except CacheGenerationStateError as e:
+            logger.warning("策略缓存代际不可用, 拒绝读取缓存: %s", e)
+            return None
 
 
 def cache_generation(data_dir: Path, strategy_ids: Iterable[str]) -> CacheGeneration:
     """返回全量与指定策略的缓存代际, 供异步策略运行在回写前校验。"""
     path = _cache_path(data_dir)
-    with _file_lock:
-        with _process_file_lock(path):
-            full_generation, versions = _read_generation_state(path)
-            _cache_generations[path] = full_generation
-            _strategy_generations[path] = versions
-            return full_generation, {
-                strategy_id: versions.get(strategy_id, 0)
-                for strategy_id in strategy_ids
-            }
+    with _file_lock, _process_file_lock(path):
+        full_generation, versions = _read_generation_state(path)
+        return full_generation, {
+            strategy_id: versions.get(strategy_id, 0)
+            for strategy_id in strategy_ids
+        }
 
 
 def clear_cache(data_dir: Path) -> None:
     """删除策略结果缓存并推进代际, 阻止进行中的旧策略运行回写。"""
     path = _cache_path(data_dir)
-    with _file_lock:
-        with _process_file_lock(path):
+    with _file_lock, _process_file_lock(path):
+        try:
             full_generation, _ = _read_generation_state(path)
             next_generation = full_generation + 1
-            try:
-                _write_generation_state(path, next_generation, {})
-            except Exception:
-                _invalidate_and_remove_cache_files(path)
-                raise
-            _cache_generations[path] = next_generation
-            _strategy_generations.pop(path, None)
+            _write_generation_state(path, next_generation, {})
             _invalidate_and_remove_cache_files(path)
+        except Exception:
+            _invalidate_and_remove_cache_files(path)
+            raise
 
 
 def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
-    """仅删除指定策略的缓存结果，同时保留未受配置变更影响的策略。"""
+    """仅删除指定策略的缓存结果, 同时保留未受配置变更影响的策略。"""
     if not strategy_ids:
         return
 
     path = _cache_path(data_dir)
-    with _file_lock:
-        with _process_file_lock(path):
+    with _file_lock, _process_file_lock(path):
+        try:
             # 即使当前文件内没有目标策略, 也要推进该策略的代际, 拒绝配置变更前已经开始的回写。
             full_generation, versions = _read_generation_state(path)
             versions = dict(versions)
             for strategy_id in strategy_ids:
                 versions[strategy_id] = versions.get(strategy_id, 0) + 1
-            try:
-                _write_generation_state(path, full_generation, versions)
-            except Exception:
-                _invalidate_and_remove_cache_files(path)
-                raise
-            _cache_generations[path] = full_generation
-            _strategy_generations[path] = versions
+            _write_generation_state(path, full_generation, versions)
             cached = _read_cache_unlocked(data_dir)
             if not cached:
                 return
@@ -229,6 +252,11 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
                     values.pop(strategy_id, None)
                 payload[key] = values
             payload["updated_at"] = int(time.time() * 1000)
+            payload[_CACHE_GENERATION_KEY] = full_generation
+            payload[_STRATEGY_GENERATIONS_KEY] = {
+                strategy_id: versions.get(strategy_id, 0)
+                for strategy_id in results
+            }
 
             try:
                 tmp = path.with_name(path.name + ".tmp")
@@ -238,6 +266,9 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
                 logger.warning("按策略清理策略缓存失败: %s", e)
                 _invalidate_and_remove_cache_files(path)
                 raise
+        except Exception:
+            _invalidate_and_remove_cache_files(path)
+            raise
 
 
 def _read_cache_unlocked(data_dir: Path) -> dict | None:
@@ -256,7 +287,53 @@ def _read_cache_unlocked(data_dir: Path) -> dict | None:
         logger.warning("读取策略缓存失败: %s", e)
         return None
 
-    return cached
+    if not isinstance(cached, dict):
+        return None
+
+    current_full_generation, current_strategy_generations = _read_generation_state(path)
+    cached_full_generation = cached.pop(_CACHE_GENERATION_KEY, 0)
+    cached_strategy_generations = cached.pop(_STRATEGY_GENERATIONS_KEY, {})
+    if not isinstance(cached_full_generation, int) or cached_full_generation < 0:
+        raise CacheGenerationStateError("缓存快照代际格式无效")
+    if not isinstance(cached_strategy_generations, dict) or any(
+        not isinstance(strategy_id, str)
+        or not isinstance(generation, int)
+        or generation < 0
+        for strategy_id, generation in cached_strategy_generations.items()
+    ):
+        raise CacheGenerationStateError("缓存快照策略代际格式无效")
+    if cached_full_generation != current_full_generation:
+        return None
+
+    results = cached.get("results")
+    if not isinstance(results, dict):
+        return None
+    valid_strategy_ids = {
+        strategy_id
+        for strategy_id in results
+        if cached_strategy_generations.get(strategy_id, 0)
+        == current_strategy_generations.get(strategy_id, 0)
+    }
+    if results and not valid_strategy_ids:
+        return None
+    if len(valid_strategy_ids) == len(results):
+        return cached
+
+    filtered = dict(cached)
+    filtered["results"] = {
+        strategy_id: result
+        for strategy_id, result in results.items()
+        if strategy_id in valid_strategy_ids
+    }
+    for key in ("today_ever_matched", "today_ever_rows"):
+        values = cached.get(key)
+        if isinstance(values, dict):
+            filtered[key] = {
+                strategy_id: value
+                for strategy_id, value in values.items()
+                if strategy_id in valid_strategy_ids
+            }
+    return filtered
 
 
 def _invalidate_and_remove_cache_files(path: Path) -> None:
@@ -303,10 +380,10 @@ def write_cache(
     only_latest_available: bool = False,
     expected_generation: CacheGeneration | int | None = None,
 ) -> None:
-    """将策略结果写入缓存文件，同时更新今日曾命中集合。
+    """将策略结果写入缓存文件, 同时更新今日曾命中集合。
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
-    - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
+    - 同一天内合并 (并集) 之前曾命中的 symbol, 并用最新行数据更新
     - 设置 preserve_newer 时, 防止历史日期覆盖较新的共享快照
     - latest_available_as_of 可为日期或延迟读取函数. 函数在写锁内调用, 避免
       过期日期快照放行较早任务覆盖并发完成的新结果
@@ -318,8 +395,8 @@ def write_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
-    with _file_lock:
-        with _process_file_lock(path):
+    with _file_lock, _process_file_lock(path):
+        try:
             _write_cache_locked(
                 path,
                 data_dir,
@@ -330,6 +407,9 @@ def write_cache(
                 only_latest_available,
                 expected_generation,
             )
+        except Exception:
+            _invalidate_and_remove_cache_files(path)
+            raise
 
 
 def _write_cache_locked(
@@ -444,6 +524,11 @@ def _write_cache_locked(
         "today_ever_rows": today_ever_rows,
         "enriched_mtime": enriched_mtime,
         "updated_at": int(time.time() * 1000),
+        _CACHE_GENERATION_KEY: current_full_generation,
+        _STRATEGY_GENERATIONS_KEY: {
+            strategy_id: current_strategy_generations.get(strategy_id, 0)
+            for strategy_id in merged_results
+        },
     }
     tmp = path.with_name(path.name + ".tmp")
     try:

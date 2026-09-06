@@ -1,4 +1,4 @@
-"""策略实时监控 — 订阅行情更新，检查策略买卖信号和提醒条件。
+"""策略实时监控 — 订阅行情更新, 检查策略买卖信号和提醒条件。
 
 职责: 接收实时行情 DataFrame → 检查监控中策略的信号/提醒 → 推送告警。
 不知道: 策略加载逻辑、AI、API、配置持久化、回测。
@@ -207,7 +207,7 @@ class StrategyMonitorService:
         df: pl.DataFrame,
         signals: list[str],
     ) -> list[tuple[str, str | None, float | None, float | None, list[str]]]:
-        """检查信号列，返回 [(symbol, name, price, change_pct, [hit_signals])]。
+        """检查信号列, 返回 [(symbol, name, price, change_pct, [hit_signals])]。
         支持内置 signal_ 与自定义 csg_ 前缀。"""
         cols = set(df.columns)
         resolved: list[tuple[str, str]] = []  # (原值, 列名)
@@ -442,66 +442,88 @@ class MonitorRuleEngine:
         for r in rules:
             if r.get("enabled") is not False:
                 new_rules[r["id"]] = r
-        changed_ids = {
-            rule_id
-            for rule_id, rule in new_rules.items()
-            if rule_id in self._rules
-            and self._rule_state_signature(self._rules[rule_id])
-            != self._rule_state_signature(rule)
-        }
-        self._rules = new_rules
-        active_ids = set(new_rules) - changed_ids
-        self._last_fire = {
-            key: value for key, value in list(self._last_fire.items()) if key[0] in active_ids
-        }
-        self._strategy_pools = {
-            key: value for key, value in list(self._strategy_pools.items()) if key[0] in active_ids
-        }
-        self._strategy_signal_state = {
-            key: value
-            for key, value in list(self._strategy_signal_state.items())
-            if key[0] in active_ids
-        }
-        self._strategy_signal_seen = {
-            key: value
-            for key, value in list(self._strategy_signal_seen.items())
-            if key[0] in active_ids
-        }
-        logger.info("MonitorRuleEngine: 装载 %d 条规则", len(self._rules))
+        with self._strategy_state_lock:
+            changed_ids = {
+                rule_id
+                for rule_id, rule in new_rules.items()
+                if rule_id in self._rules
+                and self._rule_state_signature(self._rules[rule_id])
+                != self._rule_state_signature(rule)
+            }
+            self._rules = new_rules
+            active_ids = set(new_rules) - changed_ids
+            self._last_fire = {
+                key: value for key, value in list(self._last_fire.items()) if key[0] in active_ids
+            }
+            self._strategy_pools = {
+                key: value for key, value in list(self._strategy_pools.items()) if key[0] in active_ids
+            }
+            self._strategy_signal_state = {
+                key: value
+                for key, value in list(self._strategy_signal_state.items())
+                if key[0] in active_ids
+            }
+            self._strategy_signal_seen = {
+                key: value
+                for key, value in list(self._strategy_signal_seen.items())
+                if key[0] in active_ids
+            }
+            self._latest_strategy_results = {}
+            self._building_strategy_results = {}
+            self._latest_strategy_result_ids.clear()
+            self._strategy_state_generation += 1
+            logger.info("MonitorRuleEngine: 装载 %d 条规则", len(self._rules))
 
     def add_rule(self, rule: dict) -> None:
-        if rule.get("enabled") is not False:
-            self._rules[rule["id"]] = rule
-        else:
-            self._rules.pop(rule["id"], None)
+        with self._strategy_state_lock:
+            if rule.get("enabled") is not False:
+                self._rules[rule["id"]] = rule
+            else:
+                self._rules.pop(rule["id"], None)
+            self._latest_strategy_results = {}
+            self._building_strategy_results = {}
+            self._latest_strategy_result_ids.clear()
+            self._strategy_state_generation += 1
 
     def remove_rule(self, rule_id: str) -> None:
-        self._rules.pop(rule_id, None)
-        self._last_fire = {k: v for k, v in list(self._last_fire.items()) if k[0] != rule_id}
-        self._strategy_pools = {
-            k: v for k, v in list(self._strategy_pools.items()) if k[0] != rule_id
-        }
-        self._strategy_signal_state = {
-            k: v for k, v in list(self._strategy_signal_state.items()) if k[0] != rule_id
-        }
-        self._strategy_signal_seen = {
-            k: v for k, v in list(self._strategy_signal_seen.items()) if k[0] != rule_id
-        }
+        with self._strategy_state_lock:
+            self._rules.pop(rule_id, None)
+            self._last_fire = {k: v for k, v in list(self._last_fire.items()) if k[0] != rule_id}
+            self._strategy_pools = {
+                k: v for k, v in list(self._strategy_pools.items()) if k[0] != rule_id
+            }
+            self._strategy_signal_state = {
+                k: v for k, v in list(self._strategy_signal_state.items()) if k[0] != rule_id
+            }
+            self._strategy_signal_seen = {
+                k: v for k, v in list(self._strategy_signal_seen.items()) if k[0] != rule_id
+            }
+            self._latest_strategy_results = {}
+            self._building_strategy_results = {}
+            self._latest_strategy_result_ids.clear()
+            self._strategy_state_generation += 1
 
     def clear(self) -> None:
-        self._rules.clear()
-        self._last_fire.clear()
-        self._strategy_pools.clear()
-        self._strategy_signal_state.clear()
-        self._strategy_signal_seen.clear()
+        with self._strategy_state_lock:
+            self._rules.clear()
+            self._last_fire.clear()
+            self._strategy_pools.clear()
+            self._strategy_signal_state.clear()
+            self._strategy_signal_seen.clear()
+            self._latest_strategy_results = {}
+            self._building_strategy_results = {}
+            self._latest_strategy_result_ids.clear()
+            self._strategy_state_generation += 1
 
     @property
     def rules(self) -> dict[str, dict]:
-        return dict(self._rules)
+        with self._strategy_state_lock:
+            return dict(self._rules)
 
     @property
     def rule_count(self) -> int:
-        return len(self._rules)
+        with self._strategy_state_lock:
+            return len(self._rules)
 
     def latest_strategy_results(self) -> dict[str, dict]:
         """返回本轮 evaluate() 产出的策略选股结果 (strategy_id → {rows, total, as_of})。
@@ -521,25 +543,24 @@ class MonitorRuleEngine:
 
     def has_rule_type(self, rtype: str) -> bool:
         """是否存在指定类型的 (已启用) 规则。供 quote_service 判断是否需要注入特殊数据。"""
-        if not self._rules:
-            return False
-        # list() 快照: API 线程可能并发增删规则, 直接迭代 dict 会抛 RuntimeError
-        return any(
-            r.get("enabled", True) and r.get("type") == rtype
-            for r in list(self._rules.values())
-        )
+        with self._strategy_state_lock:
+            return any(
+                r.get("enabled", True) and r.get("type") == rtype
+                for r in self._rules.values()
+            )
 
     def intraday_signal_symbols(self, asset_type: str) -> set[str]:
         """返回启用的分时信号规则所需标的并集。"""
         symbols: set[str] = set()
-        for rule in list(self._rules.values()):
-            if (
-                rule.get("enabled", True)
-                and rule.get("asset_type", "stock") == asset_type
-                and rule.get("scope") == "symbols"
-                and uses_intraday_signals(rule)
-            ):
-                symbols.update(str(symbol) for symbol in rule.get("symbols", []) if symbol)
+        with self._strategy_state_lock:
+            for rule in self._rules.values():
+                if (
+                    rule.get("enabled", True)
+                    and rule.get("asset_type", "stock") == asset_type
+                    and rule.get("scope") == "symbols"
+                    and uses_intraday_signals(rule)
+                ):
+                    symbols.update(str(symbol) for symbol in rule.get("symbols", []) if symbol)
         return symbols
 
     def intraday_price_levels(self, asset_type: str) -> dict[str, list[float]]:
@@ -548,33 +569,34 @@ class MonitorRuleEngine:
         多条规则可能为同一标的不同价位设置穿越监控, 合并为 {symbol: [price1, price2, ...]}。
         """
         merged: dict[str, list[float]] = {}
-        for rule in list(self._rules.values()):
-            if (
-                rule.get("enabled", True)
-                and rule.get("asset_type", "stock") == asset_type
-                and rule.get("scope") == "symbols"
-                and uses_price_cross_signals(rule)
-            ):
-                for sym, price in (rule.get("intraday_price_levels") or {}).items():
-                    if isinstance(price, (int, float)) and price > 0:
-                        merged.setdefault(str(sym), []).append(float(price))
+        with self._strategy_state_lock:
+            for rule in self._rules.values():
+                if (
+                    rule.get("enabled", True)
+                    and rule.get("asset_type", "stock") == asset_type
+                    and rule.get("scope") == "symbols"
+                    and uses_price_cross_signals(rule)
+                ):
+                    for sym, price in (rule.get("intraday_price_levels") or {}).items():
+                        if isinstance(price, (int, float)) and price > 0:
+                            merged.setdefault(str(sym), []).append(float(price))
         return merged
 
     # ── 评估 ───────────────────────────────────────────
     def has_asset_rules(self, asset_type: str) -> bool:
         """是否存在指定资产类型的 (已启用) 规则。供 quote_service 判断是否需要 ETF 评估轮。"""
-        if not self._rules:
-            return False
-        return any(
-            r.get("enabled", True) and r.get("asset_type", "stock") == asset_type
-            for r in list(self._rules.values())
-        )
+        with self._strategy_state_lock:
+            return any(
+                r.get("enabled", True) and r.get("asset_type", "stock") == asset_type
+                for r in self._rules.values()
+            )
 
     def evaluate(self, df: pl.DataFrame, asset_type: str = "stock",
                  reset_strategy_results: bool = True) -> list[dict]:
         """在锁外评估, 并仅在失效代际未变时发布本轮状态。"""
         with self._strategy_state_lock:
             generation = self._strategy_state_generation
+            rules = list(self._rules.items())
             state = _EvaluationState(
                 last_fire=dict(self._last_fire),
                 strategy_pools={key: set(pool) for key, pool in self._strategy_pools.items()},
@@ -590,12 +612,15 @@ class MonitorRuleEngine:
                     set() if reset_strategy_results else set(self._latest_strategy_result_ids)
                 ),
             )
-        return self._evaluate_unlocked(df, asset_type, reset_strategy_results, state, generation)
+        return self._evaluate_unlocked(
+            df, asset_type, reset_strategy_results, state, generation, rules,
+        )
 
     def _evaluate_unlocked(self, df: pl.DataFrame, asset_type: str = "stock",
                            reset_strategy_results: bool = True,
                            state: _EvaluationState | None = None,
-                           generation: int | None = None) -> list[dict]:
+                           generation: int | None = None,
+                           rules: list[tuple[str, dict]] | None = None) -> list[dict]:
         """行情更新后评估规则。
 
         按 asset_type 只评估匹配资产类型的规则; ETF 规则应传 ETF enriched 快照。
@@ -609,7 +634,7 @@ class MonitorRuleEngine:
         Returns:
             触发的 AlertEvent dict 列表 (含 ts/rule_id/source/type/symbol/...)
         """
-        if not self._rules or df.is_empty():
+        if not rules or df.is_empty():
             return []
 
         assert state is not None and generation is not None
@@ -624,7 +649,7 @@ class MonitorRuleEngine:
         params_map: dict[str, dict] = {}
         overrides_map: dict[str, dict] = {}
         if self._strategy_engine is not None:
-            for rule in list(self._rules.values()):
+            for _, rule in rules:
                 if (
                     not rule.get("enabled", True)
                     or rule.get("type") != "strategy"
@@ -694,9 +719,7 @@ class MonitorRuleEngine:
                 state.active_matrix_snapshots.pop(asset_type, None)
                 logger.warning("%s 矩阵策略实时缓存准备失败: %s", asset_type, e)
 
-        # list() 快照: 本方法跑在行情轮询线程, API 线程同时 add/remove 规则
-        # 会触发 "dictionary changed size during iteration", 整轮告警丢失
-        for rule_id, rule in list(self._rules.items()):
+        for rule_id, rule in rules:
             if rule.get("asset_type", "stock") != asset_type:
                 continue
             try:

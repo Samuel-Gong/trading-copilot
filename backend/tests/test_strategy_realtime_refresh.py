@@ -150,6 +150,33 @@ def test_strategy_invalidation_discards_inflight_evaluation_without_blocking_rea
     assert monitor.latest_strategy_results() == {}
 
 
+def test_rule_updates_discard_inflight_evaluation_without_blocking_reads():
+    def assert_update(update):
+        started = threading.Event()
+        release = threading.Event()
+        updated = threading.Event()
+        monitor = MonitorRuleEngine()
+        monitor.set_strategy_engine(_BlockingStrategyEngine(started, release))
+        monitor.set_rules([_strategy_rule()])
+
+        evaluation = threading.Thread(target=lambda: monitor.evaluate(_quote_df()))
+        evaluation.start()
+        assert started.wait(timeout=2)
+        updater = threading.Thread(target=lambda: (update(monitor), updated.set()))
+        updater.start()
+        assert updated.wait(timeout=0.5)
+
+        release.set()
+        evaluation.join(timeout=2)
+        updater.join(timeout=2)
+
+        assert not evaluation.is_alive()
+        assert monitor.latest_strategy_results() == {}
+
+    assert_update(lambda monitor: monitor.set_rules([]))
+    assert_update(lambda monitor: monitor.remove_rule("strategy_rule"))
+
+
 def test_matrix_strategy_monitor_reuses_live_matrix_and_updates_last_row():
     target = cn_today()
     start = target - timedelta(days=61)

@@ -225,6 +225,90 @@ def test_fresh_generation_write_clears_tombstone_after_cache_clear(tmp_path):
     assert not strategy_cache._invalid_cache_path(strategy_cache._cache_path(tmp_path)).exists()
 
 
+def test_corrupt_generation_state_hides_cache_and_rejects_old_write(tmp_path):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    old_generation = strategy_cache.cache_generation(tmp_path, ["a"])
+    generation_path = strategy_cache._generation_path(strategy_cache._cache_path(tmp_path))
+    generation_path.write_text("{not-json", encoding="utf-8")
+    restarted_cache = importlib.reload(strategy_cache)
+
+    assert restarted_cache.read_cache(tmp_path) is None
+    with pytest.raises(restarted_cache.CacheGenerationStateError):
+        restarted_cache.write_cache(
+            tmp_path,
+            "2026-07-20",
+            {"a": _result("000002.SZ")},
+            expected_generation=old_generation,
+        )
+    assert restarted_cache.read_cache(tmp_path) is None
+
+
+def test_persisted_generation_hides_cache_when_marker_and_delete_both_fail(tmp_path, monkeypatch):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    old_generation = strategy_cache.cache_generation(tmp_path, ["a"])
+    cache_path = strategy_cache._cache_path(tmp_path)
+    marker_path = strategy_cache._invalid_cache_path(cache_path)
+    original_write_text = strategy_cache.Path.write_text
+    original_unlink = strategy_cache.Path.unlink
+
+    failures = {"marker_write": 0, "cache_delete": 0}
+
+    def fail_marker_write(path, *args, **kwargs):
+        if path == marker_path:
+            failures["marker_write"] += 1
+            raise PermissionError("marker write denied")
+        return original_write_text(path, *args, **kwargs)
+
+    def fail_cache_delete(path, *args, **kwargs):
+        if path in {cache_path, cache_path.with_name(cache_path.name + ".tmp")}:
+            failures["cache_delete"] += 1
+            raise PermissionError("cache delete denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(strategy_cache.Path, "write_text", fail_marker_write)
+    monkeypatch.setattr(strategy_cache.Path, "unlink", fail_cache_delete)
+
+    strategy_cache.clear_cache(tmp_path)
+    assert cache_path.exists()
+    restarted_cache = importlib.reload(strategy_cache)
+    restarted_cache.write_cache(
+        tmp_path,
+        "2026-07-20",
+        {"a": _result("000002.SZ")},
+        expected_generation=old_generation,
+    )
+
+    assert restarted_cache.read_cache(tmp_path) is None
+    assert failures["marker_write"] == 1
+    assert failures["cache_delete"] == 2
+
+
+def test_cache_lock_rejects_platform_without_cross_process_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(strategy_cache, "fcntl", None)
+    monkeypatch.setattr(strategy_cache, "msvcrt", None)
+
+    with pytest.raises(RuntimeError, match="跨进程锁"):
+        strategy_cache.cache_generation(tmp_path, ["a"])
+
+
+def test_cache_lock_uses_windows_fallback_when_fcntl_is_unavailable(tmp_path, monkeypatch):
+    calls: list[tuple[int, int]] = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(fd, mode, length):
+            calls.append((mode, length))
+
+    monkeypatch.setattr(strategy_cache, "fcntl", None)
+    monkeypatch.setattr(strategy_cache, "msvcrt", FakeMsvcrt)
+
+    assert strategy_cache.cache_generation(tmp_path, ["a"]) == (0, {"a": 0})
+    assert calls == [(FakeMsvcrt.LK_LOCK, 1), (FakeMsvcrt.LK_UNLCK, 1)]
+
+
 def test_cache_write_fails_when_tombstone_cannot_be_removed(tmp_path, monkeypatch):
     strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
     strategy_cache.clear_cache(tmp_path)
