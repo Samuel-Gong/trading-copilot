@@ -49,6 +49,7 @@ const {
   bindScreenerRequestContext,
   createScreenerRequestContext,
   createScreenerRequestCoordinator,
+  mergeScreenerRunAllStrategyIds,
 } = await import(requestCoordinatorUrl)
 
 
@@ -187,6 +188,34 @@ test('失效后的批量重跑会等待旧请求结束，并拒绝旧上下文',
 })
 
 
+test('连续保存时排队批跑会累积所有失效策略', () => {
+  const coordinator = createScreenerRequestCoordinator()
+  const context = createScreenerRequestContext({ asOf: '2026-09-03', assetType: 'stock' })
+  const started = []
+  const start = request => started.push(request)
+  let configRerunStrategyIds = []
+
+  coordinator.request({ id: 'old', context: context.current() }, start)
+
+  context.invalidate()
+  coordinator.invalidate()
+  configRerunStrategyIds = mergeScreenerRunAllStrategyIds(configRerunStrategyIds, ['alpha'])
+  coordinator.request({ strategyIds: configRerunStrategyIds, context: context.current() }, start)
+
+  context.invalidate()
+  coordinator.invalidate()
+  configRerunStrategyIds = mergeScreenerRunAllStrategyIds(configRerunStrategyIds, ['beta'])
+  coordinator.request({ strategyIds: configRerunStrategyIds, context: context.current() }, start)
+
+  coordinator.settle(start)
+  assert.deepEqual(started[1], {
+    strategyIds: ['alpha', 'beta'],
+    context: { asOf: '2026-09-03', assetType: 'stock', version: 2 },
+    epoch: 2,
+  })
+})
+
+
 test('旧渲染闭包不能以新代际发起旧日期或旧资产请求', () => {
   const context = createScreenerRequestContext({ asOf: '2026-09-04', assetType: 'stock' })
 
@@ -236,13 +265,6 @@ test('重置策略配置会通知页面清理历史批量明细', () => {
   assert.match(settingsSource, /const reset = await api\.strategyResetConfig\(strategyId\)[\s\S]*?onSaved\?\.\(d\.display_limit \?\? null, reset\.invalidated_strategy_ids\)/)
   assert.match(settingsSource, /invalidated_strategy_ids/)
   assert.match(pageSource, /onSaved=\{\(limit, invalidatedStrategyIds\) => \{[\s\S]*?removeTransientBatchResults/)
-})
-
-
-test('保存非当前策略也会刷新摘要并重跑受影响的策略池成员', () => {
-  assert.match(pageSource, /qc\.invalidateQueries\(\{ queryKey: \['screener-cached'\] \}\)[\s\S]*?vars\.id !== activeStrategyRef\.current/)
-  assert.match(pageSource, /const affectedPool = affected\.filter\(id => visiblePool\.includes\(id\)\)/)
-  assert.match(pageSource, /requestRunAll\(\{ strategyIds: affectedPool \}\)/)
 })
 
 

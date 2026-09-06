@@ -534,6 +534,27 @@ def test_timeseries_partition_rejects_future_only_data(tmp_path):
     ) is None
 
 
+def test_ext_value_map_cache_evicts_least_recently_used_historical_partition(monkeypatch):
+    def cache_key(snapshot_date):
+        return "forecast", "signal", snapshot_date
+
+    def signature(snapshot_date):
+        return (f"/{snapshot_date}/part.parquet", 1.0),
+    monkeypatch.setattr(api, "_EXT_VALUE_MAP_CACHE_MAX_ENTRIES", 2)
+    api._ext_value_map_cache.clear()
+    try:
+        api._cache_ext_value_map(cache_key("2026-09-01"), signature("2026-09-01"), {"A": 1})
+        api._cache_ext_value_map(cache_key("2026-09-02"), signature("2026-09-02"), {"A": 2})
+        assert api._get_cached_ext_value_map(cache_key("2026-09-01"), signature("2026-09-01")) == {"A": 1}
+
+        api._cache_ext_value_map(cache_key("2026-09-03"), signature("2026-09-03"), {"A": 3})
+
+        assert api._get_cached_ext_value_map(cache_key("2026-09-02"), signature("2026-09-02")) is None
+        assert list(api._ext_value_map_cache) == [cache_key("2026-09-01"), cache_key("2026-09-03")]
+    finally:
+        api._ext_value_map_cache.clear()
+
+
 @pytest.mark.parametrize("run_kind", ["single", "batch"])
 def test_historical_snapshot_ext_columns_are_omitted(client, monkeypatch, run_kind):
     import polars as pl

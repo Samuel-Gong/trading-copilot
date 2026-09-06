@@ -23,6 +23,13 @@ export function bindScreenerRequestContext<T extends ScreenerRequestInput>(
   return { ...request, date, assetType, context }
 }
 
+export function mergeScreenerRunAllStrategyIds(
+  current: readonly string[],
+  next: readonly string[],
+) {
+  return [...new Set([...current, ...next])]
+}
+
 export function createScreenerRequestContext(
   initial: Omit<ScreenerRequestContext, 'version'>,
 ) {

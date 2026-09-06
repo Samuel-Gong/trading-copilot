@@ -6,7 +6,9 @@ import logging
 import math
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict
 from datetime import date, datetime
 from typing import Annotated, Any, Literal, Optional
@@ -86,8 +88,35 @@ def _safe_ext_value(value: Any) -> Any:
 # 每次请求 _load_ext_value_maps 都会重新从磁盘读 ext parquet 并重建 {symbol: value}。
 # 用底层 parquet 文件的 (路径, mtime) 签名做 memoize: 文件未变则复用上次的 map,
 # parquet 被重写 (mtime 变化) 时自动失效重算。仅缓存基于 config 的快照/时序路径,
-# 无 config 的 DuckDB view 回退路径不缓存 (少见)。
-_ext_value_map_cache: dict[tuple[str, str, str | None], tuple[Any, dict[str, Any]]] = {}
+# 无 config 的 DuckDB view 回退路径不缓存 (少见)。历史分区可能很多, 因此采用
+# 有界 LRU, 避免每个业务日期都永久保留一份全市场 symbol 映射。
+_EXT_VALUE_MAP_CACHE_MAX_ENTRIES = 32
+_ext_value_map_cache: OrderedDict[
+    tuple[str, str, str | None], tuple[Any, dict[str, Any]],
+] = OrderedDict()
+_ext_value_map_cache_lock = threading.Lock()
+
+
+def _get_cached_ext_value_map(cache_key: tuple[str, str, str | None], sig: tuple) -> dict[str, Any] | None:
+    """按文件签名读取并提升 LRU 项; 签名变化时删除旧项。"""
+    with _ext_value_map_cache_lock:
+        cached = _ext_value_map_cache.get(cache_key)
+        if cached is None:
+            return None
+        if cached[0] != sig:
+            _ext_value_map_cache.pop(cache_key, None)
+            return None
+        _ext_value_map_cache.move_to_end(cache_key)
+        return cached[1]
+
+
+def _cache_ext_value_map(cache_key: tuple[str, str, str | None], sig: tuple, value_map: dict[str, Any]) -> None:
+    """写入扩展列映射并淘汰最久未使用的条目。"""
+    with _ext_value_map_cache_lock:
+        _ext_value_map_cache[cache_key] = (sig, value_map)
+        _ext_value_map_cache.move_to_end(cache_key)
+        while len(_ext_value_map_cache) > _EXT_VALUE_MAP_CACHE_MAX_ENTRIES:
+            _ext_value_map_cache.popitem(last=False)
 
 
 def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
@@ -164,9 +193,9 @@ def _load_ext_value_maps(
         try:
             if cfg:
                 # 命中缓存 (文件签名一致) → 复用, 免去磁盘重读
-                cached = _ext_value_map_cache.get(cache_key)
-                if cached is not None and sig is not None and cached[0] == sig:
-                    value_maps[out_col] = cached[1]
+                cached = _get_cached_ext_value_map(cache_key, sig) if sig is not None else None
+                if cached is not None:
+                    value_maps[out_col] = cached
                     continue
                 # 时序扩展表按业务日期取单个分区, 避免历史结果读取未来数据。
                 ext_df, _ = _read_ext_dataframe(cfg, data_dir, snapshot_date=snapshot_date)
@@ -187,7 +216,7 @@ def _load_ext_value_maps(
             }
             value_maps[out_col] = vmap
             if cfg and sig is not None:
-                _ext_value_map_cache[cache_key] = (sig, vmap)
+                _cache_ext_value_map(cache_key, sig, vmap)
         except Exception as e:  # noqa: BLE001
             logger.debug("screener ext column join skipped for %s.%s: %s", config_id, field_name, e)
 

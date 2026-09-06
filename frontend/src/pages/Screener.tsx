@@ -4,7 +4,7 @@ import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { mergeTransientBatchResults, removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
-import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
+import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, mergeScreenerRunAllStrategyIds, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -116,13 +116,18 @@ export function Screener() {
   const transientColumnRefreshRef = useRef<string | null>(null)
   const latestDataDateRef = useRef<string | null>(null)
   const strategyPoolContextKeyRef = useRef<string | null>(null)
+  const configRerunStrategyIdsRef = useRef<string[]>([])
   const requestCoordinatorRef = useRef(createScreenerRequestCoordinator<QueuedRunAllRequest>())
   const requestCoordinator = requestCoordinatorRef.current
   const requestContextRef = useRef(createScreenerRequestContext({ asOf: '', assetType: 'stock' }))
   const requestContext = requestContextRef.current
   const qc = useQueryClient()
 
-  const invalidateScreenerRequests = useCallback((next: Partial<Omit<ScreenerRequestContext, 'version'>> = {}) => {
+  const invalidateScreenerRequests = useCallback((
+    next: Partial<Omit<ScreenerRequestContext, 'version'>> = {},
+    preserveConfigReruns = false,
+  ) => {
+    if (!preserveConfigReruns) configRerunStrategyIdsRef.current = []
     const context = requestContext.invalidate(next)
     const epoch = requestCoordinator.invalidate()
     runAllDateRef.current = null
@@ -365,6 +370,11 @@ export function Screener() {
         nextTransient,
         vars.strategyIds,
       ))
+      if (vars.strategyIds) {
+        const completed = new Set(vars.strategyIds)
+        configRerunStrategyIdsRef.current = configRerunStrategyIdsRef.current
+          .filter(id => !completed.has(id))
+      }
       for (const [id, item] of Object.entries(data.results)) {
         counts[id] = item.total
       }
@@ -1236,7 +1246,7 @@ export function Screener() {
         onClose={() => setSettingsStrategyId(null)}
         onSaved={(limit, invalidatedStrategyIds) => {
           if (settingsStrategyId) {
-            invalidateScreenerRequests()
+            invalidateScreenerRequests({}, true)
             const context = requestContext.current()
             qc.invalidateQueries({ queryKey: ['screener-cached'] })
             setStrategyLimits(prev => ({ ...prev, [settingsStrategyId]: limit }))
@@ -1250,11 +1260,23 @@ export function Screener() {
               && affected.some(id => id in transient.results)
             ) {
               setTransientBatchResults(removeTransientBatchResults(transient, affected))
-              if (affectedPool.length > 0) requestRunAll({ strategyIds: affectedPool })
+              if (affectedPool.length > 0) {
+                configRerunStrategyIdsRef.current = mergeScreenerRunAllStrategyIds(
+                  configRerunStrategyIdsRef.current,
+                  affectedPool,
+                )
+                requestRunAll({ strategyIds: configRerunStrategyIdsRef.current })
+              }
               return
             }
             if (context.assetType === 'stock') {
-              if (affectedPool.length > 0) requestRunAll({ strategyIds: affectedPool })
+              if (affectedPool.length > 0) {
+                configRerunStrategyIdsRef.current = mergeScreenerRunAllStrategyIds(
+                  configRerunStrategyIdsRef.current,
+                  affectedPool,
+                )
+                requestRunAll({ strategyIds: configRerunStrategyIdsRef.current })
+              }
               return
             }
             run.mutate({
