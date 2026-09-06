@@ -4,6 +4,7 @@ import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
+import { createScreenerRequestCoordinator, type CoordinatedRequest } from '@/lib/screenerRequestCoordinator'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -41,6 +42,17 @@ import {
   saveScreenerColumnConfig,
   type ColumnConfig,
 } from '@/lib/screener-columns'
+
+type RunAllRequestVariables = {
+  date?: string
+  strategyIds?: string[]
+  extColumns?: string
+  assetType?: 'stock' | 'etf'
+}
+
+type QueuedRunAllRequest = {
+  vars: RunAllRequestVariables
+}
 
 export function Screener() {
   const [assetType, setAssetType] = useState<'stock' | 'etf'>('stock')
@@ -96,11 +108,21 @@ export function Screener() {
   const [showFilter, setShowFilter] = useState(false)
   const [filter, setFilter] = useState<ScreenerFilterType>(defaultFilter)
   const [transientBatchResults, setTransientBatchResults] = useState<ScreenerBatchResultSource | null>(null)
-  const screenerRunEpochRef = useRef(0)
   const filterMap = useRef<Map<string, ScreenerFilterType>>(new Map())
+  const activeStrategyRef = useRef<string | null>(null)
   const runAllDateRef = useRef<string | null>(null)
   const transientColumnRefreshRef = useRef<string | null>(null)
+  const latestDataDateRef = useRef<string | null>(null)
+  const requestCoordinatorRef = useRef(createScreenerRequestCoordinator<QueuedRunAllRequest>())
+  const requestCoordinator = requestCoordinatorRef.current
   const qc = useQueryClient()
+
+  const invalidateScreenerRequests = useCallback(() => {
+    const epoch = requestCoordinator.invalidate()
+    runAllDateRef.current = null
+    transientColumnRefreshRef.current = null
+    return epoch
+  }, [requestCoordinator])
 
   // 结果列配置 — 默认内置列，异步合并后端/localStorage 偏好
   const [columns, setColumns] = useState<ColumnConfig[]>([...SCREENER_BUILTIN_COLUMNS])
@@ -114,9 +136,10 @@ export function Screener() {
   }, [])
 
   const handleColumnsChange = useCallback((next: ColumnConfig[]) => {
+    invalidateScreenerRequests()
     setColumns(next)
     saveScreenerColumnConfig(next)
-  }, [])
+  }, [invalidateScreenerRequests])
 
   const extColumnsParam = useMemo(() => buildExtColumnsParam(columns), [columns])
 
@@ -131,6 +154,10 @@ export function Screener() {
   useEffect(() => {
     if (activeStrategy) filterMap.current.set(activeStrategy, filter)
   }, [filter, activeStrategy])
+
+  useEffect(() => {
+    activeStrategyRef.current = activeStrategy
+  }, [activeStrategy])
 
   // 切换策略时恢复该策略之前保存的筛选
   const handleStrategySwitch = useCallback((strategyId: string) => {
@@ -178,11 +205,18 @@ export function Screener() {
   const tradingDatesQuery = useTradingDates()
   const tradingDates = tradingDatesQuery.data?.dates ?? []
 
-  // 默认日期 = enriched 最新日期（始终跟随最新）
+  // 默认日期 = enriched 最新日期；仅在用户仍停留于上一次最新日期时自动跟随新数据。
   useEffect(() => {
     const latest = tradingDatesQuery.data?.latest_date ?? dataStatus.data?.enriched?.latest_date
-    if (latest) setAsOf(latest)
-  }, [dataStatus.data?.enriched?.latest_date, tradingDatesQuery.data?.latest_date])
+    if (!latest || latest === latestDataDateRef.current) return
+    const previousLatest = latestDataDateRef.current
+    latestDataDateRef.current = latest
+    if (previousLatest && asOf !== previousLatest) return
+    invalidateScreenerRequests()
+    setAsOf(latest)
+    setTransientBatchResults(null)
+    setResult(null)
+  }, [asOf, dataStatus.data?.enriched?.latest_date, invalidateScreenerRequests, tradingDatesQuery.data?.latest_date])
 
   const strategyPresets = useMemo(
     () => (strategies.data?.presets ?? []).filter(s => s.asset_types.includes(assetType)),
@@ -247,13 +281,7 @@ export function Screener() {
 
   // 进入页面自动跑策略池中的策略，获取命中数
   const runAll = useMutation({
-    mutationFn: (vars: {
-      date?: string
-      strategyIds?: string[]
-      extColumns?: string
-      assetType?: 'stock' | 'etf'
-      epoch?: number
-    } = {}) => {
+    mutationFn: (vars: RunAllRequestVariables & CoordinatedRequest) => {
       const { date, strategyIds, extColumns, assetType: requestedAssetType } = vars
       const latestDataDate = tradingDatesQuery.data?.latest_date ?? dataStatus.data?.enriched?.latest_date
       const includeRows = requiresTransientBatchRows(date, latestDataDate)
@@ -266,7 +294,7 @@ export function Screener() {
       )
     },
     onSuccess: (data, vars) => {
-      if (vars.epoch !== screenerRunEpochRef.current) return
+      if (!requestCoordinator.isCurrent(vars.epoch)) return
       if (data.as_of) setAsOf(data.as_of)
       const counts: Record<string, number> = {}
       const rows: ScreenerBatchResultSource['results'] = {}
@@ -298,27 +326,26 @@ export function Screener() {
   const cacheCoversPool = visiblePool.length > 0 && missingStrategyIds.length === 0
 
   // 防止 reload / auto-run / StrictMode 叠出并发 run_all（后端 Numba 会崩溃）
-  // 用 ref 同步门闩，避免同一渲染周期内 isPending 尚未更新导致重复触发
-  const runAllPendingRef = useRef(false)
-  const requestRunAll = useCallback((
-    vars: { date?: string; strategyIds?: string[]; extColumns?: string; assetType?: 'stock' | 'etf'; epoch?: number } = {},
-    options?: Parameters<typeof runAll.mutate>[1],
-  ) => {
-    if (runAllPendingRef.current || runAll.isPending) return
-    runAllPendingRef.current = true
-    runAll.mutate({
-      ...vars,
-      assetType: vars.assetType ?? assetType,
-      epoch: vars.epoch ?? screenerRunEpochRef.current,
-      extColumns: vars.extColumns ?? extColumnsParam,
-    }, {
-      ...options,
-      onSettled: (...args) => {
-        runAllPendingRef.current = false
-        options?.onSettled?.(...args)
-      },
+  // 当前请求不能取消时，保留最新的重跑请求，并在它结束后执行。
+  const startRunAllRef = useRef<(request: QueuedRunAllRequest & CoordinatedRequest) => void>(() => {})
+  const startRunAll = useCallback((request: QueuedRunAllRequest & CoordinatedRequest) => {
+    runAll.mutate({ ...request.vars, epoch: request.epoch }, {
+      onSettled: () => requestCoordinator.settle(startRunAllRef.current),
     })
-  }, [runAll, assetType, extColumnsParam])
+  }, [requestCoordinator, runAll])
+  startRunAllRef.current = startRunAll
+
+  const requestRunAll = useCallback((
+    vars: RunAllRequestVariables = {},
+  ) => {
+    requestCoordinator.request({
+      vars: {
+        ...vars,
+        assetType: vars.assetType ?? assetType,
+        extColumns: vars.extColumns ?? extColumnsParam,
+      },
+    }, startRunAll)
+  }, [assetType, extColumnsParam, requestCoordinator, startRunAll])
 
   // 历史结果只驻留在页面内存。用户变更扩展列后重新读取该日期的明细，
   // 避免“全部”视图继续展示旧列；历史请求仍不会写入共享导出快照。
@@ -554,7 +581,7 @@ export function Screener() {
     }) =>
       api.screenerRunPreset(id, undefined, date || undefined, extColumnsParam || undefined, requestedAssetType),
     onSuccess: (data, vars) => {
-      if (vars.epoch !== screenerRunEpochRef.current) return
+      if (!requestCoordinator.isCurrent(vars.epoch) || vars.id !== activeStrategyRef.current) return
       setResult(data)
       setTransientBatchResults(current => updateTransientBatchResult(current, vars.id, {
         as_of: data.as_of,
@@ -569,43 +596,52 @@ export function Screener() {
   })
 
   const handleRun = (s: ScreenerStrategy) => {
+    if (activeStrategy !== s.id || showAll) invalidateScreenerRequests()
     handleStrategySwitch(s.id)
+    activeStrategyRef.current = s.id
     setActiveStrategy(s.id)
     setShowAll(false)
     if (result?.strategy !== s.id || result.as_of !== asOf) setResult(null)
     // ETF 模式: 无股票盘后缓存, 始终实时单跑。
     // 传空日期让后端用 ETF 自己的最新交易日 (asOf 跟随的是股票 enriched, 两者可能不同日)。
     if (assetType !== 'stock') {
-      run.mutate({ id: s.id, date: '', assetType, epoch: screenerRunEpochRef.current })
+      run.mutate({ id: s.id, date: '', assetType, epoch: requestCoordinator.currentEpoch() })
       return
     }
     // 摘要命中时由 singleCachedQuery 按需加载明细；缺失时才单独计算。
     if (summaryQuery.data?.results[s.id]?.as_of === asOf || runAll.isPending) return
-    run.mutate({ id: s.id, date: asOf, assetType, epoch: screenerRunEpochRef.current })
+    run.mutate({ id: s.id, date: asOf, assetType, epoch: requestCoordinator.currentEpoch() })
   }
 
   // 日期变化交给统一 effect 计算一次，避免这里与 effect 重复请求。
   const handleDateChange = (newDate: string) => {
-    screenerRunEpochRef.current += 1
+    invalidateScreenerRequests()
     setAsOf(newDate)
     setTransientBatchResults(null)
-    runAllDateRef.current = null
-    transientColumnRefreshRef.current = null
     setResult(null)
   }
 
   const handleAssetTypeChange = (nextAssetType: 'stock' | 'etf') => {
     if (nextAssetType === assetType) return
-    screenerRunEpochRef.current += 1
-    runAllDateRef.current = null
-    transientColumnRefreshRef.current = null
+    invalidateScreenerRequests()
     setTransientBatchResults(null)
     setHitCounts({})
     setExpiredCounts({})
     setAssetType(nextAssetType)
+    activeStrategyRef.current = null
     setActiveStrategy(null)
     setResult(null)
     setShowAll(false)
+  }
+
+  const handleShowAllToggle = () => {
+    if (!showAll) {
+      invalidateScreenerRequests()
+      activeStrategyRef.current = null
+      setActiveStrategy(null)
+      setResult(null)
+    }
+    setShowAll(current => !current)
   }
 
   const minDate = tradingDatesQuery.data?.earliest_date ?? dataStatus.data?.enriched?.earliest_date ?? ''
@@ -636,8 +672,14 @@ export function Screener() {
   // 重新运行策略：重载策略文件 + 重跑全部策略，刷新符合条件的个股
   const reloadStrategies = useMutation({
     mutationFn: api.strategyReload,
+    onMutate: () => {
+      invalidateScreenerRequests()
+      setTransientBatchResults(null)
+      setResult(null)
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['screener-strategies'] })
+      qc.invalidateQueries({ queryKey: ['screener-cached'] })
       if (asOf) requestRunAll({ date: asOf })
     },
   })
@@ -747,7 +789,7 @@ export function Screener() {
             )}
             {/* 全部切换 */}
             <button
-              onClick={() => setShowAll(v => { if (!v) setActiveStrategy(null); return !v })}
+              onClick={handleShowAllToggle}
               title="显示全部策略个股"
               className={`inline-flex items-center justify-center h-7 w-7 rounded-btn border transition-colors cursor-pointer
                 ${showAll
@@ -1128,6 +1170,7 @@ export function Screener() {
         onClose={() => setSettingsStrategyId(null)}
         onSaved={(limit, invalidatedStrategyIds) => {
           if (settingsStrategyId) {
+            invalidateScreenerRequests()
             setStrategyLimits(prev => ({ ...prev, [settingsStrategyId]: limit }))
             const affected = invalidatedStrategyIds.length ? invalidatedStrategyIds : [settingsStrategyId]
             if (result?.strategy && affected.includes(result.strategy)) setResult(null)
@@ -1141,7 +1184,7 @@ export function Screener() {
               id: settingsStrategyId,
               date: assetType === 'stock' ? asOf : '',
               assetType,
-              epoch: screenerRunEpochRef.current,
+              epoch: requestCoordinator.currentEpoch(),
             })
           }
         }}

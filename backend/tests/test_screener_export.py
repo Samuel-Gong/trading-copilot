@@ -489,6 +489,18 @@ def test_historical_timeseries_ext_columns_use_latest_partition_at_or_before_req
     assert rows[0]["forecast__signal"] == "2026-09-01"
 
 
+def test_timeseries_partition_rejects_future_only_data(tmp_path):
+    from app.services.ext_data import latest_timeseries_partition_on_or_before
+
+    future_part = tmp_path / "ext_data" / "forecast" / "timeseries" / "date=2026-09-05" / "part.parquet"
+    future_part.parent.mkdir(parents=True)
+    future_part.touch()
+
+    assert latest_timeseries_partition_on_or_before(
+        SimpleNamespace(id="forecast"), tmp_path, "2026-09-03",
+    ) is None
+
+
 @pytest.mark.parametrize("run_kind", ["single", "batch"])
 def test_historical_snapshot_ext_columns_are_omitted(client, monkeypatch, run_kind):
     import polars as pl

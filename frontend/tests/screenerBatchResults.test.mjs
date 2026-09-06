@@ -17,6 +17,10 @@ const settingsSource = await readFile(
   new URL('../src/components/screener/StrategySettingsDialog.tsx', import.meta.url),
   'utf8',
 )
+const requestCoordinatorSource = await readFile(
+  new URL('../src/lib/screenerRequestCoordinator.ts', import.meta.url),
+  'utf8',
+)
 const { outputText } = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.ES2022,
@@ -24,6 +28,13 @@ const { outputText } = ts.transpileModule(source, {
   },
 })
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
+const { outputText: requestCoordinatorOutput } = ts.transpileModule(requestCoordinatorSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.ES2022,
+    target: ts.ScriptTarget.ES2022,
+  },
+})
+const requestCoordinatorUrl = `data:text/javascript;base64,${Buffer.from(requestCoordinatorOutput).toString('base64')}`
 const {
   requiresTransientBatchRows,
   resultsForSelectedDate,
@@ -33,6 +44,7 @@ const {
   removeTransientBatchResults,
   updateTransientBatchResult,
 } = await import(moduleUrl)
+const { createScreenerRequestCoordinator } = await import(requestCoordinatorUrl)
 
 
 test('仅在历史日期早于最新数据日期时请求批量明细', () => {
@@ -103,6 +115,29 @@ test('配置变更会移除目标策略及叠加策略的历史临时结果', ()
 })
 
 
+test('失效后的批量重跑会等待旧请求结束，并拒绝旧上下文', () => {
+  const coordinator = createScreenerRequestCoordinator()
+  const started = []
+  const start = request => started.push(request)
+
+  coordinator.request({ id: 'old-date' }, start)
+  assert.deepEqual(started, [{ id: 'old-date', epoch: 0 }])
+
+  coordinator.invalidate()
+  coordinator.request({ id: 'new-config' }, start)
+
+  assert.equal(coordinator.isCurrent(started[0].epoch), false)
+  assert.equal(started.length, 1)
+
+  coordinator.settle(start)
+  assert.deepEqual(started, [
+    { id: 'old-date', epoch: 0 },
+    { id: 'new-config', epoch: 1 },
+  ])
+  assert.equal(coordinator.isCurrent(started[1].epoch), true)
+})
+
+
 test('历史临时明细在扩展列配置变化后需要重新读取', () => {
   const transient = {
     as_of: '2026-09-03',
@@ -142,7 +177,6 @@ test('重置策略配置会通知页面清理历史批量明细', () => {
 
 
 test('切换资产类型会废弃旧请求和历史批量结果', () => {
-  assert.match(pageSource, /const screenerRunEpochRef = useRef\(0\)/)
-  assert.match(pageSource, /if \(vars\.epoch !== screenerRunEpochRef\.current\) return/)
-  assert.match(pageSource, /screenerRunEpochRef\.current \+= 1[\s\S]*?setTransientBatchResults\(null\)[\s\S]*?setAssetType\(nextAssetType\)/)
+  assert.match(pageSource, /createScreenerRequestCoordinator/)
+  assert.match(pageSource, /invalidateScreenerRequests\(\)[\s\S]*?setTransientBatchResults\(null\)[\s\S]*?setAssetType\(nextAssetType\)/)
 })
