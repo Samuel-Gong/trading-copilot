@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import screener as api
+from app.api import strategy as strategy_api
 from app.services import strategy_cache
 from app.services.screener_export import ExportError, build_export, export_csv
 
@@ -82,6 +83,7 @@ def test_export_rejects_incomplete_or_wrong_context(cached, ids, as_of, status):
 def client(tmp_path, monkeypatch):
     app = FastAPI()
     app.include_router(api.router)
+    app.include_router(strategy_api.router)
     app.state.repo = SimpleNamespace(
         store=SimpleNamespace(data_dir=tmp_path),
         enriched_latest_date=lambda: date.fromisoformat(DAY),
@@ -91,7 +93,10 @@ def client(tmp_path, monkeypatch):
         {"id": sid, "name": name, "asset_types": ["stock"], "timeframes": ["1d"]}
         for sid, name in NAMES.items()
     ])
-    app.state.monitor_engine = SimpleNamespace(latest_strategy_results=lambda **_: {})
+    app.state.monitor_engine = SimpleNamespace(
+        latest_strategy_results=lambda **_: {},
+        invalidate_strategy_state=lambda: None,
+    )
     monkeypatch.setattr(api.strategy_config, "list_overrides", lambda _: {})
     return TestClient(app)
 
@@ -417,6 +422,138 @@ def test_historical_run_without_latest_date_never_creates_export_snapshot(client
     assert rows[0]["symbol"] == "000003.SZ"
     assert strategy_cache.read_cache(client.app.state.repo.store.data_dir) is None
     assert client.get("/api/screener/export").status_code == 404
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_timeseries_ext_columns_use_requested_date(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+    from app.services.screener import ScreenerResult
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="forecast", mode="timeseries")],
+        ),
+    )
+    requested_dates: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        requested_dates.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["000003.SZ"], "signal": [snapshot_date]}), snapshot_date
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03", "ext_columns": "forecast.signal",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03", "ext_columns": "forecast.signal",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
+
+    assert response.status_code == 200
+    assert requested_dates == ["2026-09-03"]
+    assert rows[0]["forecast__signal"] == "2026-09-03"
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_reload_cannot_publish_an_inflight_old_strategy_result(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    engine.reload = lambda: None
+    old_started = threading.Event()
+    release_old = threading.Event()
+    old_result = ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy="alpha", rows=[{"symbol": "000001.SZ"}], total=1,
+    )
+    new_result = ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy="alpha", rows=[{"symbol": "000002.SZ"}], total=1,
+    )
+
+    def old_run(*_args, **_kwargs):
+        old_started.set()
+        assert release_old.wait(timeout=2)
+        return old_result if run_kind == "single" else {"alpha": old_result}
+
+    if run_kind == "single":
+        engine.run = old_run
+    else:
+        engine.run_all = old_run
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000001.SZ"]}),
+        ),
+    )
+    old_response: dict[str, object] = {}
+
+    def run_old_request():
+        if run_kind == "single":
+            old_response["value"] = client.post("/api/screener/run_preset", json={
+                "strategy_id": "alpha", "as_of": DAY,
+            })
+        else:
+            old_response["value"] = client.post("/api/screener/run_all", json={
+                "strategy_ids": ["alpha"], "as_of": DAY,
+            })
+
+    old_thread = threading.Thread(target=run_old_request)
+    old_thread.start()
+    assert old_started.wait(timeout=2)
+    assert client.post("/api/strategies/reload").status_code == 200
+    if run_kind == "single":
+        engine.run = lambda *_args, **_kwargs: new_result
+        new_response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": DAY,
+        })
+    else:
+        engine.run_all = lambda *_args, **_kwargs: {"alpha": new_result}
+        new_response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": DAY,
+        })
+    assert new_response.status_code == 200
+    release_old.set()
+    old_thread.join(timeout=2)
+
+    assert not old_thread.is_alive()
+    assert old_response["value"].status_code == 200
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached["results"]["alpha"]["rows"] == [{"symbol": "000002.SZ"}]
+    assert client.get("/api/screener/export").json()["symbols"] == ["000002.SZ"]
 
 
 @pytest.mark.parametrize("run_kind", ["single", "batch"])
