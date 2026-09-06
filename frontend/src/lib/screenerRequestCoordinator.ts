@@ -30,6 +30,27 @@ export function mergeScreenerRunAllStrategyIds(
   return [...new Set([...current, ...next])]
 }
 
+export function shouldPreserveScreenerConfigReruns(
+  current: Pick<ScreenerRequestContext, 'asOf' | 'assetType'>,
+  next: Partial<Omit<ScreenerRequestContext, 'version'>> = {},
+  explicit: boolean | undefined = undefined,
+) {
+  if (explicit !== undefined) return explicit
+  return (next.asOf ?? current.asOf) === current.asOf
+    && (next.assetType ?? current.assetType) === current.assetType
+}
+
+export function isCurrentScreenerRequest(
+  request: CoordinatedRequest & { context: ScreenerRequestContext },
+  currentContext: ScreenerRequestContext,
+  currentEpoch: number,
+) {
+  return request.epoch === currentEpoch
+    && request.context.asOf === currentContext.asOf
+    && request.context.assetType === currentContext.assetType
+    && request.context.version === currentContext.version
+}
+
 export function createScreenerRequestContext(
   initial: Omit<ScreenerRequestContext, 'version'>,
 ) {

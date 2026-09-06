@@ -4,7 +4,7 @@ import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { mergeTransientBatchResults, removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
-import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, mergeScreenerRunAllStrategyIds, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
+import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, isCurrentScreenerRequest, mergeScreenerRunAllStrategyIds, shouldPreserveScreenerConfigReruns, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -121,17 +121,26 @@ export function Screener() {
   const requestCoordinator = requestCoordinatorRef.current
   const requestContextRef = useRef(createScreenerRequestContext({ asOf: '', assetType: 'stock' }))
   const requestContext = requestContextRef.current
+  const requestRunAllRef = useRef<(vars?: RunAllRequestVariables) => void>(() => {})
   const qc = useQueryClient()
 
   const invalidateScreenerRequests = useCallback((
     next: Partial<Omit<ScreenerRequestContext, 'version'>> = {},
-    preserveConfigReruns = false,
+    preserveConfigReruns?: boolean,
   ) => {
-    if (!preserveConfigReruns) configRerunStrategyIdsRef.current = []
+    const preserveReruns = shouldPreserveScreenerConfigReruns(
+      requestContext.current(),
+      next,
+      preserveConfigReruns,
+    )
+    if (!preserveReruns) configRerunStrategyIdsRef.current = []
     const context = requestContext.invalidate(next)
     const epoch = requestCoordinator.invalidate()
     runAllDateRef.current = null
     transientColumnRefreshRef.current = null
+    if (preserveReruns && configRerunStrategyIdsRef.current.length > 0) {
+      requestRunAllRef.current({ strategyIds: configRerunStrategyIdsRef.current })
+    }
     return { context, epoch }
   }, [requestContext, requestCoordinator])
 
@@ -267,7 +276,7 @@ export function Screener() {
     strategyPoolContextKeyRef.current = nextPool
       .filter(id => availableStrategyIds.has(id))
       .join('\u0000')
-    invalidateScreenerRequests()
+    invalidateScreenerRequests({}, false)
     setTransientBatchResults(null)
     setResult(null)
     setHitCounts({})
@@ -298,7 +307,7 @@ export function Screener() {
     }
     if (strategyPoolContextKeyRef.current === visiblePoolContextKey) return
     strategyPoolContextKeyRef.current = visiblePoolContextKey
-    invalidateScreenerRequests()
+    invalidateScreenerRequests({}, false)
     setTransientBatchResults(null)
     setResult(null)
     setHitCounts({})
@@ -348,7 +357,11 @@ export function Screener() {
       )
     },
     onSuccess: (data, vars) => {
-      if (!requestCoordinator.isCurrent(vars.epoch) || !requestContext.matches(vars.context)) return
+      if (!isCurrentScreenerRequest(
+        vars,
+        requestContext.current(),
+        requestCoordinator.currentEpoch(),
+      )) return
       if (data.as_of !== vars.context.asOf) return
       const counts: Record<string, number> = {}
       const rows: ScreenerBatchResultSource['results'] = {}
@@ -412,6 +425,7 @@ export function Screener() {
       },
     }, startRunAll)
   }, [extColumnsParam, requestContext, requestCoordinator, startRunAll])
+  requestRunAllRef.current = requestRunAll
 
   // 历史结果只驻留在页面内存。用户变更扩展列后重新读取该日期的明细，
   // 避免“全部”视图继续展示旧列；历史请求仍不会写入共享导出快照。
@@ -649,8 +663,11 @@ export function Screener() {
       api.screenerRunPreset(id, undefined, date || undefined, extColumnsParam || undefined, requestedAssetType),
     onSuccess: (data, vars) => {
       if (
-        !requestCoordinator.isCurrent(vars.epoch)
-        || !requestContext.matches(vars.context)
+        !isCurrentScreenerRequest(
+          vars,
+          requestContext.current(),
+          requestCoordinator.currentEpoch(),
+        )
       ) return
       // 即使保存的是非当前策略, 也必须刷新摘要, 避免依赖叠加策略继续显示旧缓存。
       qc.invalidateQueries({ queryKey: ['screener-cached'] })
@@ -749,7 +766,7 @@ export function Screener() {
   const reloadStrategies = useMutation({
     mutationFn: api.strategyReload,
     onMutate: () => {
-      invalidateScreenerRequests()
+      invalidateScreenerRequests({}, false)
       setTransientBatchResults(null)
       setResult(null)
     },

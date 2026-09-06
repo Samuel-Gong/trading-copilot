@@ -49,7 +49,9 @@ const {
   bindScreenerRequestContext,
   createScreenerRequestContext,
   createScreenerRequestCoordinator,
+  isCurrentScreenerRequest,
   mergeScreenerRunAllStrategyIds,
+  shouldPreserveScreenerConfigReruns,
 } = await import(requestCoordinatorUrl)
 
 
@@ -213,6 +215,55 @@ test('连续保存时排队批跑会累积所有失效策略', () => {
     context: { asOf: '2026-09-03', assetType: 'stock', version: 2 },
     epoch: 2,
   })
+})
+
+
+test('同一上下文的视图切换会重绑配置重跑并刷新摘要', () => {
+  const coordinator = createScreenerRequestCoordinator()
+  const context = createScreenerRequestContext({ asOf: '2026-09-03', assetType: 'stock' })
+  const started = []
+  const start = request => started.push(request)
+  const configRerunStrategyIds = ['alpha']
+
+  coordinator.request({ vars: { strategyIds: ['old'], context: context.current() } }, start)
+
+  context.invalidate()
+  coordinator.invalidate()
+  coordinator.request({ vars: { strategyIds: configRerunStrategyIds, context: context.current() } }, start)
+
+  assert.equal(shouldPreserveScreenerConfigReruns(context.current()), true)
+  context.invalidate()
+  coordinator.invalidate()
+  coordinator.request({ vars: { strategyIds: configRerunStrategyIds, context: context.current() } }, start)
+
+  coordinator.settle(start)
+  assert.deepEqual(started[1], {
+    vars: {
+      strategyIds: ['alpha'],
+      context: { asOf: '2026-09-03', assetType: 'stock', version: 2 },
+    },
+    epoch: 2,
+  })
+
+  const summaryInvalidations = []
+  if (isCurrentScreenerRequest(
+    { ...started[1].vars, epoch: started[1].epoch },
+    context.current(),
+    coordinator.currentEpoch(),
+  )) {
+    summaryInvalidations.push('screener-cached')
+  }
+  assert.deepEqual(summaryInvalidations, ['screener-cached'])
+})
+
+
+test('日期、资产或策略池变化会清空配置重跑队列', () => {
+  const context = { asOf: '2026-09-03', assetType: 'stock' }
+
+  assert.equal(shouldPreserveScreenerConfigReruns(context), true)
+  assert.equal(shouldPreserveScreenerConfigReruns(context, { asOf: '2026-09-04' }), false)
+  assert.equal(shouldPreserveScreenerConfigReruns(context, { assetType: 'etf' }), false)
+  assert.equal(shouldPreserveScreenerConfigReruns(context, {}, false), false)
 })
 
 
