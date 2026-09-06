@@ -68,7 +68,10 @@ class _CapturingStrategyEngine:
 
 
 def _api_request(tmp_path, engine):
-    repo = types.SimpleNamespace(store=types.SimpleNamespace(data_dir=tmp_path))
+    repo = types.SimpleNamespace(
+        store=types.SimpleNamespace(data_dir=tmp_path),
+        enriched_latest_date=lambda: date(2026, 7, 15),
+    )
     state = types.SimpleNamespace(repo=repo, strategy_engine=engine)
     return types.SimpleNamespace(app=types.SimpleNamespace(state=state))
 

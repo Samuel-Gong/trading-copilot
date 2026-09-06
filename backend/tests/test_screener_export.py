@@ -544,6 +544,30 @@ def test_historical_snapshot_ext_columns_are_omitted(client, monkeypatch, run_ki
     assert "snapshot__signal" not in rows[0]
 
 
+def test_historical_unknown_ext_column_skips_stale_view(client, monkeypatch):
+    queried_views: list[str] = []
+    client.app.state.repo.store.db = SimpleNamespace(
+        query=lambda sql: queried_views.append(sql),
+    )
+
+    from app.services import ext_data as ext_data_service
+
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(load_all=lambda: []),
+    )
+
+    value_maps = api._load_ext_value_maps(
+        client.app.state.repo,
+        "deleted_config.signal",
+        "2026-09-03",
+    )
+
+    assert value_maps == {}
+    assert queried_views == []
+
+
 @pytest.mark.parametrize("operation", ["save", "reset"])
 def test_strategy_config_change_invalidates_export_snapshot(client, operation):
     data_dir = client.app.state.repo.store.data_dir
@@ -716,12 +740,12 @@ def test_latest_date_check_is_serialized_with_cache_write(client, monkeypatch, r
     old_latest_read = threading.Event()
     release_old = threading.Event()
 
-    def blocked_latest_date(_self):
+    def blocked_latest_date():
         old_latest_read.set()
         assert release_old.wait(timeout=2)
         return date(2026, 9, 4)
 
-    monkeypatch.setattr(api.ScreenerService, "latest_date", blocked_latest_date)
+    monkeypatch.setattr(client.app.state.repo, "enriched_latest_date", blocked_latest_date)
     response: dict[str, object] = {}
 
     def run_old_request():

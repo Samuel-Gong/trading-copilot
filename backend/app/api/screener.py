@@ -118,7 +118,6 @@ def _load_ext_value_maps(
     repo,
     ext_columns: str | None,
     as_of: date | str | None = None,
-    allow_snapshot_columns: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """按请求加载扩展列，返回 {输出列名: {symbol: value}}。
 
@@ -131,6 +130,7 @@ def _load_ext_value_maps(
     ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []
     if not ext_specs:
         return {}
+    allow_snapshot_columns = _as_of_is_latest(repo, as_of)
 
     import polars as pl
 
@@ -146,6 +146,8 @@ def _load_ext_value_maps(
     for config_id, field_name in ext_specs:
         out_col = f"{config_id}__{field_name}"
         cfg = configs.get(config_id)
+        if cfg is None and not allow_snapshot_columns:
+            continue
         if cfg is not None and cfg.mode == "snapshot" and not allow_snapshot_columns:
             continue
         snapshot_date = (
@@ -316,9 +318,7 @@ def run_custom(req: CustomRequest, request: Request):
         pool=req.pool,
     )
     safe_data = _safe(asdict(result))
-    ext_values = _load_ext_value_maps(
-        repo, req.ext_columns, as_of, _as_of_is_latest(repo, as_of),
-    )
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of)
     return _result_with_ext(safe_data, ext_values)
 
 
@@ -337,9 +337,7 @@ def run_preset(req: PresetRequest, request: Request):
         if req.asset_type == "stock" and req.timeframe == "1d"
         else None
     )
-    ext_values = _load_ext_value_maps(
-        repo, req.ext_columns, as_of, _as_of_is_latest(repo, as_of),
-    )
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of)
     overrides = strategy_config.load_override(data_dir, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
     if not engine:
@@ -376,7 +374,7 @@ def run_preset(req: PresetRequest, request: Request):
             str(as_of),
             req.strategy_id,
             safe_data,
-            svc.latest_date,
+            repo.enriched_latest_date,
             cache_generation,
         )
 
@@ -459,12 +457,7 @@ def get_cached(
 
     repo = request.app.state.repo
     cached_as_of = cached.get("as_of")
-    ext_values = _load_ext_value_maps(
-        repo,
-        ext_columns,
-        cached_as_of,
-        _as_of_is_latest(repo, cached_as_of),
-    )
+    ext_values = _load_ext_value_maps(repo, ext_columns, cached_as_of)
     return _cache_payload_with_ext(cached, ext_values)
 
 
@@ -521,12 +514,7 @@ def get_cached_result(
 
     repo = request.app.state.repo
     result_as_of = raw_result.get("as_of")
-    ext_values = _load_ext_value_maps(
-        repo,
-        ext_columns,
-        result_as_of,
-        _as_of_is_latest(repo, result_as_of),
-    )
+    ext_values = _load_ext_value_maps(repo, ext_columns, result_as_of)
     result = {
         "as_of": raw_result.get("as_of"),
         "strategy": strategy_id,
@@ -702,7 +690,7 @@ def run_all(request: Request, body: Optional[dict] = None):
                 str(as_of),
                 results,
                 preserve_newer=True,
-                latest_available_as_of=svc.latest_date,
+                latest_available_as_of=repo.enriched_latest_date,
                 only_latest_available=True,
                 expected_generation=cache_generation,
             )
@@ -718,9 +706,7 @@ def run_all(request: Request, body: Optional[dict] = None):
             },
         }
 
-    ext_values = _load_ext_value_maps(
-        repo, body.get("ext_columns"), as_of, _as_of_is_latest(repo, as_of),
-    )
+    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"), as_of)
     return {"as_of": str(as_of), "results": _results_with_ext(results, ext_values)}
 
 
