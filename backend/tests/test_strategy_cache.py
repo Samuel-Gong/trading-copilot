@@ -117,6 +117,27 @@ def test_guarded_write_replaces_future_cache_beyond_latest_available_data(tmp_pa
     assert cached["results"]["a"]["rows"][0]["symbol"] == "000002.SZ"
 
 
+@pytest.mark.parametrize(
+    "latest_available",
+    ["not-a-date", lambda: (_ for _ in ()).throw(ValueError("latest date unavailable"))],
+)
+def test_only_latest_write_rejects_unconfirmed_latest_date(tmp_path, latest_available):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+
+    strategy_cache.write_cache(
+        tmp_path,
+        "2026-07-19",
+        {"a": _result("000002.SZ", as_of="2026-07-19")},
+        latest_available_as_of=latest_available,
+        only_latest_available=True,
+    )
+
+    cached = strategy_cache.read_cache(tmp_path)
+    assert cached is not None
+    assert cached["as_of"] == "2026-07-20"
+    assert cached["results"]["a"]["rows"][0]["symbol"] == "000001.SZ"
+
+
 def test_cache_write_failure_removes_previous_export_snapshot(tmp_path, monkeypatch):
     strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
     monkeypatch.setattr(
@@ -168,6 +189,65 @@ def test_cache_tombstone_hides_previous_snapshot_after_module_reload(tmp_path, m
 
     restarted_cache = importlib.reload(strategy_cache)
     assert restarted_cache.read_cache(tmp_path) is None
+
+
+def test_persisted_generation_rejects_old_process_write_after_cache_clear(tmp_path):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    old_generation = strategy_cache.cache_generation(tmp_path, ["a"])
+
+    strategy_cache.clear_strategy_results(tmp_path, {"a"})
+    restarted_cache = importlib.reload(strategy_cache)
+    restarted_cache.write_cache(
+        tmp_path,
+        "2026-07-20",
+        {"a": _result("000002.SZ")},
+        expected_generation=old_generation,
+    )
+
+    assert restarted_cache.read_cache(tmp_path) is None
+
+
+def test_fresh_generation_write_clears_tombstone_after_cache_clear(tmp_path):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    strategy_cache.clear_cache(tmp_path)
+    generation = strategy_cache.cache_generation(tmp_path, ["a"])
+
+    strategy_cache.write_cache(
+        tmp_path,
+        "2026-07-20",
+        {"a": _result("000002.SZ")},
+        expected_generation=generation,
+    )
+
+    cached = strategy_cache.read_cache(tmp_path)
+    assert cached is not None
+    assert cached["results"]["a"]["rows"][0]["symbol"] == "000002.SZ"
+    assert not strategy_cache._invalid_cache_path(strategy_cache._cache_path(tmp_path)).exists()
+
+
+def test_cache_write_fails_when_tombstone_cannot_be_removed(tmp_path, monkeypatch):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    strategy_cache.clear_cache(tmp_path)
+    generation = strategy_cache.cache_generation(tmp_path, ["a"])
+    marker = strategy_cache._invalid_cache_path(strategy_cache._cache_path(tmp_path))
+    original_unlink = strategy_cache.Path.unlink
+
+    def fail_marker_unlink(path, *args, **kwargs):
+        if path == marker:
+            raise PermissionError("marker unlink denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(strategy_cache.Path, "unlink", fail_marker_unlink)
+
+    with pytest.raises(PermissionError, match="marker unlink denied"):
+        strategy_cache.write_cache(
+            tmp_path,
+            "2026-07-20",
+            {"a": _result("000002.SZ")},
+            expected_generation=generation,
+        )
+
+    assert strategy_cache.read_cache(tmp_path) is None
 
 
 def test_selective_clear_hides_previous_snapshot_when_cleanup_fails(tmp_path, monkeypatch):

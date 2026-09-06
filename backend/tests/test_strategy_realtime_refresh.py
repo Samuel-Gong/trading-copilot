@@ -124,7 +124,7 @@ def test_failed_or_skipped_strategy_does_not_mark_result_refresh():
     assert skipped.consume_strategy_result_updates() is False
 
 
-def test_strategy_invalidation_waits_for_inflight_evaluation_before_clearing_results():
+def test_strategy_invalidation_discards_inflight_evaluation_without_blocking_reads():
     started = threading.Event()
     release = threading.Event()
     invalidated = threading.Event()
@@ -139,7 +139,7 @@ def test_strategy_invalidation_waits_for_inflight_evaluation_before_clearing_res
         target=lambda: (monitor.invalidate_strategy_state(), invalidated.set()),
     )
     invalidation.start()
-    assert not invalidated.wait(timeout=0.05)
+    assert invalidated.wait(timeout=0.5)
 
     release.set()
     evaluation.join(timeout=2)

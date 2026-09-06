@@ -636,8 +636,10 @@ export function Screener() {
       if (
         !requestCoordinator.isCurrent(vars.epoch)
         || !requestContext.matches(vars.context)
-        || vars.id !== activeStrategyRef.current
       ) return
+      // 即使保存的是非当前策略, 也必须刷新摘要, 避免依赖叠加策略继续显示旧缓存。
+      qc.invalidateQueries({ queryKey: ['screener-cached'] })
+      if (vars.id !== activeStrategyRef.current) return
       setResult(data)
       setTransientBatchResults(current => updateTransientBatchResult(current, vars.id, {
         as_of: data.as_of,
@@ -646,8 +648,6 @@ export function Screener() {
       }))
       // 同步更新卡片上的命中数
       setHitCounts(prev => ({ ...prev, [vars.id]: data.total }))
-      // 单策略重跑后刷新摘要和当前按需明细，避免参数保存后回退到旧缓存。
-      qc.invalidateQueries({ queryKey: ['screener-cached'] })
     },
   })
 
@@ -1233,8 +1233,10 @@ export function Screener() {
           if (settingsStrategyId) {
             invalidateScreenerRequests()
             const context = requestContext.current()
+            qc.invalidateQueries({ queryKey: ['screener-cached'] })
             setStrategyLimits(prev => ({ ...prev, [settingsStrategyId]: limit }))
             const affected = invalidatedStrategyIds.length ? invalidatedStrategyIds : [settingsStrategyId]
+            const affectedPool = affected.filter(id => visiblePool.includes(id))
             if (result?.strategy && affected.includes(result.strategy)) setResult(null)
             const transient = transientBatchResults
             if (
@@ -1243,12 +1245,16 @@ export function Screener() {
               && affected.some(id => id in transient.results)
             ) {
               setTransientBatchResults(removeTransientBatchResults(transient, affected))
-              requestRunAll({ strategyIds: Object.keys(transient.results) })
+              if (affectedPool.length > 0) requestRunAll({ strategyIds: affectedPool })
+              return
+            }
+            if (context.assetType === 'stock') {
+              if (affectedPool.length > 0) requestRunAll({ strategyIds: affectedPool })
               return
             }
             run.mutate({
               id: settingsStrategyId,
-              date: context.assetType === 'stock' ? context.asOf : '',
+              date: '',
               assetType: context.assetType,
               context,
               epoch: requestCoordinator.currentEpoch(),

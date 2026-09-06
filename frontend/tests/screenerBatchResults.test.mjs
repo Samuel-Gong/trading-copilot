@@ -210,6 +210,13 @@ test('重置策略配置会通知页面清理历史批量明细', () => {
 })
 
 
+test('保存非当前策略也会刷新摘要并重跑受影响的策略池成员', () => {
+  assert.match(pageSource, /qc\.invalidateQueries\(\{ queryKey: \['screener-cached'\] \}\)[\s\S]*?vars\.id !== activeStrategyRef\.current/)
+  assert.match(pageSource, /const affectedPool = affected\.filter\(id => visiblePool\.includes\(id\)\)/)
+  assert.match(pageSource, /requestRunAll\(\{ strategyIds: affectedPool \}\)/)
+})
+
+
 test('切换资产类型会废弃旧请求和历史批量结果', () => {
   assert.match(pageSource, /createScreenerRequestCoordinator/)
   assert.match(pageSource, /invalidateScreenerRequests\(\)[\s\S]*?setTransientBatchResults\(null\)[\s\S]*?setAssetType\(nextAssetType\)/)
