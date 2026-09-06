@@ -4,6 +4,8 @@
 
 完整策略开发规范(AI 生成与手写)见 [`backend/app/strategy/prompts/strategy-guide.md`](../backend/app/strategy/prompts/strategy-guide.md)。
 
+将每日选股结果导入其他软件，见 [选股结果导出与 API 接入](./screener-export.md)。
+
 ---
 
 ## 内置策略
