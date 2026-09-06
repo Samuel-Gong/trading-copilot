@@ -414,6 +414,7 @@ def save_config(req: SaveConfigRequest, request: Request):
     overrides = _strip_defaults(req.strategy_id, req.overrides, engine)
 
     strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
+    _invalidate_strategy_runtime(request)
     return {"ok": True}
 
 
@@ -448,6 +449,7 @@ def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
 @router.delete("/config/{strategy_id}")
 def reset_config(strategy_id: str, request: Request):
     strategy_config.delete_override(_data_dir(request), strategy_id)
+    _invalidate_strategy_runtime(request)
     return {"ok": True}
 
 

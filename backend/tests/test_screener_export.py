@@ -485,6 +485,89 @@ def test_historical_timeseries_ext_columns_use_requested_date(client, monkeypatc
 
 
 @pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_snapshot_ext_columns_are_omitted(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+    from app.services.screener import ScreenerResult
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="snapshot", mode="snapshot")],
+        ),
+    )
+    read_requests: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        read_requests.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["000003.SZ"], "signal": ["future-value"]}), None
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03", "ext_columns": "snapshot.signal",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03", "ext_columns": "snapshot.signal",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
+
+    assert response.status_code == 200
+    assert read_requests == []
+    assert "snapshot__signal" not in rows[0]
+
+
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_change_invalidates_export_snapshot(client, operation):
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {"alpha": result()})
+    invalidations: list[None] = []
+    client.app.state.monitor_engine.invalidate_strategy_state = lambda: invalidations.append(None)
+
+    if operation == "save":
+        engine = client.app.state.strategy_engine
+        engine.has = lambda _: True
+        engine.get = lambda _: SimpleNamespace(basic_filter={})
+        response = client.post("/api/strategies/config", json={
+            "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+        })
+    else:
+        response = client.delete("/api/strategies/config/alpha")
+
+    assert response.status_code == 200
+    assert strategy_cache.read_cache(data_dir) is None
+    assert invalidations == [None]
+    assert client.get("/api/screener/export").status_code == 404
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
 def test_reload_cannot_publish_an_inflight_old_strategy_result(client, monkeypatch, run_kind):
     import polars as pl
 

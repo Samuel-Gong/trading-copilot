@@ -103,10 +103,22 @@ def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
         return None
 
 
+def _as_of_is_latest(repo, as_of: date | str | None) -> bool:
+    """仅在业务日期与当前最新交易日相同后允许拼接快照扩展列。"""
+    if as_of is None:
+        return False
+    try:
+        latest = repo.enriched_latest_date()
+    except Exception:
+        return False
+    return latest is not None and str(as_of) == str(latest)
+
+
 def _load_ext_value_maps(
     repo,
     ext_columns: str | None,
     as_of: date | str | None = None,
+    allow_snapshot_columns: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """按请求加载扩展列，返回 {输出列名: {symbol: value}}。
 
@@ -114,7 +126,7 @@ def _load_ext_value_maps(
     返回前通过该投影映射追加到结果副本中。
 
     基于 config 的路径按 parquet 文件 mtime 签名 memoize, 文件未变时跳过磁盘重读。
-    时序扩展列以 as_of 读取对应分区, 避免历史选股结果混入未来数据。
+    时序扩展列以 as_of 读取对应分区, 历史请求不拼接当前快照扩展列。
     """
     ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []
     if not ext_specs:
@@ -134,6 +146,8 @@ def _load_ext_value_maps(
     for config_id, field_name in ext_specs:
         out_col = f"{config_id}__{field_name}"
         cfg = configs.get(config_id)
+        if cfg is not None and cfg.mode == "snapshot" and not allow_snapshot_columns:
+            continue
         snapshot_date = (
             str(as_of)
             if cfg is not None and cfg.mode == "timeseries" and as_of is not None
@@ -302,7 +316,9 @@ def run_custom(req: CustomRequest, request: Request):
         pool=req.pool,
     )
     safe_data = _safe(asdict(result))
-    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of)
+    ext_values = _load_ext_value_maps(
+        repo, req.ext_columns, as_of, _as_of_is_latest(repo, as_of),
+    )
     return _result_with_ext(safe_data, ext_values)
 
 
@@ -321,7 +337,9 @@ def run_preset(req: PresetRequest, request: Request):
         if req.asset_type == "stock" and req.timeframe == "1d"
         else None
     )
-    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of)
+    ext_values = _load_ext_value_maps(
+        repo, req.ext_columns, as_of, _as_of_is_latest(repo, as_of),
+    )
     overrides = strategy_config.load_override(data_dir, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
     if not engine:
@@ -439,7 +457,14 @@ def get_cached(
     if not cached.get("results") and cached.get("as_of") is None:
         return {"as_of": None, "results": {}, "updated_at": None}
 
-    ext_values = _load_ext_value_maps(request.app.state.repo, ext_columns, cached.get("as_of"))
+    repo = request.app.state.repo
+    cached_as_of = cached.get("as_of")
+    ext_values = _load_ext_value_maps(
+        repo,
+        ext_columns,
+        cached_as_of,
+        _as_of_is_latest(repo, cached_as_of),
+    )
     return _cache_payload_with_ext(cached, ext_values)
 
 
@@ -494,7 +519,14 @@ def get_cached_result(
             "updated_at": cached.get("updated_at"),
         }
 
-    ext_values = _load_ext_value_maps(request.app.state.repo, ext_columns, raw_result.get("as_of"))
+    repo = request.app.state.repo
+    result_as_of = raw_result.get("as_of")
+    ext_values = _load_ext_value_maps(
+        repo,
+        ext_columns,
+        result_as_of,
+        _as_of_is_latest(repo, result_as_of),
+    )
     result = {
         "as_of": raw_result.get("as_of"),
         "strategy": strategy_id,
@@ -661,7 +693,7 @@ def run_all(request: Request, body: Optional[dict] = None):
     elapsed = (time.perf_counter() - t_total) * 1000
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
-    # 写入策略缓存 (供页面秒加载)。最新日期判断在缓存写锁内完成，避免较早
+    # 写入策略缓存 (供页面秒加载)。最新日期判断在缓存写锁内完成, 避免较早
     # 任务在较新任务完成后回退共享快照。
     if results and asset_type == "stock" and timeframe == "1d":
         try:
@@ -686,7 +718,9 @@ def run_all(request: Request, body: Optional[dict] = None):
             },
         }
 
-    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"), as_of)
+    ext_values = _load_ext_value_maps(
+        repo, body.get("ext_columns"), as_of, _as_of_is_latest(repo, as_of),
+    )
     return {"as_of": str(as_of), "results": _results_with_ext(results, ext_values)}
 
 
