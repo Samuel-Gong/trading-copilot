@@ -80,12 +80,18 @@ def test_get_minute_datetime_is_beijing_wall_clock(monkeypatch):
     assert df["symbol"][0] == "600519.SH"
 
 
-def test_get_realtime_passthrough(monkeypatch):
+def test_get_realtime_normalizes_units_without_mutating_bridge_rows(monkeypatch):
     rows = [{"symbol": "600519.SH", "name": "贵州茅台", "last_price": 1200.0,
-             "prev_close": 1194.0, "open": 1186.0, "high": 1203.0, "low": 1180.0, "volume": 16325}]
+             "prev_close": 1194.0, "open": 1186.0, "high": 1203.0, "low": 1180.0,
+             "volume": 16325, "amount": 159095, "change_pct": -1.15,
+             "timestamp": 1787193740000}]
     _patch_run_job(monkeypatch, {"realtime": {"ok": True, "op": "realtime", "rows": rows}})
     out = StockSDKProvider().get_realtime()
-    assert out == rows
+    assert abs(out[0]["change_pct"] - (-0.0115)) < 1e-12
+    assert out[0]["amount"] == 1_590_950_000
+    assert out[0]["timestamp"] == 1787193740000
+    assert rows[0]["change_pct"] == -1.15
+    assert rows[0]["amount"] == 159095
     required = {"symbol", "last_price", "prev_close", "open", "high", "low", "volume"}
     assert required <= set(out[0].keys())
 
@@ -141,7 +147,7 @@ def test_bridge_uses_utf8_error_tolerant_subprocess(monkeypatch):
     assert kwargs["errors"] == "replace"
 
 
-def test_bridge_mjs_resolves_local_stock_sdk_on_windows_path(tmp_path):
+def test_bridge_mjs_resolves_local_sdk_and_maps_realtime_timestamp(tmp_path):
     if shutil.which("node") is None:
         raise AssertionError("node is required for stock-sdk bridge path regression test")
 
@@ -155,7 +161,18 @@ def test_bridge_mjs_resolves_local_stock_sdk_on_windows_path(tmp_path):
         encoding="utf-8",
     )
     (pkg_dir / "index.js").write_text(
-        "export class StockSDK { static version = 'fake-local' }\n",
+        """export class StockSDK {
+  static version = 'fake-local'
+  constructor() {
+    this.batch = { cn: async () => [{
+      code: '600519', marketId: '1', name: '贵州茅台', price: 1200,
+      prevClose: 1194, open: 1186, high: 1203, low: 1180,
+      volume: 16325, amount: 159095, changePercent: 0.5,
+      timestamp: 1787193740000
+    }] }
+  }
+}
+""",
         encoding="utf-8",
     )
 
@@ -171,6 +188,17 @@ def test_bridge_mjs_resolves_local_stock_sdk_on_windows_path(tmp_path):
     assert proc.returncode == 0
     result = json.loads(proc.stdout)
     assert result == {"ok": True, "op": "ping", "version": "fake-local"}
+    realtime_proc = subprocess.run(
+        ["node", str(bridge_path)],
+        input=json.dumps({"op": "realtime"}),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=20,
+    )
+    assert realtime_proc.returncode == 0
+    row = json.loads(realtime_proc.stdout)["rows"][0]
+    assert row["timestamp"] == 1787193740000
 
 
 def test_plugin_discovered_in_loader():
@@ -226,3 +254,82 @@ def test_builtin_not_editable():
             raise AssertionError("expected ValueError for builtin")
         except ValueError:
             pass
+
+
+# ---------- 分钟 open 数据卫生 (stock-sdk 上游区间模式给日级常量伪 open) ----------
+
+def _sdk_rows(day: str, opens, closes):
+    """构造 bridge 返回形状的分钟行 (timestamp 为北京墙钟对应 UTC 毫秒)。"""
+    from datetime import UTC, datetime, timedelta
+    rows = []
+    for i, (o, c) in enumerate(zip(opens, closes, strict=True)):
+        dt = datetime.fromisoformat(f"{day} 09:30:00") + timedelta(minutes=i)
+        ts = int(dt.replace(tzinfo=UTC).timestamp() * 1000) - 8 * 3600_000
+        rows.append({"timestamp": ts, "open": o, "high": max(o, c), "low": min(o, c),
+                     "close": c, "volume": 100 + i, "amount": 1000.0 + i})
+    return rows
+
+
+def test_minute_degenerate_open_nulled():
+    """历史日 open 为全天常量(uniq=1)而 close 多值 → open 置 null。"""
+    n = 30
+    rows = _sdk_rows("2026-08-27", [8.0] * n, [10 + i * 0.01 for i in range(n)])
+    df = StockSDKProvider._minute_df(rows, "600664.SH")
+    assert df.height == n
+    assert df["open"].null_count() == n          # 伪 open 全部置 null
+    assert df["close"].null_count() == 0         # close/high/low 保留
+
+
+def test_minute_real_open_kept():
+    """真实分钟 open (多唯一值) 原样保留。"""
+    n = 30
+    rows = _sdk_rows("2026-08-28", [10 + i * 0.01 for i in range(n)], [10.05 + i * 0.01 for i in range(n)])
+    df = StockSDKProvider._minute_df(rows, "600664.SH")
+    assert df["open"].null_count() == 0
+    assert df["open"].n_unique() == n
+
+
+def test_minute_short_day_open_kept():
+    """短交易日 (rows<=10, 如半日/首日少量bar) 不误杀。"""
+    rows = _sdk_rows("2026-08-26", [8.0] * 6, [8.0 + i * 0.1 for i in range(6)])
+    df = StockSDKProvider._minute_df(rows, "600664.SH")
+    assert df["open"].null_count() == 0
+
+
+def test_get_minute_splits_tail_into_single_day_jobs(monkeypatch):
+    """多日区间 → 末尾 3 自然日(跳过周末)逐日单拉 (保住最新交易日真实 open)。"""
+    from datetime import datetime
+
+    jobs = []
+
+    def fake_run_job(job, timeout=None):
+        jobs.append(job)
+        return {"ok": True, "op": "minute", "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake_run_job)
+    p = StockSDKProvider()
+    p.get_minute(["600519.SH"], datetime(2026, 8, 20), datetime(2026, 8, 29, 23, 0))
+
+    # 末尾 4 个自然日 (08-26..08-29) 逐日单拉, 周六 08-29 跳过;
+    # 前段 = [08-20, 08-25] 一个区间任务
+    spans = [(j["start"], j["end"]) for j in jobs]
+    for day in ("20260826", "20260827", "20260828"):
+        assert (day, day) in spans
+    assert ("20260829", "20260829") not in spans          # 周六不单拉
+    assert ("20260820", "20260825") in spans
+
+
+def test_get_minute_single_day_no_split(monkeypatch):
+    """单日区间不拆分, 保持一个任务。"""
+    from datetime import datetime
+
+    jobs = []
+
+    def fake_run_job(job, timeout=None):
+        jobs.append(job)
+        return {"ok": True, "op": "minute", "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake_run_job)
+    StockSDKProvider().get_minute(["600519.SH"], datetime(2026, 8, 28), datetime(2026, 8, 28, 15, 0))
+    assert len(jobs) == 1
+    assert jobs[0]["start"] == "20260828"

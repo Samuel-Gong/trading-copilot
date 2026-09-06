@@ -11,7 +11,9 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Request
 
+from app.enriched_generation import EnrichedPublication
 from app.indicators.pipeline import ENRICHED_COLUMNS
+from app.services.market_environment_lock import serialized_market_environment_update
 
 logger = logging.getLogger(__name__)
 
@@ -504,26 +506,21 @@ def _compute_storage(data_dir: Path) -> dict:
         stats[f"{key}_files"] = fc
         stats[f"{key}_size_mb"] = sz
 
-    # total: 再加上其他零散文件(pools, financials, capabilities.json 等)
-    other_dirs = ["pools", "financials", "backtest_results", "screener_results", "ai_cache"]
+    # total: 再加上其他零散目录 (financials 有下方专属明细统计, 不在此列)
+    other_dirs = ["pools", "backtest_results", "screener_results", "ai_cache"]
     for name in other_dirs:
         d = data_dir / name
         if d.exists():
             _, s = _scan_dir_stats(d)
             total_size += s
 
-    # financials 单独统计
+    # financials 单独统计 (明细与 total 各计入一次, 不得与其他目录循环重复累加)
     fin_dir = data_dir / "financials"
     if fin_dir.exists():
         fc, sz = _scan_dir_stats(fin_dir)
         stats["financials_files"] = fc
         stats["financials_size_mb"] = sz
         total_size += sz
-    for name in other_dirs:
-        d = data_dir / name
-        if d.exists():
-            _, s = _scan_dir_stats(d)
-            total_size += s
     # 根目录散文件
     for entry in os.scandir(data_dir):
         if entry.is_file(follow_symlinks=False):
@@ -642,31 +639,72 @@ def trading_dates(request: Request) -> dict:
     }
 
 
-@router.post("/clear")
-def clear_data(request: Request):
-    """清除所有本地 Parquet 数据（保留 capabilities.json 和目录结构）。"""
+def _clear_parquet_directories(
+    data_dir: Path,
+    publications: dict[str, EnrichedPublication],
+) -> int:
+    """清除受管理的数据目录，并维持 enriched generation 发布语义。"""
     import shutil
 
-    repo = request.app.state.repo
-    data_dir = repo.store.data_dir
     deleted = 0
-
     for sub in (
         "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
         "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
         "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
-        "backtest_results", "screener_results", "ai_cache",
+        "backtest_results", "screener_results", "ai_cache", "regime_history", "mainline_history",
     ):
-        d = data_dir / sub
-        if d.exists():
-            # 先删所有 parquet 文件
-            for f in d.rglob("*.parquet"):
-                f.unlink()
+        directory = data_dir / sub
+        if not directory.exists():
+            continue
+        publication = publications.get(sub)
+        parquet_files = list(directory.rglob("*.parquet"))
+        if publication is not None and parquet_files:
+            publication.begin()
+        try:
+            for file_path in parquet_files:
+                file_path.unlink()
                 deleted += 1
-            # 再删除空的日期分区子目录（date=YYYY-MM-DD 等）
-            for child in list(d.iterdir()):
+                if publication is not None:
+                    publication.mark_changed()
+            for child in list(directory.iterdir()):
                 if child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
+            if publication is not None:
+                publication.commit()
+        except BaseException:
+            if publication is not None:
+                publication.abandon()
+            raise
+    return deleted
+
+
+@router.post("/clear")
+@serialized_market_environment_update
+def clear_data(request: Request):
+    """清除所有本地 Parquet 数据（保留 capabilities.json 和目录结构）。"""
+    from contextlib import nullcontext
+
+    from app.services.mining_jobs import MiningRunStore
+
+    repo = request.app.state.repo
+    data_dir = repo.store.data_dir
+    deleted = 0
+    publications = {
+        "kline_daily_enriched": EnrichedPublication(data_dir, "stock", recover=True),
+        "kline_etf_enriched": EnrichedPublication(data_dir, "etf", recover=True),
+    }
+
+    # 在整个 Parquet 删除区间阻止新挖掘任务，并先取消、等待现有 worker；避免
+    # worker 与清库并发读写，也避免清库后旧 manifest/结果仍可由 API 读取。
+    mining_manager = getattr(request.app.state, "mining_manager", None)
+    if mining_manager is not None:
+        mining_clear_scope = mining_manager.clearing_runs()
+    else:
+        mining_clear_scope = nullcontext(MiningRunStore(data_dir))
+
+    with mining_clear_scope as mining_store:
+        deleted += _clear_parquet_directories(data_dir, publications)
+        deleted += mining_store.clear_runs()
 
     # 清除同步历史（内存 + 磁盘 job_store/ 文件夹）
     from app.services.pipeline_jobs import job_store
@@ -696,9 +734,21 @@ def clear_data(request: Request):
     repo.clear_cache()
     repo.refresh_cache()
 
+    # Repository 缓存不管理偏离值的基准动量与异动历史 TTL 缓存；磁盘删除后
+    # 必须显式失效，避免清库接口继续返回旧指数/股票结果。
+    from app.indicators.pipeline import invalidate_benchmark_momentum_cache
+    from app.services.abnormal_moves import invalidate_abnormal_moves_cache
+
+    invalidate_benchmark_momentum_cache(data_dir)
+    invalidate_abnormal_moves_cache()
+
     # 清除 Screener 进程级 _history_cache (TTL 缓存)
     from app.services.screener import ScreenerService
     ScreenerService.clear_history_cache()
+
+    # 清除市场阶段/主线 API 的进程级查询缓存。
+    from app.api.regime import invalidate_regime_cache
+    invalidate_regime_cache()
 
     # 清除 Overview 总览聚合结果缓存 (5s TTL)
     from app.api.overview import invalidate_overview_cache

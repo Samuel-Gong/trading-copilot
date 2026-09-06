@@ -278,10 +278,10 @@ def _build_user_prompt(signals: dict, overview: dict, days: int, dates: list[str
         _build_signal_block("🎰 游资特征 (排名波动大)", signals.get("hot_money", [])),
     ]
 
-    from app.services.ai_provider import sanitize_focus
-    safe_focus = sanitize_focus(focus)
-    if safe_focus:
-        parts.extend(["", f"本次分析请特别关注: {safe_focus}"])
+    from app.services.ai_provider import build_focus_instruction
+    focus_instruction = build_focus_instruction(focus, report_name=f"{dim}轮动分析报告")
+    if focus_instruction:
+        parts.extend(["", focus_instruction])
 
     return "\n".join(parts)
 
@@ -365,18 +365,27 @@ async def analyze_rotation_stream(
             return
 
         user_prompt = _build_user_prompt(signals, overview, days, dates, focus, kind)
+        got_content = False
         async for delta in stream_ai_text(
             [
                 {"role": "system", "content": _build_system_prompt(kind)},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=4000,
+            # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
+            max_tokens=None,
+            prefer_final_answer=True,
         ):
+            got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 
     except Exception as e:  # noqa: BLE001
         logger.exception("AI %s rotation analyze failed: %s", kind, e)
         yield json.dumps({"type": "error", "message": f"AI 轮动分析失败: {e}"}, ensure_ascii=False)
+        return
 
+    if not got_content:
+        logger.warning("AI %s rotation analyze ended with empty content", kind)
+        yield json.dumps({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"}, ensure_ascii=False)
+        return
     yield json.dumps({"type": "done"}, ensure_ascii=False)

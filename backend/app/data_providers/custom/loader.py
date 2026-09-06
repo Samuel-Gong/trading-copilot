@@ -11,6 +11,7 @@ from pathlib import Path
 
 import yaml
 
+from app import secrets_store
 from app.config import settings
 from app.data_providers.custom.config import (
     DEFAULT_TIMEOUT,
@@ -89,6 +90,19 @@ def list_plugins() -> list[dict]:
     return list(_PLUGIN_STATUS.values())
 
 
+def _plugin_key_masked(name: str, api_key_env: str) -> str:
+    """插件当前生效 Key 的脱敏串 (secrets.json 优先, .env 兜底), 未配置返回空。
+
+    与 TickFlow Key 的展示契约一致 (settings API 的 tickflow_api_key_masked):
+    完整 Key 永不出后端, 只出 mask() 结果, 供设置页常驻显示。
+    """
+    env = str(api_key_env or "").strip()
+    if not env:
+        return ""
+    key = secrets_store.get_env_backed_secret(f"{name.lower()}_api_key", env)
+    return secrets_store.mask(key) if key else ""
+
+
 def plugin_manifest(name: str) -> dict | None:
     """读取指定插件的 plugin.yaml 清单。"""
     plugin_dir = plugins_dir() / (name or "")
@@ -101,6 +115,33 @@ def plugin_manifest(name: str) -> dict | None:
 def plugin_dir_of(name: str) -> Path:
     """返回插件目录路径。"""
     return plugins_dir() / (name or "")
+
+
+def probe_plugin_key(name: str, api_key: str) -> tuple[bool, str]:
+    """调用插件的 probe_api_key(key) 探测候选 Key(不落盘)。
+
+    约定: 声明了 api_key_env 的插件, 其 entry 模块提供模块级
+    probe_api_key(key) -> (ok, reason)。未声明或未提供 → (False, 原因)。
+    """
+    manifest = plugin_manifest(name)
+    if manifest is None:
+        return False, f"插件 '{name}' 不存在"
+    if not manifest.get("api_key_env"):
+        return False, f"插件 '{name}' 不支持在界面配置 Key"
+    entry = str(manifest.get("entry") or "")
+    if ":" not in entry:
+        return False, f"插件 '{name}' entry 非法"
+    try:
+        module = importlib.import_module(entry.split(":", 1)[0])
+    except Exception as e:
+        return False, f"插件模块加载失败: {e}"
+    probe = getattr(module, "probe_api_key", None)
+    if probe is None:
+        return False, f"插件 '{name}' 未提供 Key 探测"
+    try:
+        return probe(api_key)
+    except Exception as e:
+        return False, f"探测失败: {e}"
 
 
 def install_plugin(name: str) -> tuple[bool, str]:
@@ -131,8 +172,14 @@ def install_plugin(name: str) -> tuple[bool, str]:
                 timeout=300,
             )
         elif runtime == "python":
+            import sys
             # Python 型插件: 优先用 uv pip install (uv 管理的 venv 无 pip 模块),
             # 回退 python -m pip。都装进当前后端虚拟环境。
+            # 关键: uv 分支必须显式传 --python sys.executable。dev.ps1 直接跑
+            # .venv/Scripts/python.exe 而不 activate, 后端进程 VIRTUAL_ENV 为空,
+            # uv pip 会默认选 PATH 上的基础解释器 (如 conda base, 常为只读) →
+            # 装错环境并 exit 2 (访问拒绝)。--python 锁定后端自身 venv, 与 pip
+            # 回退路径 (sys.executable -m pip) 的目标一致。
             # uv 容错: 用户全局 uv.toml 配置错误时 exit 2, 回退 --no-config 重试。
             # UV_HTTP_TIMEOUT=300: akshare 等含大包(如 mini-racer 14MB), 默认 30s 不够。
             req = pdir / "requirements.txt"
@@ -141,7 +188,7 @@ def install_plugin(name: str) -> tuple[bool, str]:
             uv_bin = shutil.which("uv")
             if uv_bin:
                 result = subprocess.run(
-                    [uv_bin, "pip", "install", "-r", str(req)],
+                    [uv_bin, "pip", "install", "--python", sys.executable, "-r", str(req)],
                     capture_output=True, text=True, timeout=300,
                     env={**__import__("os").environ, "UV_HTTP_TIMEOUT": "300"},
                 )
@@ -151,12 +198,12 @@ def install_plugin(name: str) -> tuple[bool, str]:
                     result = subprocess.run(
                         [uv_bin, "pip", "install", "--no-config",
                          "--index-url", "https://pypi.tuna.tsinghua.edu.cn/simple",
+                         "--python", sys.executable,
                          "-r", str(req)],
                         capture_output=True, text=True, timeout=300,
                         env={**__import__("os").environ, "UV_HTTP_TIMEOUT": "300"},
                     )
             else:
-                import sys
                 result = subprocess.run(
                     [sys.executable, "-m", "pip", "install", "-r", str(req)],
                     capture_output=True, text=True, timeout=300,
@@ -217,11 +264,12 @@ def uninstall_plugin(name: str) -> tuple[bool, str]:
                 if l.strip() and not l.startswith("#")]
         if not pkgs:
             return True, "requirements.txt 无有效包名"
+        import sys
         uv_bin = _shutil.which("uv")
-        cmd = [uv_bin, "pip", "uninstall", *pkgs] if uv_bin else None
-        if cmd is None:
-            import sys
-            cmd = [sys.executable, "-m", "pip", "uninstall", "-y", *pkgs]
+        # 与 install 一致: uv 分支显式 --python 锁定后端 venv (无 VIRTUAL_ENV 时
+        # 会默认落到 PATH 基础解释器), 与 pip 回退 (sys.executable -m pip) 目标一致。
+        cmd = ([uv_bin, "pip", "uninstall", "--python", sys.executable, *pkgs]
+               if uv_bin else [sys.executable, "-m", "pip", "uninstall", "-y", *pkgs])
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if result.returncode != 0:
@@ -319,6 +367,7 @@ def _config_to_dict(config: CustomSourceConfig) -> dict:
             } if ds_name != "realtime" else {}),
             **({"asset_type_param": ds.asset_type_param} if ds_name == "minute" and ds.asset_type_param else {}),
             **({"freq_param": ds.freq_param} if ds_name == "minute" and ds.freq_param else {}),
+            **({"pct_unit": ds.pct_unit} if ds_name == "realtime" and ds.pct_unit else {}),
         }
     return out
 
@@ -374,7 +423,7 @@ def _sanitize_for_yaml(config: dict) -> dict:
 
     datasets_out: dict = {}
     for ds_name, ds_cfg in (config.get("datasets") or {}).items():
-        if ds_name not in {"daily", "adj_factor", "realtime", "minute", "financial"}:
+        if ds_name not in {"daily", "adj_factor", "realtime", "minute", "full_minute", "financial"}:
             continue
         if not isinstance(ds_cfg, dict):
             continue
@@ -442,6 +491,13 @@ def _sanitize_dataset(ds_name: str, ds_cfg: dict) -> dict:
             out["start_param"] = start_param
         if end_param:
             out["end_param"] = end_param
+    pct_unit = str(ds_cfg.get("pct_unit") or "").strip().lower()
+    if pct_unit:
+        if ds_name != "realtime":
+            raise ValueError(f"{ds_name}: pct_unit 仅用于 realtime 数据集")
+        if pct_unit not in ("percent", "decimal"):
+            raise ValueError(f"{ds_name}: pct_unit 必须是 percent 或 decimal")
+        out["pct_unit"] = pct_unit
     if ds_name == "minute":
         asset_type_param = str(ds_cfg.get("asset_type_param") or "").strip()
         freq_param = str(ds_cfg.get("freq_param") or "").strip()
@@ -502,6 +558,10 @@ def _register_one_plugin(manifest: dict) -> None:
     if not name or not _NAME_RE.match(name):
         logger.warning("插件清单缺少合法 name: %r", name)
         return
+    # hidden: 已加载但对 UI 隐藏 (功能未完成/暂不开放), 不注册不展示
+    if manifest.get("hidden"):
+        logger.info("插件 %s 标记为 hidden, 跳过注册", name)
+        return
     runtime = str(manifest.get("runtime", "none")).lower()
     # 委托检测: 调用插件自己的 check 函数 (node 型/python 型各自实现)
     available, reason = _call_check(manifest.get("check"))
@@ -514,6 +574,9 @@ def _register_one_plugin(manifest: dict) -> None:
         "status": reason,
         "description": manifest.get("description", ""),
         "install_hint": manifest.get("install_hint", ""),
+        "homepage": manifest.get("homepage", ""),
+        "api_key_env": manifest.get("api_key_env", ""),
+        "api_key_masked": _plugin_key_masked(name, manifest.get("api_key_env", "")),
     }
     if not available:
         return  # 依赖没装: 不注册, 但状态已记录供 UI 显示

@@ -9,7 +9,7 @@ import { toast } from '@/components/Toast'
 const INPUT_CLS =
   'w-full h-9 px-2.5 rounded-lg bg-base border-0 ring-1 ring-border/40 text-xs text-foreground placeholder:text-muted/30 focus:outline-none focus:ring-2 focus:ring-accent/40 transition-shadow'
 
-const DATASETS = ['daily', 'adj_factor', 'realtime', 'minute'] as const
+const DATASETS = ['daily', 'adj_factor', 'realtime', 'minute', 'full_minute'] as const
 type DatasetKey = typeof DATASETS[number]
 
 const DATASET_LABEL: Record<DatasetKey, string> = {
@@ -17,6 +17,7 @@ const DATASET_LABEL: Record<DatasetKey, string> = {
   adj_factor: '除权因子',
   realtime: '实时行情',
   minute: '分钟K',
+  full_minute: '全量分钟',
 }
 
 const TARGET_FIELDS: Record<DatasetKey, string[]> = {
@@ -24,6 +25,7 @@ const TARGET_FIELDS: Record<DatasetKey, string[]> = {
   adj_factor: ['symbol', 'trade_date', 'ex_factor'],
   realtime: ['symbol', 'name', 'last_price', 'prev_close', 'open', 'high', 'low', 'volume', 'amount', 'change_pct', 'change_amount', 'amplitude', 'turnover_rate', 'timestamp', 'session'],
   minute: ['symbol', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount'],
+  full_minute: ['symbol', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount'],
 }
 
 // 内部字段的中文说明 (下拉选项展示用)
@@ -192,15 +194,15 @@ export function DataSourceEditor({
           {!isNew && !isActive && config.name.trim() && (
             <button
               onClick={() => onActivate(config.name.toLowerCase().trim())}
-              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-btn bg-accent/10 text-accent text-xs font-medium hover:bg-accent/20 transition-colors"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-accent/10 text-accent text-xs font-medium hover:bg-accent/20 transition-colors"
             >
-              <Zap className="h-3 w-3" /> 切换为当前
+              <Zap className="h-3.5 w-3.5" /> 切换为当前数据源
             </button>
           )}
           {!isNew && onDelete && (
             <button
               onClick={onDelete}
-              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-btn text-xs text-muted hover:text-danger hover:bg-danger/10 transition-colors"
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-btn text-xs text-muted hover:text-danger hover:bg-danger/10 transition-colors"
             >
               <Trash2 className="h-3 w-3" /> 删除
             </button>
@@ -486,7 +488,7 @@ function DatasetDetail({
                           </Field>
                         </>
                       )}
-                      {datasetKey === 'minute' && (
+                      {(datasetKey === 'minute' || datasetKey === 'full_minute') && (
                         <>
                           <Field label="资产类型参数">
                             <input

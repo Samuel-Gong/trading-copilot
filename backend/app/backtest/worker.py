@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing as mp
 import os
 import queue
@@ -17,9 +18,14 @@ from typing import Any
 
 import psutil
 
+logger = logging.getLogger(__name__)
+
 
 class BacktestWorkerError(RuntimeError):
     """Raised when a spawned worker fails before returning a task result."""
+
+
+_CANCEL_GRACE_SECONDS = 5.0
 
 
 class _PeakRssSampler:
@@ -136,6 +142,10 @@ def make_worker_task(kind: str, data_dir: Path, config) -> dict[str, Any]:
         encoded = asdict(config)
         encoded["start"] = config.start.isoformat()
         encoded["end"] = config.end.isoformat()
+    elif kind == "mining":
+        if not isinstance(config, dict):
+            raise TypeError("mining worker config must be a dict")
+        encoded = dict(config)
     else:
         raise ValueError(f"unsupported worker task kind: {kind}")
     return {
@@ -165,13 +175,19 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         from app.backtest.engine import BacktestEngine
         from app.backtest.optimizer import StrategyOptimizer
         from app.backtest.strategy import StrategyBacktestService
-        from app.strategy.engine import StrategyEngine
         from app.strategy import config as strategy_config
+        from app.strategy.engine import StrategyEngine
         from app.tickflow.repository import DataStore, KlineRepository
 
         data_dir = Path(task["data_dir"])
         store = DataStore(data_dir)
         repo = KlineRepository(store)
+        # 子进程不继承主进程的因子注册表; 自定义/复合因子 (uf_/cf_) 在任何
+        # 涉及因子物化的 worker 任务里都依赖注册表, 启动时从存储加载。
+        # 单个加载失败只跳过 (fail-open 跳过该因子), 与主进程启动行为一致。
+        from app.factors.store import load_into_registry
+
+        load_into_registry(data_dir)
         strategy_engine = StrategyEngine(
             strategy_dirs=_strategy_dirs(data_dir),
             override_loader=lambda sid: strategy_config.load_override(data_dir, sid),
@@ -201,6 +217,18 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
             optimizer = StrategyOptimizer(service, strategy_engine)
             walkforward = WalkForwardService(optimizer, service, strategy_engine)
             result = walkforward.run(config, _progress, cancel_event)
+        elif kind == "mining":
+            from app.backtest.mining_runtime import run_mining_runtime
+
+            result = run_mining_runtime(
+                task["config"],
+                data_dir=data_dir,
+                service=service,
+                strategy_engine=strategy_engine,
+                progress_cb=_progress,
+                cancel_check=cancel_event,
+                rss_sampler=sampler,
+            )
         else:
             raise ValueError(f"unsupported worker task kind: {kind}")
 
@@ -235,6 +263,14 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         if store is not None:
             with suppress(Exception):
                 store.db.close()
+        # 终态消息已入队: 显式冲刷队列后立即退出。put 只是入队, 实际写管道的
+        # 是后台 feeder 线程, close+join_thread 保证消息完整落管 (否则父进程误判
+        # "exited without result"); 大数据量任务再跳过解释器 teardown (GC、DuckDB
+        # 线程 join、DLL 卸载), 否则收尾可达数十秒, 撞上父进程 10s 退出预算。
+        with suppress(Exception):
+            event_queue.close()
+            event_queue.join_thread()
+        os._exit(0)
 
 
 def run_worker_task(
@@ -261,11 +297,20 @@ def run_worker_task(
     result: dict[str, Any] | None = None
     failure: dict[str, Any] | None = None
     ipc_started = time.perf_counter()
+    cancel_started: float | None = None
 
     try:
         while result is None and failure is None:
             if cancel_event is not None and cancel_event.is_set():
                 process_cancel.set()
+                if cancel_started is None:
+                    cancel_started = time.monotonic()
+                elif time.monotonic() - cancel_started >= _CANCEL_GRACE_SECONDS:
+                    process.terminate()
+                    process.join(timeout=5.0)
+                    raise BacktestWorkerError(
+                        "backtest worker did not stop within 5 seconds after cancellation"
+                    )
             try:
                 message = events.get(timeout=0.1)
             except queue.Empty:
@@ -282,11 +327,35 @@ def run_worker_task(
             elif message_type == "error":
                 failure = message
 
+        # 子进程退出后, 队列读线程可能尚未把管道尾部的 result/error 搬进本地缓冲
+        # (0.1s 轮询在系统高负载下会先看到 Empty+进程已死)。join 后做一次兜底排空,
+        # 只要消息完整刷入过管道就一定能取到。
+        if result is None and failure is None:
+            for _ in range(2):
+                try:
+                    message = events.get(timeout=1.0)
+                except queue.Empty:
+                    break
+                message_type = message.get("type")
+                if message_type == "result":
+                    result = message["payload"]
+                elif message_type == "error":
+                    failure = message
+
         process.join(timeout=10.0)
+        worker_exit_forcibly = False
         if process.is_alive():
+            # 终态消息 (result/error) 已完整送达, 子进程只是退出收尾慢:
+            # 强制结束并继续走结果/错误处理, 不把已送达的成功结果当失败丢弃。
             process.terminate()
             process.join(timeout=5.0)
-            raise BacktestWorkerError("backtest worker returned but did not exit within 10 seconds")
+            worker_exit_forcibly = True
+            logger.warning(
+                "%s worker delivered its terminal message but did not exit within "
+                "10s; terminated forcibly (exitcode=%s)",
+                task["kind"],
+                process.exitcode,
+            )
         if failure is not None:
             raise BacktestWorkerError(
                 f"{failure.get('message', 'worker failed')}\n{failure.get('traceback', '')}".rstrip()
@@ -301,6 +370,7 @@ def run_worker_task(
             "parent_rss_before_bytes": parent_rss_before,
             "parent_rss_after_worker_exit_bytes": _rss_bytes(),
             "worker_exitcode": process.exitcode,
+            "worker_exit_forcibly": worker_exit_forcibly,
         }
         kind = task["kind"]
         if kind == "backtest":

@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import tempfile
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
@@ -15,8 +16,10 @@ import polars as pl
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from app.market_time import cn_today
 from app.services.ext_data import (
     ExtConfig,
+    ExtConfigChangedError,
     ExtConfigStore,
     ExtField,
     PullConfig,
@@ -26,8 +29,8 @@ from app.services.ext_data import (
     fix_symbol_format,
     infer_fields_from_df,
     parse_upload_file,
-    write_ext_parquet,
     rows_to_parquet,
+    write_ext_parquet,
 )
 from app.services.ext_pull import fetch_and_ingest, pull_scheduler
 
@@ -79,6 +82,8 @@ class PullConfigReq(BaseModel):
     field_map: dict[str, str] | None = None  # external → internal field name
     schedule_minutes: int = Field(1440, ge=1)
     enabled: bool = False
+    time_window_start: str | None = None   # "HH:MM", None=不限
+    time_window_end: str | None = None     # "HH:MM", None=不限
 
 
 class DetectUrlReq(BaseModel):
@@ -324,6 +329,8 @@ async def fetch_preset_data(request: Request, config_id: str):
 
     try:
         n = await fetch_preset(config_id, _data_dir(request))
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(404, str(e)) from e
     except Exception as e:
@@ -348,7 +355,10 @@ def create_config(request: Request, body: CreateExtReq):
         symbol_map=body.symbol_map,
         code_map=body.code_map,
     )
-    store.upsert(config)
+    try:
+        store.create(config)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     return config.to_dict()
 
 
@@ -369,7 +379,10 @@ def update_config(request: Request, config_id: str, body: UpdateExtReq):
         config.symbol_map = body.symbol_map
     if body.code_map is not None:
         config.code_map = body.code_map
-    store.upsert(config)
+    try:
+        store.update(config)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     return config.to_dict()
 
 
@@ -484,8 +497,224 @@ def dimension_members(
 
 
 # ---------------------------------------------------------------------------
+# 板块分时 (dimension intraday)
+# ---------------------------------------------------------------------------
+
+# 点击触发 + 60s 进程内缓存: 分钟分区是滚动底座 (minute_refresh / 盘后分钟同步),
+# 不做后台预计算 — 板块基数大而单次聚合仅几十毫秒。
+_DIMENSION_INTRADAY_CACHE: dict[tuple[str, str, str, str | None], tuple[float, dict]] = {}
+_DIMENSION_INTRADAY_CACHE_TTL_S = 60.0
+# 成分股网格化 ffill 上限: 超大板块退化为逐时间戳可得均值 (内存保护)。
+_DIMENSION_INTRADAY_FFILL_CAP = 2000
+
+
+def _bare_symbol_expr(col: str = "symbol") -> pl.Expr:
+    """'000001.SZ' → '000001'; 已是裸代码则原样。"""
+    return pl.col(col).cast(pl.String).str.strip_chars().str.split(".").list.first()
+
+
+def _dimension_member_bares(matched: pl.DataFrame, config: ExtConfig) -> list[str]:
+    """成分股裸代码集合 (symbol 列优先级与 dimension-members 端点一致)。"""
+    if matched.is_empty():
+        return []
+    symbol_columns = ["symbol", "code", "股票代码", "代码"]
+    for mapping in (config.symbol_map, config.code_map):
+        if isinstance(mapping, dict) and mapping.get("type") == "mapped" and mapping.get("col"):
+            symbol_columns.append(str(mapping["col"]))
+    cols = [c for c in dict.fromkeys(symbol_columns) if c in matched.columns]
+    if not cols:
+        return []
+    coalesced = pl.coalesce(
+        [pl.col(c).cast(pl.String).str.strip_chars().str.split(".").list.first() for c in cols]
+    )
+    series = matched.select(coalesced.alias("_bare")).to_series()
+    return sorted({s for s in series.to_list() if s})
+
+
+def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
+    """目标日前最近一个日K分区的收盘价 → (_bare, prev_close); 无则 None。"""
+    daily = data_dir / "kline_daily"
+    if not daily.exists():
+        return None
+    dates = sorted(
+        d.name[5:]
+        for d in daily.iterdir()
+        if d.is_dir() and d.name.startswith("date=") and (d / "part.parquet").exists()
+    )
+    prevs = [d for d in dates if d < target_date]
+    if not prevs:
+        return None
+    path = daily / f"date={prevs[-1]}" / "part.parquet"
+    if not path.exists():
+        return None
+    df = pl.read_parquet(path, columns=["symbol", "close"])
+    return (
+        df.with_columns(_bare_symbol_expr().alias("_bare"))
+        .select([pl.col("_bare"), pl.col("close").cast(pl.Float64).alias("prev_close")])
+        .unique(subset=["_bare"], keep="last")
+    )
+
+
+def _dimension_intraday_compute(
+    config: ExtConfig,
+    data_dir: Path,
+    field: str,
+    value: str,
+    snapshot_date: str | None,
+) -> dict:
+    """板块等权分时: 成分股当日分钟K逐分钟平均涨跌幅 + 全市场对照线。
+
+    口径: pct = 分钟close / ref − 1 (小数制, 与快照涨跌幅契约一致, 前端 ×100 显示),
+    ref 优先前一交易日日K收盘 (prev_close, 开盘跳空体现在曲线起点);
+    日K缺失的标的退化为当日首根分钟close (混合基准)。
+    停牌/无成交分钟按成分股 forward-fill 后再平均, 全市场线取逐时间戳可得均值。
+    """
+    minute_dir = data_dir / "kline_minute"
+    partitions: list[str] = []
+    if minute_dir.exists():
+        partitions = sorted(
+            d.name[5:]
+            for d in minute_dir.iterdir()
+            if d.is_dir() and d.name.startswith("date=") and (d / "part.parquet").exists()
+        )
+    if snapshot_date:
+        target = snapshot_date if snapshot_date in partitions else None
+    else:
+        target = partitions[-1] if partitions else None
+    if not target:
+        return {"status": "no_data", "reason": "minute_missing", "date": snapshot_date, "points": []}
+
+    ext_df, _active = _read_ext_dataframe(config, data_dir)
+    if ext_df.is_empty() or field not in ext_df.columns:
+        return {"status": "empty", "reason": "no_members", "date": target, "points": []}
+    member_bares = _dimension_member_bares(_filter_dimension_member_rows(ext_df, field, value), config)
+    if not member_bares:
+        return {"status": "empty", "reason": "no_members", "date": target, "points": []}
+
+    try:
+        bars = pl.read_parquet(
+            minute_dir / f"date={target}" / "part.parquet",
+            columns=["symbol", "datetime", "close"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dimension-intraday read minute partition failed: %s", exc)
+        return {"status": "no_data", "reason": "minute_schema", "date": target, "points": []}
+    bars = bars.drop_nulls(subset=["datetime", "close"])
+    if bars.is_empty():
+        return {"status": "no_data", "reason": "minute_empty", "date": target, "points": []}
+    bars = bars.with_columns(_bare_symbol_expr().alias("_bare"))
+
+    prev = _prev_daily_close(data_dir, target)
+    joined = bars.join(prev, on="_bare", how="left") if prev is not None else bars.with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("prev_close")
+    )
+    refs = joined.group_by("_bare").agg(
+        pl.col("prev_close").first().alias("_prev"),
+        pl.col("close").sort_by("datetime").first().alias("_first"),
+    ).with_columns(pl.coalesce(["_prev", "_first"]).alias("_ref"))
+    n_prev = refs["_prev"].is_not_null().sum()
+    basis = "prev_close" if n_prev == refs.height else ("first_close" if n_prev == 0 else "mixed")
+    joined = (
+        joined.join(refs.select(["_bare", "_ref"]), on="_bare", how="left")
+        .with_columns((pl.col("close") / pl.col("_ref") - 1.0).alias("_pct"))
+    )
+
+    market = joined.group_by("datetime").agg(pl.col("_pct").mean().alias("_market"))
+
+    member_bars = joined.filter(pl.col("_bare").is_in(member_bares))
+    members_with_minute = member_bars["_bare"].n_unique() if not member_bars.is_empty() else 0
+    if members_with_minute == 0:
+        return {
+            "status": "empty", "reason": "no_member_bars", "date": target,
+            "member_count": len(member_bares), "members_with_minute": 0, "points": [],
+        }
+    if members_with_minute <= _DIMENSION_INTRADAY_FFILL_CAP:
+        # 网格化 (成分股 × 全时间轴) + 逐股 ffill: 停牌分钟冻结在最后价而非退出均值
+        grid = (
+            member_bars.select(pl.col("_bare").unique())
+            .join(joined.select(pl.col("datetime").unique()), how="cross")
+        )
+        member_bars = (
+            grid.join(member_bars.select(["_bare", "datetime", "_pct"]), on=["_bare", "datetime"], how="left")
+            .sort(["_bare", "datetime"])
+            .with_columns(pl.col("_pct").forward_fill().over("_bare"))
+        )
+    sector = member_bars.group_by("datetime").agg(pl.col("_pct").mean().alias("_sector"))
+
+    combined = market.join(sector, on="datetime", how="left").sort("datetime")
+
+    def _r4(v) -> float | None:
+        return round(float(v), 4) if v is not None and not (isinstance(v, float) and math.isnan(v)) else None
+
+    points = [
+        {
+            "time": row["datetime"].strftime("%H:%M"),
+            "sector": _r4(row["_sector"]),
+            "market": _r4(row["_market"]),
+        }
+        for row in combined.iter_rows(named=True)
+    ]
+    return {
+        "status": "ok",
+        "date": target,
+        "basis": basis,
+        "member_count": len(member_bares),
+        "members_with_minute": members_with_minute,
+        "points": points,
+    }
+
+
+@router.get("/{config_id}/dimension-intraday")
+def dimension_intraday(
+    request: Request,
+    config_id: str,
+    field: str = Query(..., min_length=1),
+    value: str = Query(..., min_length=1),
+    snapshot_date: str | None = Query(None, alias="date"),
+):
+    """板块分时走势 (等权): 成分股 × 当日分钟K聚合; 60s 缓存, 点击触发不预计算。"""
+    config = _store(request).get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+
+    cache_key = (config_id, field, value.strip(), snapshot_date)
+    now = time.monotonic()
+    hit = _DIMENSION_INTRADAY_CACHE.get(cache_key)
+    if hit is not None and now - hit[0] < _DIMENSION_INTRADAY_CACHE_TTL_S:
+        return hit[1]
+
+    payload = _dimension_intraday_compute(config, _data_dir(request), field, value, snapshot_date)
+    _DIMENSION_INTRADAY_CACHE[cache_key] = (now, payload)
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # 文件上传
 # ---------------------------------------------------------------------------
+
+# 扩展数据 CSV/Excel 上传上限(与自选截图 OCR 的 12MB 上限属同类保护, 见 watchlist.py)。
+# 通过分块写入临时文件, 超限即拒绝, 避免 `await file.read()` 把整个文件读入内存。
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _write_upload_capped(file: UploadFile, dest: Path, max_bytes: int) -> None:
+    """分块把上传文件写入 dest, 累计超过 max_bytes 立即拒绝(413)。
+
+    避免一次性 `await file.read()` 把整个文件读入内存(大文件可能触发高内存占用、
+    进程 OOM 或服务不可用); 超限时停止继续读取与落盘。
+    """
+    total = 0
+    with dest.open("wb") as f:
+        while True:
+            chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(413, f"文件过大(上限 {max_bytes // (1024 * 1024)}MB)")
+            f.write(chunk)
+
 
 @router.post("/{config_id}/upload")
 async def upload_data(
@@ -509,9 +738,7 @@ async def upload_data(
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_path = tmp_dir / f"upload{suffix}"
     try:
-        with tmp_path.open("wb") as f:
-            content = await file.read()
-            f.write(content)
+        await _write_upload_capped(file, tmp_path, _MAX_UPLOAD_BYTES)
 
         # 直接读取文件，不做列重命名
         if suffix == ".csv":
@@ -544,9 +771,12 @@ async def upload_data(
     df = df.select(keep)
 
     # 解析快照日期
-    snap = date.fromisoformat(snapshot_date) if snapshot_date else date.today()
+    snap = date.fromisoformat(snapshot_date) if snapshot_date else cn_today()
 
-    rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
+    try:
+        rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
 
     # 刷新 DuckDB 视图
     _refresh_views(request)
@@ -576,9 +806,17 @@ def ingest_data(request: Request, config_id: str, body: IngestReq):
         if missing:
             raise HTTPException(400, f"第 {i + 1} 行缺少字段: {', '.join(sorted(missing))}")
 
-    snap = date.fromisoformat(body.date) if body.date else date.today()
+    snap = date.fromisoformat(body.date) if body.date else cn_today()
 
-    rows_written = rows_to_parquet(body.rows, config, _data_dir(request), snapshot_date=snap)
+    try:
+        rows_written = rows_to_parquet(
+            body.rows,
+            config,
+            _data_dir(request),
+            snapshot_date=snap,
+        )
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
 
     _refresh_views(request)
 
@@ -608,12 +846,17 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         field_map=body.field_map,
         schedule_minutes=body.schedule_minutes,
         enabled=body.enabled,
+        time_window_start=body.time_window_start,
+        time_window_end=body.time_window_end,
         last_run=old_pull.last_run if old_pull else None,
         last_status=old_pull.last_status if old_pull else None,
         last_message=old_pull.last_message if old_pull else None,
         last_rows=old_pull.last_rows if old_pull else None,
     )
-    store.upsert(config)
+    try:
+        store.update(config)
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
 
     # 刷新调度器
     pull_scheduler.refresh(_data_dir(request))
@@ -623,7 +866,7 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         cleared = store.get(config_id)
         if cleared and cleared.pull and cleared.pull.next_run:
             cleared.pull.next_run = None
-            store.upsert(cleared)
+            store.update(cleared)
 
     return {"status": "ok", "pull": config.pull.to_dict()}
 
@@ -688,7 +931,7 @@ async def run_pull(request: Request, config_id: str):
             updated.pull.last_status = "success"
             updated.pull.last_message = f"{n} rows @ {d}"
             updated.pull.last_rows = n
-            store.upsert(updated)
+            store.update(updated)
         return {"status": "ok", "rows": n, "date": d}
     except Exception as e:
         # 失败也写回状态, 记录错误信息
@@ -698,7 +941,7 @@ async def run_pull(request: Request, config_id: str):
             failed.pull.last_run = datetime.now(timezone.utc).isoformat()
             failed.pull.last_status = "error"
             failed.pull.last_message = str(e)[:200]
-            store.upsert(failed)
+            store.update(failed)
         raise HTTPException(400, f"拉取失败: {e}") from e
 
 
@@ -715,7 +958,10 @@ def fix_symbol(request: Request, config_id: str):
     if not config:
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
 
-    fixed = fix_symbol_format(config, _data_dir(request))
+    try:
+        fixed = fix_symbol_format(config, _data_dir(request))
+    except ExtConfigChangedError as e:
+        raise HTTPException(409, str(e)) from e
     _refresh_views(request)
     return {"status": "ok", "fixed_files": fixed}
 
@@ -742,9 +988,7 @@ async def detect_fields(
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_path = tmp_dir / f"upload{suffix}"
     try:
-        with tmp_path.open("wb") as f:
-            content = await file.read()
-            f.write(content)
+        await _write_upload_capped(file, tmp_path, _MAX_UPLOAD_BYTES)
 
         # 直接读取，不要求 symbol 列
         if suffix == ".csv":

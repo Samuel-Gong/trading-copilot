@@ -9,6 +9,7 @@ import polars as pl
 from app.backtest.engine import BacktestEngine, SimResult
 from app.backtest.matrix import build_market_data_matrix, make_signal_matrix, rolling_mean
 from app.backtest.strategy import StrategyBacktestConfig, StrategyBacktestService
+from app.services import regime_builder
 from app.strategy.engine import StrategyDef
 
 
@@ -23,7 +24,6 @@ def _strategy(**kwargs) -> StrategyDef:
         trailing_take_profit_activate=None,
         trailing_take_profit_drawdown=None,
         max_hold_days=None,
-        alerts=[],
         filter_fn=lambda df, params: pl.lit(True),
         filter_history_fn=None,
         lookback_days=1,
@@ -43,14 +43,17 @@ class _StrategyEngineStub:
 
 
 class _RepoStub:
+    def __init__(self, data_dir=None) -> None:
+        self.store = SimpleNamespace(data_dir=data_dir)
+
     def get_index_daily(self, *args, **kwargs) -> pl.DataFrame:
         return pl.DataFrame()
 
 
 class _EngineStub:
-    def __init__(self, panel: pl.DataFrame) -> None:
+    def __init__(self, panel: pl.DataFrame, data_dir=None) -> None:
         self.panel = panel
-        self.repo = _RepoStub()
+        self.repo = _RepoStub(data_dir)
         self.load_args = None
         self.load_count = 0
         self.sim_panel: pl.DataFrame | None = None
@@ -160,6 +163,114 @@ def test_basic_filter_only_limits_entries_not_panel_rows():
         "entry_trigger_filtered": 0,
         "entry_trigger_enabled": False,
     }
+
+
+def test_non_matrix_strategy_applies_regime_filter_and_reports_config(tmp_path):
+    start = date(2024, 1, 1)
+    panel = pl.DataFrame([
+        {
+            "symbol": "A",
+            "name": "A",
+            "date": start + timedelta(days=offset),
+            "open": 10.0,
+            "high": 10.0,
+            "low": 10.0,
+            "close": 10.0,
+            "volume": 1000.0,
+            "amount": 1000.0,
+            "signal_limit_up": False,
+            "signal_limit_down": False,
+        }
+        for offset in range(-1, 3)
+    ]).sort(["symbol", "date"])
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [
+            start - timedelta(days=1),
+            start,
+            start + timedelta(days=1),
+            start + timedelta(days=2),
+        ],
+        "state": ["weak", "weak", "strong", "strong"],
+        "score": [10, 10, 85, 85],
+    }))
+    engine = _EngineStub(panel, data_dir=tmp_path)
+    service = StrategyBacktestService(engine=engine, strategy_engine=_StrategyEngineStub(_strategy()))
+    regime_filter = {"states": ["strong"]}
+
+    result = service.run(StrategyBacktestConfig(
+        strategy_id="test",
+        symbols=None,
+        start=start,
+        end=start + timedelta(days=2),
+        matching="close_t",
+        mode="position",
+        regime_filter=regime_filter,
+    ))
+
+    assert result.error is None
+    assert engine.sim_matrix is not None
+    assert engine.sim_matrix.entry[:, 0].tolist() == [0, 0, 1]
+    assert result.config["regime_filter"] == regime_filter
+    assert result.stats["selection"] == {
+        "strategy_matches": 1,
+        "entry_candidates": 1,
+        "entry_trigger_filtered": 0,
+        "entry_trigger_enabled": False,
+    }
+
+
+def test_regime_filter_matches_raw_five_level_states(tmp_path):
+    start = date(2024, 1, 1)
+    panel = pl.DataFrame([
+        {
+            "symbol": "A",
+            "name": "A",
+            "date": start + timedelta(days=offset),
+            "open": 10.0,
+            "high": 10.0,
+            "low": 10.0,
+            "close": 10.0,
+            "volume": 1000.0,
+            "amount": 1000.0,
+            "signal_limit_up": False,
+            "signal_limit_down": False,
+        }
+        for offset in range(-1, 3)
+    ]).sort(["symbol", "date"])
+    regime_builder.upsert_regime_history(tmp_path, pl.DataFrame({
+        "date": [
+            start - timedelta(days=1),
+            start,
+            start + timedelta(days=1),
+            start + timedelta(days=2),
+        ],
+        "state": ["weak", "lean_strong", "strong", "strong"],
+        "score": [10, 60, 85, 85],
+    }))
+
+    def run_with(states: list[str]):
+        engine = _EngineStub(panel, data_dir=tmp_path)
+        service = StrategyBacktestService(
+            engine=engine,
+            strategy_engine=_StrategyEngineStub(_strategy()),
+        )
+        result = service.run(StrategyBacktestConfig(
+            strategy_id="test",
+            symbols=None,
+            start=start,
+            end=start + timedelta(days=2),
+            matching="close_t",
+            mode="position",
+            regime_filter={"states": states},
+        ))
+        assert result.error is None
+        assert engine.sim_matrix is not None
+        return engine.sim_matrix.entry[:, 0].tolist()
+
+    # 强势与偏强是两个独立档位; 只选强势时偏强日不入场
+    assert run_with(["strong"]) == [0, 0, 1]
+    assert run_with(["strong", "lean_strong"]) == [0, 1, 1]
+    assert run_with(["lean_strong"]) == [0, 1, 0]
 
 
 def test_selection_stats_explain_entry_trigger_filtering():
@@ -423,6 +534,21 @@ def test_matrix_optimizer_preparation_loads_and_builds_base_data_once():
     assert all(result.stats["shared_market_data_bytes"] == prepared.market_data.nbytes for result in results)
 
 
+def test_matrix_prepare_signature_includes_regime_filter():
+    base = dict(
+        strategy_id="native",
+        symbols=None,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 2),
+    )
+    without_filter = StrategyBacktestConfig(**base)
+    with_filter = StrategyBacktestConfig(**base, regime_filter={"states": ["strong"]})
+
+    assert StrategyBacktestService._matrix_prepare_signature(without_filter) != (
+        StrategyBacktestService._matrix_prepare_signature(with_filter)
+    )
+
+
 def test_matrix_cache_preserves_trades_daily_equity_and_core_stats():
     start = date(2024, 1, 1)
     panel = pl.DataFrame([
@@ -510,3 +636,57 @@ def test_matrix_cache_preserves_trades_daily_equity_and_core_stats():
         assert cached.stats[name] == uncached.stats[name]
         assert cached_again.stats[name] == uncached.stats[name]
     assert cached_again.stats["matrix_compute_cache"]["hits"] > 0
+
+
+def test_apply_score_captures_factor_snapshot_for_candidates():
+    panel = pl.DataFrame({
+        "symbol": ["A", "B", "C"],
+        "date": [date(2024, 1, 1)] * 3,
+        "factor": [10.0, 20.0, 1000.0],
+    })
+    universe = pl.Series([True, True, False], dtype=pl.Boolean)
+    strategy = SimpleNamespace(meta={"scoring": {"factor": 1.0}, "order_by": "score", "descending": True})
+
+    snapshot: dict = {}
+    StrategyBacktestService._apply_score(panel, strategy, None, universe_mask=universe, factor_snapshot=snapshot)
+    frame = snapshot["frame"]
+    assert frame.columns == ["symbol", "date", "factor"]
+    assert frame["symbol"].to_list() == ["A", "B"]  # 非候选行不入快照
+
+
+def test_full_mode_reports_factor_attribution():
+    start = date(2024, 1, 1)
+    panel = pl.DataFrame([
+        {"symbol": "A", "name": "A", "date": start, "open": 10.0, "high": 10.0, "low": 10.0, "close": 10.0, "volume": 1, "amount": 1000.0, "signal_limit_up": False, "signal_limit_down": False, "factor": 5.0},
+        {"symbol": "A", "name": "A", "date": start + timedelta(days=1), "open": 11.0, "high": 11.0, "low": 11.0, "close": 11.0, "volume": 1, "amount": 0.0, "signal_limit_up": False, "signal_limit_down": False, "factor": 5.0},
+        {"symbol": "A", "name": "A", "date": start + timedelta(days=2), "open": 20.0, "high": 20.0, "low": 20.0, "close": 20.0, "volume": 1, "amount": 1000.0, "signal_limit_up": False, "signal_limit_down": False, "factor": 5.0},
+    ]).sort(["symbol", "date"])
+
+    engine = BacktestEngine(repo=None)  # type: ignore[arg-type]
+    engine.load_panel_for_backtest = lambda symbols, s, e, plan, asset_type="stock": panel  # type: ignore[method-assign]
+    strategy = _strategy(
+        filter_fn=lambda df, params: pl.col("date") == start,
+        max_hold_days=1,
+    )
+    strategy.meta["scoring"] = {"factor": 1.0}
+    service = StrategyBacktestService(engine=engine, strategy_engine=_StrategyEngineStub(strategy))
+
+    result = service.run(StrategyBacktestConfig(
+        strategy_id="test",
+        symbols=None,
+        start=start,
+        end=start,
+        mode="full",
+        matching="open_t+1",
+        fees_pct=0,
+        slippage_bps=0,
+        holding_days=1,
+    ))
+
+    assert result.error is None
+    assert result.stats["n_trades"] == 1
+    attribution = result.factor_attribution
+    assert attribution is not None
+    assert attribution["n_win"] == 1 and attribution["n_lose"] == 0
+    assert attribution["factors"][0]["factor"] == "factor"
+    assert attribution["factors"][0]["win_mean"] == 5.0

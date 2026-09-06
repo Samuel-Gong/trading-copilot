@@ -20,28 +20,29 @@ const META: Record<string, StrategyEventMeta> = {
   pool_entry: {
     label: '进入',
     action: '进入选股结果',
-    className: 'text-emerald-400',
+    className: 'text-danger',
   },
   pool_exit: {
     label: '移出',
     action: '移出选股结果',
-    className: 'text-warning',
+    className: 'text-bear',
   },
   new_entry: {
     label: '进入',
     action: '进入选股结果',
-    className: 'text-emerald-400',
+    className: 'text-danger',
   },
   dropped: {
     label: '移出',
     action: '移出选股结果',
-    className: 'text-warning',
+    className: 'text-bear',
   },
 }
 
+/** 新建策略监控的默认通知事件: 选股结果(进入/移出), 与后端省略字段时的回填一致 */
 export const DEFAULT_STRATEGY_NOTIFY_EVENTS: StrategyNotifyEvent[] = [
-  'buy_signal',
-  'sell_signal',
+  'pool_entry',
+  'pool_exit',
 ]
 
 export const LEGACY_STRATEGY_NOTIFY_EVENTS: StrategyNotifyEvent[] = [

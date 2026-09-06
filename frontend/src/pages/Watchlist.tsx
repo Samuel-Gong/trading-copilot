@@ -1,24 +1,37 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Trash2, RefreshCw, Star, X, LayoutGrid, List, Settings2, Plus, Check, Filter, Eye, EyeOff, Minus, ChevronsUp, Clock, RotateCcw, ImagePlus } from 'lucide-react'
-import { api, type KlineRow, type MinuteKlineRow } from '@/lib/api'
+import { Trash2, RefreshCw, Star, X, Search, LayoutGrid, List, Rows3, BarChart3, Settings2, Plus, Check, Filter, Eye, EyeOff, Minus, ChevronsUp, Clock, RotateCcw, FileUp, FolderOpen, FolderMinus, FolderPlus } from 'lucide-react'
+import { api, type KlineRow, type MinuteKlineRow, type WatchlistGroup, type WatchlistGroupColor } from '@/lib/api'
+import { fetchMinuteBatchIncremental } from '@/lib/minuteBatchIncremental'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
 import { fmtPrice, fmtPct, fmtBigNum, priceColorClass, formatExtNumber } from '@/lib/format'
+import { cn } from '@/lib/cn'
+import { computeGroupPcts, loadGroupStatsConfig, type GroupStatsConfigPatch } from '@/lib/watchlistGroupStats'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
-import { StockPreviewDialog } from '@/components/StockPreviewDialog'
+import { StockPreviewDialog, toNavItems, type NavItem } from '@/components/StockPreviewDialog'
 import {
   DimensionMembersDialog,
   dimensionKindForSourceField,
   type DimensionMembersTarget,
 } from '@/components/DimensionMembersDialog'
 import { WatchlistImportDialog } from '@/components/WatchlistImportDialog'
-import { InstrumentSearchInput } from '@/components/InstrumentSearchInput'
-import { getOcrInstallHint } from '@/lib/ocrInstallHint'
-import { cn } from '@/lib/cn'
+import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
+import {
+  WatchlistGroupBar,
+  WatchlistGroupPicker,
+  type WatchlistGroupFilter,
+} from '@/components/WatchlistGroups'
+import { WatchlistGroupCards } from '@/components/WatchlistGroupCards'
+import { WatchlistGroupStatsBar } from '@/components/WatchlistGroupStatsBar'
+import { ExtensionSlot } from '@/extensions/ExtensionSlot'
+
+// 分时列开放排序 (StockDataTable 实例级白名单; 表头眼睛/刷新按钮已 stopPropagation)
+const INTRADAY_SORTABLE_KEYS = new Set(['intraday'])
 import { ColumnCustomizer } from '@/components/ColumnCustomizer'
 import { StockDataTable } from '@/components/stock-table/StockDataTable'
 import { VIRTUAL_LIST_THRESHOLD, useParentScroll } from '@/components/virtual-list/useParentScroll'
@@ -26,7 +39,7 @@ import { useTableSort } from '@/components/stock-table/useTableSort'
 import { MiniCandlestick } from '@/components/stock-table/MiniCandlestick'
 import { MiniIntraday } from '@/components/stock-table/MiniIntraday'
 import { boardTag, renderBuiltinDataCell } from '@/components/stock-table/primitives'
-import { getSignals, signalCls, getSortValue, UNSORTABLE_KEYS } from '@/lib/stock-table'
+import { getSignals, signalCls, getSortValue, getIntradaySortValue, UNSORTABLE_KEYS } from '@/lib/stock-table'
 import { resolveCandleConfig, resolveIntradayConfig } from '@/lib/list-columns'
 import { useQuoteStatus, useCapabilities, usePreferences } from '@/lib/useSharedQueries'
 import {
@@ -43,6 +56,10 @@ import {
 
 const BOARDS = ['沪主板', '深主板', '创业板', '科创板', '北交所'] as const
 type BoardType = typeof BOARDS[number]
+
+// 板块筛选选项 = 股票板块 + ETF（ETF 无 symbol 板块语义，按 asset_type 匹配）
+const ETF_BOARD = 'ETF'
+const BOARD_OPTIONS = [...BOARDS, ETF_BOARD]
 
 function getBoardType(symbol: string): BoardType | null {
   if (/^(300|301)/.test(symbol)) return '创业板'
@@ -212,47 +229,186 @@ function renderExtCell(
 
 function StockSearchBox({
   onPreview,
-  existingSymbols,
+  existingBySymbol,
+  groups,
   onAdd,
+  onToggleMember,
+  preferredGroupId,
+  addPending,
+  memberPending,
 }: {
   onPreview: (symbol: string, name: string) => void
-  existingSymbols: string[]
-  onAdd: (symbol: string) => void
+  /** symbol -> 该标的当前所属分组 id 列表; 不在 Map 中 = 未加自选 */
+  existingBySymbol: Map<string, string[]>
+  groups: WatchlistGroup[]
+  onAdd: (symbol: string, groupId: string | null) => void
+  onToggleMember: (symbol: string, groupId: string, member: boolean) => void
+  preferredGroupId: string | null
+  addPending: boolean
+  memberPending: boolean
 }) {
   const [query, setQuery] = useState('')
+  const [open, setOpen] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [activeIdx, setActiveIdx] = useState(-1)
+
+  const search = useQuery({
+    queryKey: QK.instrumentSearch(query, 'stock,etf,index'),
+    queryFn: () => api.instrumentSearch(query, 20, 'stock,etf,index'),
+    enabled: query.trim().length > 0,
+    staleTime: 30_000,
+  })
+
+  const results = search.data?.results ?? []
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (e.target instanceof Element && e.target.closest('[data-watchlist-group-menu]')) return
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === 'Escape') { setOpen(false); return }
+    if (!open || results.length === 0) return
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setActiveIdx(i => Math.min(i + 1, results.length - 1))
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setActiveIdx(i => Math.max(i - 1, -1))
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      if (activeIdx >= 0) handleSelect(results[activeIdx])
+      else if (results.length > 0) handleSelect(results[0])
+    }
+  }
+
+  function handleSelect(r: { symbol: string; name: string }) {
+    onPreview(r.symbol, r.name)
+    setQuery('')
+    setOpen(false)
+    setActiveIdx(-1)
+  }
 
   return (
-    <InstrumentSearchInput
-      value={query}
-      onValueChange={setQuery}
-      onSelect={result => {
-        onPreview(result.symbol, result.name)
-        setQuery('')
-      }}
-      assetTypes="stock,etf,index"
-      placeholder="搜索…"
-      inputClassName="h-8 w-44 rounded-btn border border-border bg-elevated pr-2.5 text-xs text-foreground placeholder:text-muted transition-all duration-200 focus:w-56 focus:border-accent/50 focus:outline-none"
-      menuClassName="right-0 w-64"
-      renderTrailing={result => {
-        const inWatchlist = existingSymbols.includes(result.symbol)
-        return (
-          <button
-            type="button"
-            onClick={event => { event.stopPropagation(); onAdd(result.symbol) }}
-            disabled={inWatchlist}
-            className={cn(
-              'shrink-0 rounded p-1 transition-colors',
-              inWatchlist
-                ? 'cursor-default bg-accent/10 text-accent'
-                : 'text-muted hover:bg-accent/10 hover:text-accent',
-            )}
-            title={inWatchlist ? '已加自选' : '加入自选'}
+    <div ref={containerRef} className="relative">
+      <div className="relative flex items-center">
+        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted pointer-events-none" />
+        <input
+          ref={inputRef}
+          type="text"
+          placeholder="搜索…"
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setOpen(true); setActiveIdx(-1) }}
+          onFocus={() => { if (query.trim()) setOpen(true) }}
+          onKeyDown={handleKeyDown}
+          className="w-44 h-8 pl-8 pr-2.5 rounded-btn bg-elevated border border-border text-xs text-foreground placeholder:text-muted focus:outline-none focus:border-accent/50 focus:w-56 transition-all duration-200"
+        />
+      </div>
+
+      <AnimatePresence>
+        {open && results.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ duration: 0.12, ease: [0.16, 1, 0.3, 1] }}
+            className="absolute right-0 top-full mt-1 z-50 w-72 max-h-[320px] overflow-y-auto rounded-card border border-border bg-base shadow-xl"
           >
-            {inWatchlist ? <Check className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
-          </button>
-        )
-      }}
-    />
+            {results.map((r, i) => {
+              const entryGids = existingBySymbol.get(r.symbol)
+              const inWatchlist = entryGids !== undefined
+              return (
+                <div
+                  key={r.symbol}
+                  className={`flex items-center gap-2.5 px-3 py-2 text-xs transition-colors duration-100 ${
+                    i === activeIdx ? 'bg-accent/10 text-accent' : 'hover:bg-elevated text-foreground'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleSelect(r)}
+                    className="flex items-center gap-2.5 flex-1 min-w-0 text-left"
+                  >
+                    <span className="font-mono shrink-0 w-[80px]">{r.symbol}</span>
+                    {/* 名称+标签组: 标签紧贴名称文字, 而不是被 flex-1 推到行尾 */}
+                    <span className="flex min-w-0 flex-1 items-center gap-1">
+                      <span className="truncate text-secondary">{r.name}</span>
+                      {r.asset_type === 'etf' && (
+                        <span className="shrink-0 px-1 py-0.5 rounded text-[10px] leading-none bg-accent/10 text-accent">ETF</span>
+                      )}
+                      {r.asset_type === 'index' && (
+                        <span className="shrink-0 px-1 py-0.5 rounded text-[10px] leading-none bg-sky-500/10 text-sky-400">指数</span>
+                      )}
+                      {(() => {
+                        const b = boardTag(r.symbol)
+                        return b && (
+                          <span className={`shrink-0 px-1 py-0.5 rounded text-[10px] leading-none border ${b.color}`}>{b.label}</span>
+                        )
+                      })()}
+                    </span>
+                  </button>
+                  {inWatchlist ? (
+                    // 已加自选: 对勾标识 + 分组勾选面板, 可继续加入/移出其他分组
+                    // (走 members 端点, 不重排列表、不覆盖备注)
+                    <span className="flex shrink-0 items-center gap-1">
+                      <span
+                        className="inline-flex p-1 text-accent/70"
+                        title="已加自选"
+                        aria-label="已加自选"
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                      </span>
+                      <WatchlistGroupPicker
+                        groups={groups}
+                        groupIds={entryGids}
+                        symbol={r.symbol}
+                        disabled={memberPending}
+                        onToggleMember={onToggleMember}
+                      />
+                    </span>
+                  ) : (
+                    // 未加自选: + 一键加入当前分组页签 (全部/未分组页签下加为未分组);
+                    // 文件夹图标展开分组菜单, 显式选择目标分组
+                    <span className="flex shrink-0 items-center gap-0.5">
+                      <button
+                        type="button"
+                        onClick={event => { event.stopPropagation(); onAdd(r.symbol, preferredGroupId ?? null) }}
+                        disabled={addPending}
+                        className="shrink-0 rounded p-1 text-muted transition-colors hover:bg-accent/10 hover:text-accent disabled:opacity-50 cursor-pointer"
+                        title={
+                          preferredGroupId
+                            ? `加入自选 · 当前分组「${groups.find(g => g.id === preferredGroupId)?.name ?? ''}」`
+                            : '加入自选 (未分组)'
+                        }
+                        aria-label={`快速加入自选 ${r.symbol}`}
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                      </button>
+                      <WatchlistAddMenu
+                        onSelect={groupId => onAdd(r.symbol, groupId)}
+                        preferredGroupId={preferredGroupId}
+                        disabled={addPending}
+                        triggerClassName="shrink-0 rounded p-1 text-muted transition-colors hover:bg-accent/10 hover:text-accent disabled:opacity-50"
+                        title="展开分组, 选择要加入的自选分组"
+                      >
+                        <FolderPlus className="h-3.5 w-3.5" />
+                      </WatchlistAddMenu>
+                    </span>
+                  )}
+                </div>
+              )
+            })}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   )
 }
 
@@ -261,7 +417,7 @@ function StockSearchBox({
 // 视觉: 内圈实心点 + 外圈 animate-ping 扩散晕, 语义=「在线/活动」。
 // 配色用 accent (电光蓝) 而非绿/红: 项目设计规范规定红绿仅用于价格/K线,
 // UI 状态用 accent, 避免与 A 股涨跌色混淆。
-// 全市场模式 (Starter+) 不显示 —— 全部都在监控, 标记无信息量。
+// 全市场模式不显示 —— 全部都在监控, 标记无信息量。
 function RealtimeDot({ title = '实时监控中' }: { title?: string }) {
   return (
     <span
@@ -316,6 +472,10 @@ const StockCard = React.memo(function StockCard({
   onToggleExpand,
   onDimensionClick,
   isMonitored,
+  active,
+  groups,
+  onToggleMember,
+  groupChangePending,
 }: {
   r: any
   candleRows: KlineRow[]
@@ -330,6 +490,11 @@ const StockCard = React.memo(function StockCard({
   onToggleExpand: (key: string) => void
   onDimensionClick: (target: DimensionMembersTarget) => void
   isMonitored?: boolean
+  /** 正在 K 线弹窗预览中 → 高亮卡片 */
+  active?: boolean
+  groups: WatchlistGroup[]
+  onToggleMember: (symbol: string, groupId: string, member: boolean) => void
+  groupChangePending: boolean
 }) {
   const board = boardTag(r.symbol)
   const price = r.rt_price ?? r.close
@@ -352,13 +517,13 @@ const StockCard = React.memo(function StockCard({
 
   return (
     <div
-      className={`relative rounded-lg border border-border bg-surface hover:border-border/80 transition-all duration-200 group cursor-pointer overflow-hidden ${bgGlow}`}
+      className={`relative rounded-lg border border-border bg-surface hover:border-border/80 transition-all duration-200 group cursor-pointer overflow-hidden ${bgGlow} ${active ? 'ring-2 ring-accent/60' : ''}`}
       onClick={() => onPreview(r.symbol, name ?? '')}
     >
       {/* 左侧彩色指示条 */}
       <div className={`absolute left-0 top-0 bottom-0 w-[3px] rounded-l-lg ${barColor}`} />
 
-      {/* 删除按钮 / 确认区 */}
+      {/* 分组与删除入口 */}
       <div className="absolute top-1.5 right-1.5 z-10">
         {isConfirming ? (
           <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
@@ -373,20 +538,29 @@ const StockCard = React.memo(function StockCard({
             </button>
           </div>
         ) : (
-          <button
-            onClick={e => { e.stopPropagation(); onRequestRemove(r.symbol) }}
-            className="opacity-0 group-hover:opacity-100 text-muted hover:text-danger transition-all duration-150 p-0.5 rounded hover:bg-elevated"
-            aria-label="移除"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </button>
+          <div className="flex items-center gap-0.5" onClick={e => e.stopPropagation()}>
+            <WatchlistGroupPicker
+              groups={groups}
+              groupIds={r.group_ids ?? []}
+              symbol={r.symbol}
+              disabled={groupChangePending}
+              onToggleMember={onToggleMember}
+            />
+            <button
+              onClick={() => onRequestRemove(r.symbol)}
+              className="opacity-0 group-hover:opacity-100 text-muted hover:text-danger transition-all duration-150 p-0.5 rounded hover:bg-elevated"
+              aria-label="移除"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
         )}
       </div>
 
       {/* 卡片内容 */}
       <div className="pl-4 pr-2.5 pt-2.5 pb-0">
         {/* 第一行: 代码 + 名称 + 板块标识 */}
-        <div className="flex items-center gap-1.5 min-w-0 mb-2">
+        <div className="flex items-center gap-1.5 min-w-0 mb-2 pr-8">
           <span className="shrink-0 font-mono text-foreground text-xs tracking-wide">
             {r.symbol}
           </span>
@@ -413,7 +587,7 @@ const StockCard = React.memo(function StockCard({
           </span>
           {pct != null && (
             <span className={`shrink-0 inline-flex items-center px-1.5 py-[2px] rounded text-[11px] tabular-nums ${pctBg}`}>
-              {isUp ? '+' : ''}{pct.toFixed(2)}%
+              {fmtPct(pct)}
             </span>
           )}
         </div>
@@ -437,7 +611,7 @@ const StockCard = React.memo(function StockCard({
 
             return (
               <span key={col.id} title={col.label}>
-                <span className="text-secondary">{fieldName}</span>
+                <span className="text-secondary">{col.label}</span>
                 <span className="font-mono ml-0.5">
                   {renderExtValue(
                     val,
@@ -487,6 +661,10 @@ export function Watchlist() {
   const [viewMode, setViewMode] = useState<'table' | 'card'>(() => {
     return (storage.watchlistView.get('table') as 'table' | 'card')
   })
+  // 分组卡片总览: 临时整页模式, 不持久化; 关闭(含刷新)后回到原视图设置
+  const [groupCardsOpen, setGroupCardsOpen] = useState(false)
+  // 分组统计条: 顶部图形化分组涨跌概览, 会话内开关, 不影响个股视图设置
+  const [groupStatsOpen, setGroupStatsOpen] = useState(false)
   const [dailyKChartVisible, setDailyKChartVisible] = useState(() => {
     return storage.watchlistCandle.get(true)
   })
@@ -498,33 +676,20 @@ export function Watchlist() {
   const [columns, setColumns] = useState<ColumnConfig[]>([...BUILTIN_COLUMNS])
   const [customizerOpen, setCustomizerOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
-  const [ocrAvailable, setOcrAvailable] = useState<boolean | null>(null)
-  const [ocrInstallHint, setOcrInstallHint] = useState('')
+  const [searchParams] = useSearchParams()
+  const initialGroup = (searchParams.get('group') as WatchlistGroupFilter | null) ?? 'all'
+  const [selectedGroup, setSelectedGroup] = useState<WatchlistGroupFilter>(initialGroup)
+  // URL ?group= 变化时同步选中分组 (侧边栏二级菜单切换分组时触发)
+  useEffect(() => {
+    const g = (searchParams.get('group') as WatchlistGroupFilter | null) ?? 'all'
+    setSelectedGroup(g)
+  }, [searchParams])
   const columnsLoaded = useRef(false)
 
   useEffect(() => {
     if (columnsLoaded.current) return
     columnsLoaded.current = true
     loadColumnConfig().then(setColumns)
-  }, [])
-
-  useEffect(() => {
-    let cancelled = false
-    void api.watchlistOcrStatus().then(
-      res => {
-        if (cancelled) return
-        setOcrAvailable(res.available)
-        if (!res.available) setOcrInstallHint(getOcrInstallHint())
-      },
-      () => {
-        if (cancelled) return
-        setOcrAvailable(false)
-        setOcrInstallHint(getOcrInstallHint())
-      },
-    )
-    return () => {
-      cancelled = true
-    }
   }, [])
 
   const handleColumnsChange = useCallback((next: ColumnConfig[]) => {
@@ -553,7 +718,7 @@ export function Watchlist() {
   )
   // 分时列渲染配置（宽高, 来自列定制, 已钳制边界）
   const intradayResolved = useMemo(() => resolveIntradayConfig(intradayColumn?.intradayConfig), [intradayColumn])
-  // 分时图需 Pro+ (kline.minute.batch), 低档用户开了列也不拉数据
+  // 分时图依赖分钟K批量数据 (kline.minute.batch), 无数据时开了列也不拉
   const caps = useCapabilities()
   const hasMinuteBatch = !!caps.data?.capabilities?.['kline.minute.batch']
   const intradayVisible = !!intradayColumn && hasMinuteBatch && intradayChartVisible
@@ -567,11 +732,19 @@ export function Watchlist() {
   const extColumnsParam = useMemo(() => buildExtColumnsParam(columns), [columns])
 
   const toggleView = useCallback(() => {
+    setGroupCardsOpen(false)
     setViewMode(v => {
       const next = v === 'table' ? 'card' : 'table'
       storage.watchlistView.set(next)
       return next
     })
+  }, [])
+  // 分组卡片: 整页临时展示, 开关不触碰个股视图设置
+  const toggleGroupView = useCallback(() => {
+    setGroupCardsOpen(open => !open)
+  }, [])
+  const toggleGroupStats = useCallback(() => {
+    setGroupStatsOpen(open => !open)
   }, [])
   const toggleDailyKChart = useCallback(() => {
     setDailyKChartVisible(v => {
@@ -589,11 +762,14 @@ export function Watchlist() {
   }, [])
   const [previewSymbol, setPreviewSymbol] = useState<string | null>(null)
   const [previewName, setPreviewName] = useState<string>('')
+  // 切股导航: 默认用 previewNavItems(自选列表); 从成分弹窗打开时用成分列表覆盖
+  const [previewNavList, setPreviewNavList] = useState<NavItem[]>([])
   const [dimensionTarget, setDimensionTarget] = useState<DimensionMembersTarget | null>(null)
   const [expandedCells, setExpandedCells] = useState<Set<string>>(new Set())
   const closePreview = useCallback(() => {
     setPreviewSymbol(null)
     setPreviewName('')
+    setPreviewNavList([])
   }, [])
 
   const handleToggleExpand = useCallback((cellKey: string) => {
@@ -609,6 +785,26 @@ export function Watchlist() {
     queryKey: QK.watchlist,
     queryFn: api.watchlistList,
   })
+
+  const groupList = useQuery({
+    queryKey: QK.watchlistGroups,
+    queryFn: api.watchlistGroups,
+  })
+  const groups = groupList.data?.groups ?? []
+  const activeGroupId = selectedGroup === 'all' || selectedGroup === 'ungrouped'
+    ? null
+    : selectedGroup
+
+  useEffect(() => {
+    if (
+      selectedGroup !== 'all'
+      && selectedGroup !== 'ungrouped'
+      && groupList.isSuccess
+      && !groups.some(group => group.id === selectedGroup)
+    ) {
+      setSelectedGroup('all')
+    }
+  }, [groupList.isSuccess, groups, selectedGroup])
 
   // enriched 数据 — 传入 ext_columns 参数
   const enriched = useQuery({
@@ -631,38 +827,124 @@ export function Watchlist() {
   const quoteStatus = useQuoteStatus()
   const realtimeRunning = quoteStatus.data?.running ?? false
 
-  // 批量日k数据 (天数由列配置决定)
+  // 批量日k数据 (天数由列配置决定; 分组卡片视图不展示蜡烛, 挂起请求)
   const klineBatch = useQuery({
     queryKey: QK.watchlistKlineBatch(`${symbolsKey}|${candleDays}`),
     queryFn: () => api.klineDailyBatch(symbols, candleDays),
-    enabled: dailyKVisible && symbols.length > 0,
+    enabled: dailyKVisible && symbols.length > 0 && !groupCardsOpen,
     staleTime: 5 * 60_000,  // 5 分钟内不重请求
   })
 
-  const klineData = dailyKVisible ? (klineBatch.data?.data ?? {}) : {}
+  // 当日蜡烛实时修补: 历史 K 线按 staleTime 周期拉取 (见 queryKeys 注释), 最后一根
+  // 蜡烛用每 tick 刷新的 enriched 当日 OHLC 前端覆盖/追加, 蜡烛随实时行情跳动, 零额外请求。
+  const klineData = useMemo(() => {
+    const base = dailyKVisible ? (klineBatch.data?.data ?? {}) : {}
+    const liveRows = enriched.data?.rows
+    const asOf = enriched.data?.as_of
+    if (!dailyKVisible || !liveRows?.length || !asOf) return base
+    const liveBySymbol = new Map<string, any>(liveRows.map((r: any) => [r.symbol, r]))
+    const patched: Record<string, KlineRow[]> = {}
+    for (const sym of Object.keys(base)) {
+      const arr = base[sym]
+      if (!Array.isArray(arr) || arr.length === 0) { patched[sym] = arr; continue }
+      const live = liveBySymbol.get(sym)
+      const { open, high, low, close } = live ?? {}
+      if (open == null || high == null || low == null || close == null) { patched[sym] = arr; continue }
+      const last = arr[arr.length - 1]
+      if (last.date === asOf) {
+        patched[sym] = [...arr.slice(0, -1), { ...last, open, high, low, close }]
+      } else if (last.date < asOf) {
+        patched[sym] = [...arr, { date: asOf, open, high, low, close }]
+      } else {
+        patched[sym] = arr
+      }
+    }
+    return patched
+  }, [dailyKVisible, klineBatch.data, enriched.data])
 
-  // 批量分时数据 (Pro+ 用户, 列可见时才拉)
+  // 批量分时数据 (有分钟K批量能力时, 列可见才拉)
   // 刷新策略: 仅当实时行情运行 且 用户在实时监控设置里开启 minute_intraday_refresh 时
   // 按用户设定的间隔轮询 (不接 SSE 高频, 避免每秒拉 TickFlow 触限流); 与 Screener / 设置卡片描述一致。
   const { data: prefsData } = usePreferences()
   const intradayRefreshEnabled = prefsData?.minute_intraday_refresh ?? false
   const intradayRefreshInterval = prefsData?.minute_intraday_refresh_interval ?? 6
+  // 视口感知: 虚拟器渲染中的 symbol 集合 (可见 + overscan 缓冲), 由下方虚拟器
+  // 区域的 effect 写入; null = 未就绪/非虚拟化视图, 沿用全列表。首轮全量播种
+  // 缓存 (queryFn 在挂载时先于 ref 填充执行), 之后各轮只拉视口集合。
+  const minuteRequestSymbolsRef = useRef<string[] | null>(null)
   const minuteBatch = useQuery({
     queryKey: QK.minuteBatch(minuteSymbolsKey),
-    queryFn: () => api.klineMinuteBatch(minuteSymbols),
-    enabled: intradayVisible && minuteSymbols.length > 0,
+    // 增量轮询 (prefer_local): 读缓存以最后一根为 since 只拉新增, 本地合并为
+    // 完整序列; 全量分钟健康时服务端零补拉, 不健康时也只增量。
+    // 请求集合 = 视口内 symbol (缓存按 symbol upsert, 视口外保留旧序列)
+    queryFn: () => {
+      const reqSymbols = minuteRequestSymbolsRef.current ?? minuteSymbols
+      return fetchMinuteBatchIncremental(qc, QK.minuteBatch(minuteSymbolsKey), reqSymbols, true)
+    },
+    enabled: intradayVisible && minuteSymbols.length > 0 && !groupCardsOpen,
     staleTime: 10_000,
-    refetchInterval: (intradayRefreshEnabled && realtimeRunning) ? intradayRefreshInterval * 1000 : false,
+    // SSE tick 新鲜 (enriched 10s 内被行情推送刷新过) → 分时图已由下方续画本地
+    // 跳动, 轮询降为 30s 兜底校准; tick 断流时回到用户设定间隔
+    refetchInterval: () => {
+      if (!(intradayRefreshEnabled && realtimeRunning)) return false
+      const tickFresh = Date.now() - enriched.dataUpdatedAt < 10_000
+      return tickFresh ? 30_000 : intradayRefreshInterval * 1000
+    },
   })
-  const minuteData = intradayVisible ? (minuteBatch.data?.data ?? {}) : {}
+
+  // 分时图 SSE 续画: enriched 行情列每 tick 刷新 (SSE 触发), 前端本地续写分钟序列
+  // 的最后一根 / 分钟滚动追加新K — 轮询间隔内分时图也随实时价跳动, 零额外请求。
+  // 纯视图叠加不写回缓存: 轮询拉回的服务端定版K始终是权威值, 覆盖续画值。
+  const minuteData = useMemo(() => {
+    const base: Record<string, MinuteKlineRow[]> = intradayVisible ? (minuteBatch.data?.data ?? {}) : {}
+    const liveRows = enriched.data?.rows
+    if (!intradayVisible || !liveRows?.length) return base
+    const liveBySymbol = new Map<string, any>(liveRows.map((r: any) => [r.symbol, r]))
+    // 仅连续竞价时段续画 (9:31-11:30, 13:01-15:00); 收盘后 rt_price 即收盘价无需续写
+    const now = new Date()
+    const hh = now.getHours(), mm = now.getMinutes()
+    const inSession =
+      (hh === 9 && mm >= 31) || hh === 10 ||
+      (hh === 11 && mm <= 30) || (hh === 13 && mm >= 1) || hh === 14
+    if (!inSession) return base
+    // 与服务端同构的 naive 北京时间戳 (手工拼本地时间, 不能用 toISOString — 那是 UTC)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const barTs = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(hh)}:${pad(mm)}:00`
+    const patched: Record<string, MinuteKlineRow[]> = {}
+    for (const sym of Object.keys(base)) {
+      const arr = base[sym]
+      if (!Array.isArray(arr) || arr.length === 0) { patched[sym] = arr; continue }
+      const live = liveBySymbol.get(sym)
+      const price = live?.rt_price ?? live?.close
+      if (typeof price !== 'number' || !Number.isFinite(price)) { patched[sym] = arr; continue }
+      const last = arr[arr.length - 1]
+      if (last.datetime === barTs) {
+        patched[sym] = [...arr.slice(0, -1), {
+          ...last,
+          close: price,
+          high: Math.max(last.high, price),
+          low: Math.min(last.low, price),
+        }]
+      } else if (barTs > last.datetime) {
+        patched[sym] = [...arr, {
+          datetime: barTs, open: price, high: price, low: price, close: price,
+          volume: 0, amount: 0,   // 量/额由下一轮轮询定版覆盖
+        }]
+      } else {
+        patched[sym] = arr   // 轮询数据已新于本地时钟 (钟差兜底), 不动
+      }
+    }
+    return patched
+  }, [intradayVisible, minuteBatch.data, enriched.data])
 
   const addMutation = useMutation({
-    mutationFn: (sym: string) => api.watchlistAdd(sym),
+    mutationFn: ({ symbol, groupId }: { symbol: string; groupId: string | null }) =>
+      api.watchlistAdd(symbol, '', groupId),
     onSuccess: (data) => {
       qc.setQueryData(QK.watchlist, data)
       qc.invalidateQueries({ queryKey: QK.watchlist })
       qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
-      qc.invalidateQueries({ queryKey: ['watchlist-kline-batch'] })
+      qc.invalidateQueries({ queryKey: ['kline-batch'] })
     },
   })
 
@@ -677,7 +959,7 @@ export function Watchlist() {
       // 2. 清除 list 缓存，触发后台 refetch
       qc.invalidateQueries({ queryKey: QK.watchlist })
       qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
-      qc.invalidateQueries({ queryKey: ['watchlist-kline-batch'] })
+      qc.invalidateQueries({ queryKey: ['kline-batch'] })
     },
   })
 
@@ -687,7 +969,7 @@ export function Watchlist() {
       qc.setQueryData(QK.watchlist, data)
       qc.invalidateQueries({ queryKey: QK.watchlist })
       qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
-      qc.invalidateQueries({ queryKey: ['watchlist-kline-batch'] })
+      qc.invalidateQueries({ queryKey: ['kline-batch'] })
       qc.invalidateQueries({ queryKey: QK.preferences })
       qc.invalidateQueries({ queryKey: QK.quoteStatus })
     },
@@ -701,8 +983,54 @@ export function Watchlist() {
       qc.setQueryData(['watchlist-enriched', extColumnsParam], { rows: [], as_of: null, elapsed_ms: 0 })
       qc.invalidateQueries({ queryKey: QK.watchlist })
       qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
-      qc.invalidateQueries({ queryKey: ['watchlist-kline-batch'] })
+      qc.invalidateQueries({ queryKey: ['kline-batch'] })
     },
+  })
+
+  const createGroup = useMutation({
+    mutationFn: ({ name, color }: { name: string; color: WatchlistGroupColor }) =>
+      api.watchlistGroupCreate(name, color),
+    onSuccess: data => {
+      qc.setQueryData(QK.watchlistGroups, { groups: data.groups })
+      setSelectedGroup(data.group.id)
+    },
+  })
+
+  const renameGroup = useMutation({
+    mutationFn: ({ groupId, name, color }: { groupId: string; name: string; color: WatchlistGroupColor }) =>
+      api.watchlistGroupRename(groupId, name, color),
+    onSuccess: data => qc.setQueryData(QK.watchlistGroups, data),
+  })
+
+  const reorderGroup = useMutation({
+    mutationFn: (orderedIds: string[]) => api.watchlistGroupReorder(orderedIds),
+    onSuccess: data => qc.setQueryData(QK.watchlistGroups, data),
+  })
+
+  const deleteGroup = useMutation({
+    mutationFn: (groupId: string) => api.watchlistGroupDelete(groupId),
+    onSuccess: (data, groupId) => {
+      qc.setQueryData(QK.watchlistGroups, { groups: data.groups })
+      qc.setQueryData(QK.watchlist, { symbols: data.symbols })
+      if (selectedGroup === groupId) setSelectedGroup('all')
+    },
+  })
+
+  const clearGroup = useMutation({
+    mutationFn: (groupId: string) => api.watchlistGroupClear(groupId),
+    onSuccess: data => qc.setQueryData(QK.watchlist, data),
+  })
+
+  // 多组并存: 勾选加入 / 取消移出 (仅影响该分组, 标的保留在自选中)
+  const addGroupMember = useMutation({
+    mutationFn: ({ symbol, groupId }: { symbol: string; groupId: string }) =>
+      api.watchlistGroupAddMember(groupId, symbol),
+    onSuccess: data => qc.setQueryData(QK.watchlist, data),
+  })
+  const removeGroupMember = useMutation({
+    mutationFn: ({ symbol, groupId }: { symbol: string; groupId: string }) =>
+      api.watchlistGroupRemoveMember(groupId, symbol),
+    onSuccess: data => qc.setQueryData(QK.watchlist, data),
   })
 
   // 二次确认状态
@@ -718,13 +1046,62 @@ export function Watchlist() {
   }, [remove])
   const handleCardCancelRemove = useCallback(() => setConfirmRemove(null), [])
   const handleCardRequestRemove = useCallback((sym: string) => setConfirmRemove(sym), [])
+  const handleToggleMember = useCallback((symbol: string, groupId: string, member: boolean) => {
+    if (member) addGroupMember.mutate({ symbol, groupId })
+    else removeGroupMember.mutate({ symbol, groupId })
+  }, [addGroupMember, removeGroupMember])
+  // 分组卡片总览下点击分组 tab / 卡片头 = 钻取该分组: 关闭总览并选中分组,
+  // 个股视图设置(table/card)保持用户原选择
+  const handleGroupSelect = useCallback((group: WatchlistGroupFilter) => {
+    setSelectedGroup(group)
+    setGroupCardsOpen(false)
+  }, [])
 
-  const allSymbols = list.data?.symbols?.map(s => s.symbol) ?? []
+  const listEntries = list.data?.symbols ?? []
+  const allSymbols = listEntries.map(s => s.symbol)
   const rows = enriched.data?.rows ?? []
+  const groupBySymbol = useMemo(
+    () => new Map(listEntries.map(entry => [entry.symbol, entry.group_ids ?? []])),
+    [listEntries],
+  )
+  // 分组等权平均涨跌幅 (实时优先 rt_pct, 收盘兜底 change_pct; 与表格同源)
+  const groupPcts = useMemo(
+    () => computeGroupPcts(
+      listEntries,
+      new Map(rows.map((r: any) => [r.symbol as string, r])),
+    ),
+    [listEntries, rows],
+  )
+  // 分组「指标 + 排序 + 卡片显示项」配置: 分组统计条与分组卡片共享同一份持久化设置
+  const [groupStatsConfig, setGroupStatsConfig] = useState(loadGroupStatsConfig)
+  const updateGroupStatsConfig = useCallback((patch: GroupStatsConfigPatch) => {
+    setGroupStatsConfig(prev => {
+      const next = { ...prev, ...patch }
+      storage.watchlistGroupStats.set(next)
+      return next
+    })
+  }, [])
+  const groupCounts = useMemo(() => {
+    // 多组并存: 一股计入每个所属分组的计数; 不属于任何分组才计未分组
+    const counts: Record<string, number> = { ungrouped: 0 }
+    for (const entry of listEntries) {
+      const gids = entry.group_ids ?? []
+      if (gids.length === 0) counts.ungrouped += 1
+      else for (const gid of gids) counts[gid] = (counts[gid] ?? 0) + 1
+    }
+    return counts
+  }, [listEntries])
+  const rowsInSelectedGroup = useMemo(() => {
+    const rowsWithGroup = rows.map(row => ({ ...row, group_ids: groupBySymbol.get(row.symbol) ?? [] }))
+    if (selectedGroup === 'all') return rowsWithGroup
+    if (selectedGroup === 'ungrouped') return rowsWithGroup.filter(row => row.group_ids.length === 0)
+    return rowsWithGroup.filter(row => row.group_ids.includes(selectedGroup))
+  }, [groupBySymbol, rows, selectedGroup])
+  const watchlistContentLoading = list.isLoading || (allSymbols.length > 0 && enriched.isLoading)
 
   // 实时监控圆点: 仅 Free/低档 "按自选股实时监控" 模式 (mode === 'watchlist') 下显示;
-  // Starter+ 全市场模式 (mode === 'full_market') 全部标的都在监控, 标圆点无意义, 故不显示。
-  // 后端 Free 档实际只监控自选页前 N 个 (N = watchlist_symbol_count), 顺序与 allSymbols 一致。
+  // 全市场模式 (mode === 'full_market') 全部标的都在监控, 标圆点无意义, 故不显示。
+  // 后端自选实时模式实际只监控自选页前 N 个 (N = watchlist_symbol_count), 顺序与 allSymbols 一致。
   const realtimeMode = quoteStatus.data?.mode
   const watchlistMonitoredCount = quoteStatus.data?.watchlist_symbol_count ?? 0
   const showRealtimeDot = realtimeRunning && realtimeMode === 'watchlist'
@@ -739,9 +1116,10 @@ export function Watchlist() {
   const [filters, setFilters] = useState<Record<string, { min?: string; max?: string; text?: string }>>({})
 
   // 板块筛选（持久化）
+  // 兼容: 旧存储不含 ETF 键 → 加载时补上，保持 ETF 行默认可见
   const [boardFilter, setBoardFilter] = useState<Set<string>>(() => {
     const saved = storage.watchlistBoardFilter.get([])
-    return saved.length > 0 ? new Set(saved) : new Set(BOARDS) // 默认全选
+    return saved.length > 0 ? new Set([...saved, ETF_BOARD]) : new Set(BOARD_OPTIONS) // 默认全选
   })
   const persistBoardFilter = useCallback((next: Set<string>) => {
     setBoardFilter(next)
@@ -757,6 +1135,15 @@ export function Watchlist() {
       return next
     })
   }, [persistBoardFilter])
+
+  // 排除 ST (含 *ST/S*ST 等变体, 按简称含 "ST" 判定), 默认关闭并持久化
+  const [excludeST, setExcludeST] = useState(() => storage.watchlistExcludeST.get(false))
+  const toggleExcludeST = useCallback(() => {
+    setExcludeST(prev => {
+      storage.watchlistExcludeST.set(!prev)
+      return !prev
+    })
+  }, [])
 
   const updateFilter = useCallback((colId: string, patch: { min?: string; max?: string; text?: string }) => {
     setFilters(prev => {
@@ -774,7 +1161,9 @@ export function Watchlist() {
 
   const resetAllFilters = useCallback(() => {
     setFilters({})
-    persistBoardFilter(new Set(BOARDS))
+    persistBoardFilter(new Set(BOARD_OPTIONS))
+    setExcludeST(false)
+    storage.watchlistExcludeST.set(false)
   }, [persistBoardFilter])
 
   // 可筛选的内置列
@@ -799,14 +1188,19 @@ export function Watchlist() {
   // 筛选 + 排序
   const filteredRows = useMemo(() => {
     // 板块筛选（全选时跳过）
-    let result = rows
-    if (boardFilter.size > 0 && boardFilter.size < BOARDS.length) {
+    let result = rowsInSelectedGroup
+    if (boardFilter.size > 0 && boardFilter.size < BOARD_OPTIONS.length) {
       result = result.filter(r => {
-        // 非股票 (指数/ETF) 无板块语义, 不受板块筛选影响 (顺带修复 ETF 行被误过滤)
+        if (r.asset_type === 'etf') return boardFilter.has(ETF_BOARD)
+        // 其他非股票 (指数等) 无板块语义, 不受板块筛选影响
         if (r.asset_type && r.asset_type !== 'stock') return true
         const board = getBoardType(r.symbol)
         return board != null && boardFilter.has(board)
       })
+    }
+    // 排除 ST: 按简称判定 (ST/*ST/S*ST 均含 "ST"); 非股票名称不含该标记, 天然不受影响
+    if (excludeST) {
+      result = result.filter(r => !((r.rt_name ?? r.name ?? '').toUpperCase().includes('ST')))
     }
     // 数值/文本筛选
     const activeFilters = Object.entries(filters).filter(([, v]) => v.min || v.max || v.text)
@@ -828,23 +1222,37 @@ export function Watchlist() {
       })
     }
     return result
-  }, [rows, filters, columns, boardFilter])
+  }, [rowsInSelectedGroup, filters, columns, boardFilter, excludeST])
 
   const activeFilterCount = Object.values(filters).filter(v => v.min || v.max || v.text).length
-  const hasBoardFilter = boardFilter.size > 0 && boardFilter.size < BOARDS.length
-  const hasActiveFilters = activeFilterCount > 0 || hasBoardFilter
+  const hasBoardFilter = boardFilter.size > 0 && boardFilter.size < BOARD_OPTIONS.length
+  const hasActiveFilters = activeFilterCount > 0 || hasBoardFilter || excludeST
 
-  // 排序（复用共享三态排序 hook）
-  const { sort, toggle: handleSortToggle, sortRows } = useTableSort()
+  // 排序（复用共享三态排序 hook）。分时列按「最新分钟收盘 vs 昨收」排序（分时图最后一点同口径），
+  // 其余列走共享取值；眼睛关闭时不拉分钟数据，取值为 null → 保持原序。
+  const getWatchlistSortValue = useCallback((r: any, col: ColumnConfig) => {
+    if (col.source.type === 'builtin' && col.source.key === 'intraday') {
+      return getIntradaySortValue(r, minuteData[r.symbol])
+    }
+    return getSortValue(r, col)
+  }, [minuteData])
+  const { sort, toggle: handleSortToggle, sortRows } = useTableSort(getWatchlistSortValue)
 
   const sortedRows = useMemo(
     () => sortRows(filteredRows, columns),
     [filteredRows, sortRows, columns],
   )
 
+  // 切股导航列表: 按列表当前展示顺序 (与 sortedRows 一致, 排序/筛选后行序随之变化)。
+  // 弹窗未打开时跳过构建 — sortedRows 随行情 tick 重建, 避免无谓分配。
+  const previewNavItems = useMemo(
+    () => previewSymbol ? toNavItems(sortedRows) : [],
+    [previewSymbol, sortedRows],
+  )
+
   const cardColumns = useCardColumnCount()
   const cardGridRef = useRef<HTMLDivElement>(null)
-  const virtualizeCards = viewMode === 'card' && sortedRows.length > VIRTUAL_LIST_THRESHOLD
+  const virtualizeCards = viewMode === 'card' && !groupCardsOpen && sortedRows.length > VIRTUAL_LIST_THRESHOLD
   const cardRowCount = Math.ceil(sortedRows.length / cardColumns)
   const { getScrollElement: getCardScrollElement, scrollMargin: cardScrollMargin } = useParentScroll(
     cardGridRef,
@@ -859,6 +1267,40 @@ export function Watchlist() {
     overscan: 3,
     scrollMargin: cardScrollMargin,
   })
+
+  // 视口感知 (数据层): 从虚拟器派生"正在渲染的 symbol" (可见 + overscan 缓冲,
+  // 滚动前已就绪)。非虚拟化视图 (小列表/表格/分组) 为 null → 沿用全列表。
+  // 每次渲染直读 getVirtualItems (滚动不换 deps, 不能 useMemo), 副作用集中在 effect。
+  const visibleCardSymbols = (() => {
+    if (!virtualizeCards) return null
+    // 与 minuteSymbols 同口径: 剔除指数 (minute-batch 契约只收股票/ETF)
+    const scope = new Set(minuteSymbols as string[])
+    const items = cardRowVirtualizer.getVirtualItems()
+    const out: string[] = []
+    for (const item of items) {
+      for (let i = item.index * cardColumns; i < (item.index + 1) * cardColumns && i < sortedRows.length; i++) {
+        const s = (sortedRows[i] as any)?.symbol
+        if (typeof s === 'string' && scope.has(s)) out.push(s)
+      }
+    }
+    return out.length ? out : null
+  })()
+  const minuteVisibleKey = visibleCardSymbols?.join(',') ?? ''
+  const lastVisibleKeyRef = useRef<string | null>(null)
+  useEffect(() => {
+    minuteRequestSymbolsRef.current = visibleCardSymbols
+    if (!minuteVisibleKey) return
+    if (lastVisibleKeyRef.current === minuteVisibleKey) return
+    const prevKey = lastVisibleKeyRef.current
+    lastVisibleKeyRef.current = minuteVisibleKey
+    if (prevKey === null) return   // 首次: 挂载播种轮已按全列表发出, 不额外触发
+    // 视口集合变化 (滚动到新区段) → 防抖 300ms 补拉一次, 新滚入的 symbol 即时就绪
+    const t = setTimeout(() => {
+      qc.invalidateQueries({ queryKey: QK.minuteBatch(minuteSymbolsKey) })
+    }, 300)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [minuteVisibleKey, minuteSymbolsKey])
 
   // 可见的 ext 列（卡片视图使用）
   const visibleExtCols = useMemo(
@@ -875,8 +1317,8 @@ export function Watchlist() {
   )
 
   // "被筛选条件隐藏" 的个股数: 后端返回的行数 vs 经过前端筛选后的行数.
-  // rows.length 是后端实际返回 (含 pending 行), 减去 sortedRows (筛选后) 才是真正的筛选隐藏.
-  const hiddenCount = Math.max(0, rows.length - sortedRows.length)
+  // 分组切换不计入筛选隐藏，只比较当前分组内的数据。
+  const hiddenCount = Math.max(0, rowsInSelectedGroup.length - sortedRows.length)
 
   const renderStockCard = (r: any) => (
     <StockCard
@@ -894,6 +1336,10 @@ export function Watchlist() {
       onToggleExpand={handleToggleExpand}
       onDimensionClick={setDimensionTarget}
       isMonitored={monitoredSymbols.has(r.symbol)}
+      active={previewSymbol === r.symbol}
+      groups={groups}
+      onToggleMember={handleToggleMember}
+      groupChangePending={addGroupMember.isPending || removeGroupMember.isPending}
     />
   )
 
@@ -907,7 +1353,7 @@ export function Watchlist() {
             <span className="inline-flex items-baseline gap-0.5 px-2 py-0.5 rounded-md bg-elevated/70 text-[11px]">
               <span className="font-mono font-semibold text-secondary tabular-nums">{sortedRows.length}</span>
               <span className="text-muted/50">/</span>
-              <span className="font-mono text-muted tabular-nums">{allSymbols.length}</span>
+              <span className="font-mono text-muted tabular-nums">{rowsInSelectedGroup.length}</span>
               <span className="text-muted/60 ml-0.5">只</span>
             </span>
             {/* 数据未就绪提示: 自选了但 enriched 缓存未覆盖 (新股/冷门/新用户未同步), 指标全为 null */}
@@ -958,23 +1404,21 @@ export function Watchlist() {
             )}
             <StockSearchBox
               onPreview={(sym, name) => { setPreviewSymbol(sym); setPreviewName(name) }}
-              existingSymbols={allSymbols as string[]}
-              onAdd={(sym) => addMutation.mutate(sym)}
+              existingBySymbol={groupBySymbol}
+              groups={groups}
+              onAdd={(symbol, groupId) => addMutation.mutate({ symbol, groupId })}
+              onToggleMember={handleToggleMember}
+              preferredGroupId={activeGroupId}
+              addPending={addMutation.isPending}
+              memberPending={addGroupMember.isPending || removeGroupMember.isPending}
             />
             <button
-              onClick={() => {
-                if (ocrAvailable === false) return
-                setImportOpen(true)
-              }}
-              disabled={ocrAvailable === false}
-              className="inline-flex items-center justify-center h-8 w-8 rounded-btn bg-elevated hover:bg-elevated/80 text-secondary hover:text-foreground transition-colors duration-150 ease-smooth disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-elevated disabled:hover:text-secondary"
-              title={
-                ocrAvailable === false
-                  ? ocrInstallHint || 'OCR 不可用，请先安装 Tesseract'
-                  : '从截图导入自选'
-              }
+              onClick={() => setImportOpen(true)}
+              className="inline-flex items-center justify-center h-8 w-8 rounded-btn bg-elevated hover:bg-elevated/80 text-secondary hover:text-foreground transition-colors duration-150 ease-smooth"
+              title="批量导入自选（截图 / CSV / 粘贴代码）"
+              aria-label="批量导入自选"
             >
-              <ImagePlus className="h-4 w-4" />
+              <FileUp className="h-4 w-4" />
             </button>
             <div className="w-px h-5 bg-border" />
             {/* 视图 */}
@@ -984,6 +1428,34 @@ export function Watchlist() {
               title={viewMode === 'table' ? '卡片视图' : '列表视图'}
             >
               {viewMode === 'table' ? <LayoutGrid className="h-4 w-4" /> : <List className="h-4 w-4" />}
+            </button>
+            {/* 分组卡片视图 */}
+            <button
+              onClick={toggleGroupView}
+              aria-pressed={groupCardsOpen}
+              className={`inline-flex items-center justify-center h-8 w-8 rounded-btn transition-colors duration-150 ease-smooth ${
+                groupCardsOpen
+                  ? 'bg-accent/15 text-accent hover:bg-accent/25'
+                  : 'bg-elevated text-secondary hover:bg-elevated/80 hover:text-foreground'
+              }`}
+              title={groupCardsOpen ? '退出分组卡片' : '分组卡片视图'}
+              aria-label={groupCardsOpen ? '退出分组卡片' : '分组卡片视图'}
+            >
+              <Rows3 className="h-4 w-4" />
+            </button>
+            {/* 分组统计条 */}
+            <button
+              onClick={toggleGroupStats}
+              aria-pressed={groupStatsOpen}
+              className={`inline-flex items-center justify-center h-8 w-8 rounded-btn transition-colors duration-150 ease-smooth ${
+                groupStatsOpen
+                  ? 'bg-accent/15 text-accent hover:bg-accent/25'
+                  : 'bg-elevated text-secondary hover:bg-elevated/80 hover:text-foreground'
+              }`}
+              title={groupStatsOpen ? '收起分组统计' : '分组统计'}
+              aria-label={groupStatsOpen ? '收起分组统计' : '分组统计'}
+            >
+              <BarChart3 className="h-4 w-4" />
             </button>
             <div className="w-px h-5 bg-border" />
             {/* 自定义列 / 刷新 */}
@@ -1014,8 +1486,44 @@ export function Watchlist() {
                 </button>
               </>
             )}
+            {/* 扩展插槽: 自选页工具栏二开区 (无注册时不渲染) */}
+            <ExtensionSlot
+              name="watchlist.toolbar"
+              context={{
+                symbols: sortedRows.map((row: any) => row.symbol),
+                viewMode,
+                selectedGroup,
+                refresh: () => enriched.refetch(),
+              }}
+            />
           </div>
         }
+      />
+
+      {groupStatsOpen && (
+        <WatchlistGroupStatsBar
+          groups={groups}
+          counts={groupCounts}
+          pcts={groupPcts}
+          selected={selectedGroup}
+          onSelect={handleGroupSelect}
+          config={groupStatsConfig}
+          onConfigChange={updateGroupStatsConfig}
+        />
+      )}
+
+      <WatchlistGroupBar
+        groups={groups}
+        counts={groupCounts}
+        selected={selectedGroup}
+        total={allSymbols.length}
+        pcts={groupPcts}
+        onSelect={handleGroupSelect}
+        onCreate={(name, color) => createGroup.mutateAsync({ name, color }).then(() => undefined)}
+        onRename={(groupId, name, color) => renameGroup.mutateAsync({ groupId, name, color }).then(() => undefined)}
+        onDelete={groupId => deleteGroup.mutateAsync(groupId).then(() => undefined)}
+        onClearGroup={groupId => clearGroup.mutateAsync(groupId).then(() => undefined)}
+        onReorder={orderedIds => reorderGroup.mutateAsync(orderedIds).then(() => undefined)}
       />
 
       {/* 筛选栏 */}
@@ -1025,7 +1533,7 @@ export function Watchlist() {
           <div className="mb-2">
             <div className="text-[10px] text-muted uppercase tracking-wider mb-0.5">板块</div>
             <div className="flex flex-wrap gap-1">
-              {BOARDS.map(board => {
+              {BOARD_OPTIONS.map(board => {
                 const active = boardFilter.has(board)
                 return (
                   <button
@@ -1041,6 +1549,23 @@ export function Watchlist() {
                   </button>
                 )
               })}
+            </div>
+          </div>
+          {/* 排除 ST */}
+          <div className="mb-2">
+            <div className="text-[10px] text-muted uppercase tracking-wider mb-0.5">风险警示</div>
+            <div className="flex flex-wrap gap-1">
+              <button
+                onClick={toggleExcludeST}
+                className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+                  excludeST
+                    ? 'bg-accent/15 text-accent'
+                    : 'bg-elevated text-secondary hover:text-foreground hover:bg-elevated/80'
+                }`}
+                title="勾选后隐藏简称含 ST 标记的标的 (ST/*ST/S*ST)"
+              >
+                排除ST
+              </button>
             </div>
           </div>
           {COLUMN_GROUPS.map(cat => {
@@ -1094,14 +1619,34 @@ export function Watchlist() {
       <div className="flex-1 min-h-0 overflow-y-auto">
         <div className="px-5 py-3">
           {/* 列表 */}
-          {list.isLoading && <div className="text-sm text-muted">加载中…</div>}
-          {list.isError && <div className="text-sm text-danger">读取自选失败</div>}
-
-          {allSymbols.length === 0 ? (
+          {watchlistContentLoading ? (
+            <div className="text-sm text-muted">加载中…</div>
+          ) : list.isError ? (
+            <div className="text-sm text-danger">读取自选失败</div>
+          ) : enriched.isError ? (
+            <div className="text-sm text-danger">读取自选行情失败</div>
+          ) : allSymbols.length === 0 ? (
             <EmptyState
               icon={Star}
               title="自选股为空"
-              hint="点击右上角搜索添加标的，或点击图片图标从券商自选截图批量导入。"
+              hint="点击右上角搜索添加标的，或用导入按钮从券商自选 CSV / 截图批量导入、粘贴代码。"
+            />
+          ) : rowsInSelectedGroup.length === 0 ? (
+            <EmptyState
+              icon={FolderOpen}
+              title="该分组暂无标的"
+              hint="使用右上角搜索添加、通过股票旁的分组按钮移入，或用导入弹窗把整批标的并入本组。"
+            />
+          ) : groupCardsOpen ? (
+            <WatchlistGroupCards
+              groups={groups}
+              rows={rows}
+              groupBySymbol={groupBySymbol}
+              pcts={groupPcts}
+              onPreview={handleCardPreview}
+              onOpenGroup={handleGroupSelect}
+              config={groupStatsConfig}
+              onConfigChange={updateGroupStatsConfig}
             />
           ) : viewMode === 'table' ? (
             <StockDataTable
@@ -1110,14 +1655,15 @@ export function Watchlist() {
               headerSticky
               sort={sort}
               onSortToggle={handleSortToggle}
+              extraSortableKeys={INTRADAY_SORTABLE_KEYS}
               rowKey={(r: any) => r.symbol}
-              rowClassName={() => 'border-t border-border hover:bg-elevated/50 transition-colors duration-150 ease-smooth'}
+              rowClassName={(r: any) => cn('border-t border-border transition-colors duration-150 ease-smooth hover:bg-elevated/50', r.symbol === previewSymbol && 'bg-accent/10 hover:bg-accent/15')}
               // 日k列表头：标签 + 显示/隐藏眼睛按钮
               renderHeaderContent={(col) => {
                 if (col.source.type === 'builtin' && col.source.key === 'candle') {
                   return (
                     <span className="inline-flex items-center justify-center gap-1.5">
-                      <span>{col.label}</span>
+                      <span className="shrink-0 whitespace-nowrap">{col.label}</span>
                       <button
                         type="button"
                         onClick={(event) => { event.stopPropagation(); toggleDailyKChart() }}
@@ -1138,7 +1684,7 @@ export function Watchlist() {
                   const intradayAutoRefresh = intradayRefreshEnabled && realtimeRunning
                   return (
                     <span className="inline-flex items-center justify-center gap-1.5">
-                      <span>{col.label}</span>
+                      <span className="shrink-0 whitespace-nowrap">{col.label}</span>
                       <button
                         type="button"
                         onClick={(event) => { event.stopPropagation(); toggleIntradayChart() }}
@@ -1209,7 +1755,7 @@ export function Watchlist() {
                           ) : null}
                           {monitoredSymbols.has(r.symbol) && <span className="ml-2"><RealtimeDot /></span>}
                         </button>
-                        {/* 删除入口：默认减号图标，二次确认时替换为确定按钮 */}
+                        {/* 删除入口：从分组移除 + 从自选移除(二次确认) + 移到顶部 */}
                         <div className="ml-auto pl-1 shrink-0">
                           {confirmRemove === r.symbol ? (
                             <div className="flex items-center gap-1">
@@ -1228,11 +1774,29 @@ export function Watchlist() {
                             </div>
                           ) : (
                             <div className="flex items-center gap-1">
+                              <WatchlistGroupPicker
+                                groups={groups}
+                                groupIds={r.group_ids ?? []}
+                                symbol={r.symbol}
+                                disabled={addGroupMember.isPending || removeGroupMember.isPending}
+                                onToggleMember={handleToggleMember}
+                              />
+                              {selectedGroup !== 'all' && selectedGroup !== 'ungrouped' && r.group_ids?.includes(selectedGroup) && (
+                                <button
+                                  onClick={() => handleToggleMember(r.symbol, selectedGroup, false)}
+                                  disabled={addGroupMember.isPending || removeGroupMember.isPending}
+                                  className="p-0.5 text-muted hover:text-warning transition-colors duration-150 ease-smooth disabled:opacity-50"
+                                  aria-label="移出当前分组"
+                                  title="移出当前分组（仍保留在自选中）"
+                                >
+                                  <FolderMinus className="h-3.5 w-3.5" />
+                                </button>
+                              )}
                               <button
                                 onClick={() => setConfirmRemove(r.symbol)}
                                 className="p-0.5 text-muted hover:text-danger transition-colors duration-150 ease-smooth"
                                 aria-label="移除"
-                                title="移除"
+                                title="从自选移除"
                               >
                                 <Minus className="h-3.5 w-3.5" />
                               </button>
@@ -1415,19 +1979,29 @@ export function Watchlist() {
         symbol={previewSymbol}
         name={previewName}
         onClose={closePreview}
+        navList={previewNavList.length > 0 ? previewNavList : previewNavItems}
+        onNavigate={(sym, n) => { setPreviewSymbol(sym); setPreviewName(n ?? '') }}
       />
 
       <DimensionMembersDialog
         target={dimensionTarget}
         onClose={() => setDimensionTarget(null)}
-        onStockClick={(symbol, name) => {
+        onStockClick={(symbol, name, navList) => {
           setDimensionTarget(null)
           setPreviewSymbol(symbol)
           setPreviewName(name ?? '')
+          // 成分列表作为切股导航 (成员可能不在自选列表, 不能退回 previewNavItems)
+          setPreviewNavList(navList ?? previewNavItems)
         }}
       />
 
-      <WatchlistImportDialog open={importOpen} onClose={() => setImportOpen(false)} />
+      <WatchlistImportDialog
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        groupId={activeGroupId}
+        groups={groups}
+        existingBySymbol={groupBySymbol}
+      />
     </div>
   )
 }

@@ -128,34 +128,61 @@ class FactorColumnsResponse(BaseModel):
 
 @router.get("/factor/columns")
 def factor_columns():
-    """返回可用的因子列列表。"""
-    from app.backtest.factor import FACTOR_COLUMNS
-    return {"columns": FACTOR_COLUMNS}
+    """返回可用的因子列列表 (含运行期注册的自定义/复合因子)。"""
+    from app.factors.registry import all_factors, factor_columns_view
+
+    asset_order = {"stock": 0, "etf": 1}
+    asset_types = {
+        spec.id: sorted(
+            spec.asset_types,
+            key=lambda value: (asset_order.get(value, len(asset_order)), value),
+        )
+        for spec in all_factors()
+    }
+    columns = [
+        {**column, "asset_types": asset_types.get(str(column["id"]), [])}
+        for column in factor_columns_view()
+    ]
+    return {"columns": columns}
+
+
+def _guard_factor_asset_types(factor_names: list[str], asset_type: str) -> None:
+    from app.backtest.factor import validate_factor_asset_types
+
+    try:
+        validate_factor_asset_types(factor_names, asset_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class FactorBacktestRequest(BaseModel):
-    factor_name: str
+    factor_name: str = Field(..., min_length=1, max_length=64)
     symbols: list[str] | None = None
     start: date | None = None
     end: date | None = None
-    n_groups: int = 5
+    n_groups: int = Field(5, ge=2, le=10)
     rebalance: Literal["daily", "weekly", "monthly"] = "monthly"
     weight: Literal["equal", "factor_weight"] = "equal"
     fees_pct: float = 0.0002
     slippage_bps: float = 5.0
-    asset_type: str = "stock"
+    asset_type: Literal["stock", "etf"] = "stock"
 
 
 @router.post("/factor/run")
 def factor_run(req: FactorBacktestRequest, request: Request):
     """因子回测 — IC/IR 分析 + 分层回测。"""
     from app.backtest.factor import FactorBacktestService, FactorConfig
+    from app.factors.registry import factor_columns_view
+
+    if req.factor_name not in {item["id"] for item in factor_columns_view()}:
+        raise HTTPException(status_code=400, detail=f"不支持的因子: {req.factor_name}")
+    _guard_factor_asset_types([req.factor_name], req.asset_type)
 
     engine = _get_engine(request)
     svc = FactorBacktestService(engine)
 
     end = req.end or date.today()
-    start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
+    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
     symbols = req.symbols if req.symbols else None
     if symbols is not None and len(symbols) > FACTOR_MAX_SYMBOLS:
@@ -178,6 +205,140 @@ def factor_run(req: FactorBacktestRequest, request: Request):
     )
     result = svc.run(cfg)
     return asdict(result)
+
+
+class FactorBatchRequest(BaseModel):
+    factor_names: list[str] = Field(..., min_length=1, max_length=96)  # 目录 77 + 自定义余量
+    symbols: list[str] | None = None
+    start: date | None = None
+    end: date | None = None
+    n_groups: int = Field(5, ge=2, le=10)
+    rebalance: Literal["daily", "weekly", "monthly"] = "monthly"
+    weight: Literal["equal", "factor_weight"] = "equal"
+    fees_pct: float = 0.0002
+    slippage_bps: float = 5.0
+    asset_type: Literal["stock", "etf"] = "stock"
+
+
+@router.post("/factor/batch")
+def factor_batch(req: FactorBatchRequest, request: Request):
+    """批量筛选因子, 同一批次只加载并计算一次数据面板。"""
+    from app.backtest.factor import (
+        FactorBacktestService,
+        FactorBatchConfig,
+    )
+    from app.factors.registry import factor_columns_view
+
+    factor_names = list(dict.fromkeys(req.factor_names))
+    allowed = {item["id"] for item in factor_columns_view()}
+    invalid = [name for name in factor_names if name not in allowed]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"不支持的因子: {', '.join(invalid)}")
+    _guard_factor_asset_types(factor_names, req.asset_type)
+
+    end = req.end or date.today()
+    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
+    _guard_server_backtest_range(start, end)
+    symbols = req.symbols if req.symbols else None
+    if symbols is not None and len(symbols) > FACTOR_MAX_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"指定标的最多支持 {FACTOR_MAX_SYMBOLS} 只, 请缩小标的范围。",
+        )
+
+    svc = FactorBacktestService(_get_engine(request))
+    result = svc.run_batch(FactorBatchConfig(
+        factor_names=factor_names,
+        symbols=symbols,
+        start=start,
+        end=end,
+        n_groups=req.n_groups,
+        rebalance=req.rebalance,
+        weight=req.weight,
+        fees_pct=req.fees_pct,
+        slippage_bps=req.slippage_bps,
+        asset_type=req.asset_type,
+    ))
+    return asdict(result)
+
+
+# ================================================================
+# 研究候选方案
+# ================================================================
+
+class CandidateCreateRequest(BaseModel):
+    kind: Literal["factor", "strategy"]
+    name: str = Field(..., min_length=1, max_length=80)
+    source_id: str = Field(..., min_length=1, max_length=120)
+    config: dict = Field(default_factory=dict)
+    metrics: dict = Field(default_factory=dict)
+    data_as_of: date | None = None
+    status: Literal["pending", "validated", "rejected"] = "pending"
+
+
+class CandidateUpdateRequest(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=80)
+    status: Literal["pending", "validated", "rejected"] | None = None
+
+
+def _candidate_store():
+    from app.backtest.candidates import CandidateStore
+
+    return CandidateStore(settings.data_dir)
+
+
+def _raise_candidate_error(exc: Exception) -> None:
+    from app.backtest.candidates import CandidateValidationError
+
+    status_code = 400 if isinstance(exc, CandidateValidationError) else 500
+    raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
+@router.get("/candidates")
+def candidates_list():
+    try:
+        return {"items": _candidate_store().list()}
+    except Exception as exc:
+        _raise_candidate_error(exc)
+
+
+@router.post("/candidates")
+def candidate_create(req: CandidateCreateRequest):
+    try:
+        return _candidate_store().create(
+            kind=req.kind,
+            name=req.name,
+            source_id=req.source_id,
+            config=req.config,
+            metrics=req.metrics,
+            data_as_of=req.data_as_of.isoformat() if req.data_as_of else None,
+            status=req.status,
+        )
+    except Exception as exc:
+        _raise_candidate_error(exc)
+
+
+@router.patch("/candidates/{candidate_id}")
+def candidate_update(candidate_id: str, req: CandidateUpdateRequest):
+    if req.name is None and req.status is None:
+        raise HTTPException(status_code=400, detail="至少提供一个需要更新的字段")
+    try:
+        return _candidate_store().update(candidate_id, name=req.name, status=req.status)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="候选方案不存在") from exc
+    except Exception as exc:
+        _raise_candidate_error(exc)
+
+
+@router.delete("/candidates/{candidate_id}")
+def candidate_delete(candidate_id: str):
+    try:
+        _candidate_store().delete(candidate_id)
+        return {"ok": True}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="候选方案不存在") from exc
+    except Exception as exc:
+        _raise_candidate_error(exc)
 
 
 # ================================================================
@@ -210,6 +371,33 @@ class StrategyBacktestRequest(BaseModel):
     regime_filter: dict | None = None
 
 
+def _guard_minute_strategy_backtest(
+    request: Request, strategy_id: str, start: date, asset_type: str,
+) -> None:
+    """分钟策略回测入口守卫: 仅 A 股 + 本地分钟K覆盖检查 (fail-fast)。"""
+    engine = getattr(request.app.state, "strategy_engine", None)
+    if engine is None:
+        return
+    try:
+        s = engine.get(strategy_id)
+    except ValueError:
+        return
+    if s is None or s.execution_backend != "minute_filter":
+        return
+    if asset_type != "stock":
+        raise HTTPException(400, detail="分钟策略回测当前仅支持 A 股 (stock)")
+    earliest = request.app.state.repo.earliest_minute_date()
+    if earliest is None or start < earliest:
+        have = f"最早到 {earliest}, " if earliest else ""
+        raise HTTPException(
+            400,
+            detail=(
+                f"本地分钟K{have}无法覆盖回测起始日 {start}。"
+                "请先用「扩展分钟K历史」拉取更多数据, 或缩小回测区间"
+            ),
+        )
+
+
 @router.post("/strategy/run")
 def strategy_run(req: StrategyBacktestRequest, request: Request):
     """策略回测 — 复用 StrategyDef 体系做全周期回测。"""
@@ -219,6 +407,7 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
     end = req.end or date.today()
     start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
+    _guard_minute_strategy_backtest(request, req.strategy_id, start, req.asset_type)
 
     cfg = StrategyBacktestConfig(
         strategy_id=req.strategy_id,
@@ -245,7 +434,10 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         regime_filter=req.regime_filter,
     )
     task = make_worker_task("backtest", settings.data_dir, cfg)
-    return run_worker_task(task)
+    from app.services.heavy_job_limiter import shared_heavy_job_limiter
+
+    with shared_heavy_job_limiter.slot("normal"):
+        return run_worker_task(task)
 
 
 # ── SSE 流式回测 (实时进度 + 可取消 + 支持重连) ───────────────────
@@ -272,10 +464,6 @@ class _BacktestJob:
 _running_jobs: dict[str, _BacktestJob] = {}
 _jobs_lock = threading.Lock()
 _JOB_TTL = 300  # 完成后保留 5 分钟
-
-# 并发回测上限: 多个重回测同时跑会 OOM (服务器内存约 1.8GB)。用信号量限并发,
-# 超出的任务在 _run_backtest 里排队, SSE 连接照常保持, run 一开始就有进度。
-_backtest_semaphore = threading.Semaphore(2)
 
 
 def _cleanup_stale_jobs():
@@ -370,6 +558,7 @@ async def strategy_stream(
         # 空 start = 全部历史: 用本地最早日K日期, 查不到再回退到默认窗口
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
+    _guard_minute_strategy_backtest(request, strategy_id, start_date, asset_type)
 
     # 服务端范围保护
     guard_violated = False
@@ -452,21 +641,27 @@ async def strategy_stream(
             )
 
             def _run_backtest():
-                # 信号量限并发: 超额任务在此阻塞排队, 不并发吃满内存 (等待期间 cancel_event
-                # 仍可置位, svc.run 会据此提前返回 cancelled)。持槽跑完在 finally 释放。
-                _backtest_semaphore.acquire()
+                from app.services.heavy_job_limiter import (
+                    HeavyJobCancelledError,
+                    shared_heavy_job_limiter,
+                )
+
                 try:
-                    task = make_worker_task("backtest", settings.data_dir, cfg)
-                    result = run_worker_task(
-                        task,
-                        lambda d: job.progress.append(d),
-                        job.cancel_event,
-                    )
+                    with shared_heavy_job_limiter.slot(
+                        "normal",
+                        cancel_event=job.cancel_event,
+                    ):
+                        task = make_worker_task("backtest", settings.data_dir, cfg)
+                        result = run_worker_task(
+                            task,
+                            lambda d: job.progress.append(d),
+                            job.cancel_event,
+                        )
                     _finish_job(job, result=result)
+                except HeavyJobCancelledError:
+                    _finish_job(job, error="回测已取消")
                 except Exception as e:
                     _finish_job(job, error=str(e))
-                finally:
-                    _backtest_semaphore.release()
 
             # 启动后台线程 (不阻塞事件循环)
             threading.Thread(target=_run_backtest, daemon=True).start()
@@ -750,14 +945,25 @@ async def optimize_stream(
                 )
 
                 def _run_opt():
+                    from app.services.heavy_job_limiter import (
+                        HeavyJobCancelledError,
+                        shared_heavy_job_limiter,
+                    )
+
                     try:
-                        task = make_worker_task("optimize", settings.data_dir, ocfg)
-                        result = run_worker_task(
-                            task,
-                            lambda d: job.progress.append(d),
-                            job.cancel_event,
-                        )
+                        with shared_heavy_job_limiter.slot(
+                            "normal",
+                            cancel_event=job.cancel_event,
+                        ):
+                            task = make_worker_task("optimize", settings.data_dir, ocfg)
+                            result = run_worker_task(
+                                task,
+                                lambda d: job.progress.append(d),
+                                job.cancel_event,
+                            )
                         _finish_job(job, result=result)
+                    except HeavyJobCancelledError:
+                        _finish_job(job, error="优化已取消")
                     except Exception as e:
                         _finish_job(job, error=str(e))
 
@@ -965,14 +1171,25 @@ async def walkforward_stream(
                 )
 
                 def _run_wf():
+                    from app.services.heavy_job_limiter import (
+                        HeavyJobCancelledError,
+                        shared_heavy_job_limiter,
+                    )
+
                     try:
-                        task = make_worker_task("walkforward", settings.data_dir, wf_cfg)
-                        result = run_worker_task(
-                            task,
-                            lambda d: job.progress.append(d),
-                            job.cancel_event,
-                        )
+                        with shared_heavy_job_limiter.slot(
+                            "normal",
+                            cancel_event=job.cancel_event,
+                        ):
+                            task = make_worker_task("walkforward", settings.data_dir, wf_cfg)
+                            result = run_worker_task(
+                                task,
+                                lambda d: job.progress.append(d),
+                                job.cancel_event,
+                            )
                         _finish_job(job, result=result)
+                    except HeavyJobCancelledError:
+                        _finish_job(job, error="walk-forward 已取消")
                     except Exception as e:
                         _finish_job(job, error=str(e))
 

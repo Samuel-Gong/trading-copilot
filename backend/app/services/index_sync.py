@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
-from app.indicators.pipeline import compute_enriched
+from app.indicators.pipeline import compute_enriched, invalidate_benchmark_momentum_cache
 from app.services import kline_sync, preferences
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
@@ -242,6 +242,7 @@ def sync_and_persist_index_daily(
             continue
 
         repo.append_index_daily(raw)
+        invalidate_benchmark_momentum_cache(repo.store.data_dir)
         enriched = compute_enriched(raw, factors=None, instruments=None)
         repo.append_index_enriched(enriched)
         total_rows += raw.height

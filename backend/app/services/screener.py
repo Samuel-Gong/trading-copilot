@@ -154,8 +154,10 @@ class ScreenerService:
         # 加载 warmup 历史 (目标日期前 ~120 天)
         enriched_dir = self.repo.store.data_dir / self._enriched_dirname
         start = target_date - timedelta(days=150)
+        # turnover_rate 是 enriched 存储列, 必须随行透传: 否则即时计算后该列
+        # 丢失, 自定义 SQL 用它做条件会 Binder Error 被吞成空结果 (#187)
         read_cols = ["symbol", "date", "open", "high", "low", "close", "volume",
-                     "amount", "raw_close", "raw_high", "raw_low"]
+                     "amount", "raw_close", "raw_high", "raw_low", "turnover_rate"]
 
         try:
             lf = (
@@ -245,8 +247,9 @@ class ScreenerService:
         start = target_date - timedelta(days=min((lookback_days + warmup) * 2, 180))
 
         enriched_dir = self.repo.store.data_dir / self._enriched_dirname
+        # 同 _compute_enriched_full: turnover_rate 存储列随行透传 (#187)
         read_cols = ["symbol", "date", "open", "high", "low", "close", "volume",
-                     "amount", "raw_close", "raw_high", "raw_low"]
+                     "amount", "raw_close", "raw_high", "raw_low", "turnover_rate"]
 
         try:
             lf = (
@@ -335,10 +338,14 @@ class ScreenerService:
         # 用独立的 :memory: 连接 (而非复用 repo 共享连接的 cursor): conditions 是用户
         # 传入的 SQL 片段, 隔离连接下注入至多能碰 read_csv/read_parquet 文件; 若复用共享
         # 连接则会把 app 已注册的真实业务表也暴露给注入, 扩大攻击面。隔离连接创建开销极低。
+        # 再关闭 external_access, 让注入的文件读写函数 (read_parquet/COPY 等) 直接报错,
+        # 视图数据仍通过 con.register 注入, 不受该开关影响 (#224)。
         con = None
         try:
             import duckdb
-            con = duckdb.connect(database=":memory:")
+            con = duckdb.connect(
+                database=":memory:", config={"enable_external_access": False}
+            )
             con.register("enriched", df.to_arrow())
             where = " AND ".join(f"({c})" for c in conditions)
             sql = f"SELECT * FROM enriched WHERE {where}"
@@ -386,6 +393,27 @@ class ScreenerService:
 
         if current is None:
             current = self._load_enriched_for_date(as_of)
+        if timeframe == "1m":
+            # 分钟策略数据源是本地当日分钟K分区 (单分区文件直读), 与日线
+            # enriched 历史窗口无关, 不走 required_history_bars 日线路径。
+            history = self._load_minute_history(as_of, current)
+            # 策略声明 META["daily_history_bars"] 时额外装配日线 enriched 窗口,
+            # 供分钟策略叠加日线维度条件 (如 N 日内涨停过)。
+            daily_history = None
+            if engine is not None:
+                daily_bars = engine.minute_daily_history_bars(strategy_ids)
+                if daily_bars > 0:
+                    daily_history = self._load_enriched_history(as_of, daily_bars)
+            return StrategyDataContext(
+                asset_type=self.asset_type,
+                timeframe=timeframe,
+                as_of=as_of,
+                current=current,
+                history=history,
+                daily_history=daily_history,
+                market=None,
+                cache_key=cache_key,
+            )
         history_bars = engine.required_history_bars(
             strategy_ids,
             params_map=params_map,
@@ -403,6 +431,31 @@ class ScreenerService:
             market=market,
             cache_key=cache_key,
         )
+
+    def _load_minute_history(self, as_of: date, current: pl.DataFrame | None) -> pl.DataFrame:
+        """分钟策略数据源: 优先 as_of 当日分钟分区, 缺失时回退全市场最近分区。
+
+        只按日期直读单个分区文件 (get_minute_by_dates), 与全量 glob 扫描解耦,
+        内存只随当日分区大小 (~67万行) 走。标的池限定为 enriched 快照 universe;
+        分区与快照的日期差是允许的 (分钟分区可能比 enriched 更新, 行自带时间戳)。
+        """
+        if self.asset_type != "stock":
+            raise ValueError("分钟策略当前仅支持 A 股")
+        symbols: list[str] = []
+        if current is not None and not current.is_empty():
+            symbols = current["symbol"].cast(pl.Utf8).unique().to_list()
+        if not symbols:
+            return pl.DataFrame()
+        df = self.repo.get_minute_by_dates(symbols, [as_of])
+        if df.is_empty():
+            fallback = self.repo.latest_minute_date_global()
+            if fallback is None:
+                raise ValueError(
+                    "无分钟K数据 — 请先在 数据→分钟K 完成同步, 或开启盘中增量刷新"
+                )
+            if fallback != as_of:
+                df = self.repo.get_minute_by_dates(symbols, [fallback])
+        return df
 
     def latest_date(self) -> date | None:
         if self.asset_type != "stock":

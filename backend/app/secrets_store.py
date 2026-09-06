@@ -87,6 +87,29 @@ def get_ai_config(key: str, default: str = "") -> str:
     return getattr(settings, key, default) or default
 
 
+def get_ai_config_int(key: str, default: int) -> int:
+    """取 AI 数值配置项 (如 ai_max_output_tokens): secrets.json 优先,否则 config。"""
+    val = load().get(key)
+    if val is not None:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            logger.warning("ai config %s is not an int: %r", key, val)
+    from app.config import settings
+    return int(getattr(settings, key, default) or default)
+
+
+def get_env_backed_secret(field: str, env_name: str) -> str:
+    """取环境变量后备的密钥(插件 API Key 等):secrets.json 优先,否则环境变量。
+
+    与 get_tickflow_key 同优先级语义:UI 写入 secrets.json 后即覆盖 .env。
+    """
+    val = load().get(field)
+    if val:
+        return str(val).strip()
+    return os.environ.get(env_name, "").strip()
+
+
 def mask(key: str, prefix: int = 4, suffix: int = 4) -> str:
     """脱敏显示。"""
     if not key:

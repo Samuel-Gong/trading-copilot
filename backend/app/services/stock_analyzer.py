@@ -280,10 +280,10 @@ def _build_user_prompt(
             "请按系统提示词第 4 节的说明,在基本面/财务面维度给出\"接入中\"的友好提示,不要编造数据。)",
         ])
 
-    from app.services.ai_provider import sanitize_focus
-    safe_focus = sanitize_focus(focus)
-    if safe_focus:
-        parts.extend(["", f"本次分析请特别关注: {safe_focus}"])
+    from app.services.ai_provider import build_focus_instruction
+    focus_instruction = build_focus_instruction(focus, report_name="个股分析报告")
+    if focus_instruction:
+        parts.extend(["", focus_instruction])
     if portfolio_context:
         parts.extend([
             "",
@@ -399,14 +399,19 @@ async def analyze_stock_stream(
     try:
         from app.services.ai_provider import stream_ai_text
 
+        got_content = False
         async for delta in stream_ai_text(
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": analysis_input.user_prompt},
             ],
             temperature=0.5,
-            max_tokens=4500,
+            # 不限制输出: 推理模型(deepseek reasoner 系)思考 token 计入 max_tokens
+            # 预算, 固定上限会把正文挤光(实测 4500 全被推理吃掉 → 正文 0 字)。
+            max_tokens=None,
+            prefer_final_answer=True,
         ):
+            got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 
     except Exception as e:
@@ -414,4 +419,9 @@ async def analyze_stock_stream(
         yield json.dumps({"type": "error", "message": f"AI 分析失败: {e}"}, ensure_ascii=False)
         return
 
+    if not got_content:
+        # 流正常结束但一个正文块都没有(典型: 输出上限被思考吃光后静默截断)
+        logger.warning("AI stock analysis ended with empty content for %s", symbol)
+        yield json.dumps({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"}, ensure_ascii=False)
+        return
     yield json.dumps({"type": "done"}, ensure_ascii=False)

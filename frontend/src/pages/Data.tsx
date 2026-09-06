@@ -1,9 +1,10 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Database,
   Play,
+  Square,
   Loader2,
   HardDrive,
   Clock,
@@ -22,6 +23,7 @@ import { EndpointTestDialog } from '@/components/EndpointTestDialog'
 import { api, type ExtDataConfig } from '@/lib/api'
 import {
   useCapabilities,
+  useCapabilityMatrix,
   useSettings,
   usePreferences,
   useQuoteStatus,
@@ -29,12 +31,14 @@ import {
   useDataStatus,
 } from '@/lib/useSharedQueries'
 import { useToggleRealtimeQuotes, useUpdateQuoteInterval } from '@/lib/useSharedMutations'
+import { MissingCapChip, routeCapUsable, routeProviderDisplay, type RouteCapId } from '@/lib/capability-labels'
 import { QK } from '@/lib/queryKeys'
 import { PageHeader } from '@/components/PageHeader'
+import { useAdjFactorSyncGate } from '@/components/AdjFactorSyncGate'
 import { formatScheduleDatePart, formatScheduleTimePart, isToday } from '@/lib/format'
 
 // 拆分出的子组件
-import { StatCard, type FieldTab } from '@/components/data/StatCard'
+import { StatCard, type FieldTab, type CapLimitValue } from '@/components/data/StatCard'
 import { ActiveJobCard } from '@/components/data/ActiveJobCard'
 import { SectionTitle, HistoryRow } from '@/components/data/SectionTitle'
 import { SettingsModal } from '@/components/data/SettingsModal'
@@ -103,6 +107,19 @@ export function Data() {
     },
   })
 
+  // 停止同步: 二次确认后调 cancel 端点 (协作式终止, 当前分块完成后线程自行退出)
+  const [showStopConfirm, setShowStopConfirm] = useState(false)
+  const stopSync = useMutation({
+    mutationFn: () => api.pipelineJobCancel(activeJobId!),
+    onSuccess: () => {
+      setShowStopConfirm(false)
+      qc.invalidateQueries({ queryKey: QK.pipelineJob(activeJobId!) })
+    },
+  })
+
+  // 无除权因子能力时同步前置确认 (静默降级告知)
+  const adjGate = useAdjFactorSyncGate()
+
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const clearData = useMutation({
     mutationFn: api.dataClear,
@@ -160,7 +177,6 @@ export function Data() {
     mutationFn: () => api.syncIndexDaily(indexSyncDays),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: QK.dataStatus })
-      qc.invalidateQueries({ queryKey: QK.indexList })
       qc.invalidateQueries({ queryKey: QK.indexQuotes })
       qc.invalidateQueries({ queryKey: ['index-daily'] })
     },
@@ -179,25 +195,23 @@ export function Data() {
     ? 'TickFlow'
     : (dataSources.data?.custom?.find(s => s.name === activeProvider)?.display_name || activeProvider)
 
-  // tierKey → 自定义数据集名映射 (用于数据画像 CapBadge 显示数据源名而非 TickFlow 档位)
-  const TIERKEY_TO_DATASET: Record<string, string> = {
-    daily: 'daily',
-    adj_factor: 'adj_factor',
-    etf: 'daily',        // ETF 复用日K能力
-    minute: 'minute',
-    financials: 'financial',
-  }
-  // 当前 custom 源支持的数据集集合
-  const activeCustomDatasets = activeProvider !== 'tickflow'
-    ? new Set(dataSources.data?.custom?.find(s => s.name === activeProvider)?.datasets || [])
-    : new Set<string>()
-  // 给定 tierKey, 返回 custom provider 显示名 (走 custom 时) 或 null (走 TickFlow)
-  const getCustomProviderName = (tierKey: string): string | null => {
-    if (activeProvider === 'tickflow') return null
-    const ds = TIERKEY_TO_DATASET[tierKey]
-    if (ds && activeCustomDatasets.has(ds)) return activeDataSourceName
-    return null
-  }
+  // —— 能力路由门控 (全项目统一判定) ——
+  // usable = 生效源当前能否提供该能力 (含插件/自定义源; TickFlow 档位不足则不可用),
+  // 区别于 useCapabilities 的 TickFlow 套餐视角。矩阵未加载时回退套餐视角, 避免首屏闪烁。
+  const matrix = useCapabilityMatrix()
+  const tfCaps = caps.data?.capabilities
+  const usableOr = (id: RouteCapId, tfHas: boolean) => routeCapUsable(matrix.data, id) ?? tfHas
+  // 合并视角 caps: 套餐限额键位 + 路由可用性覆盖, 卡片徽章/显隐/设置弹窗共用
+  const mergedCaps = useMemo(() => {
+    const m: Record<string, CapLimitValue> = { ...(tfCaps ?? {}) }
+    const merge = (tfKey: string, usable: boolean) => { m[tfKey] = usable ? (m[tfKey] ?? true) : false }
+    merge('adj_factor', usableOr('adj_factor', !!tfCaps?.['adj_factor']))
+    merge('kline.daily.batch', usableOr('daily', !!tfCaps?.['kline.daily.batch']))
+    merge('kline.minute.batch', usableOr('minute', !!tfCaps?.['kline.minute.batch']))
+    merge('financial', usableOr('financial', !!tfCaps?.['financial']))
+    return m
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tfCaps, matrix.data])
 
   const minuteAuto = prefs.data?.minute_sync_enabled ?? false
   const pipelineSched = prefs.data?.pipeline_schedule ?? { hour: 15, minute: 30 }
@@ -240,9 +254,10 @@ export function Data() {
   const quoteStatus = useQuoteStatus()
   const toggleQuote = useToggleRealtimeQuotes()
 
-  const hasAdjCap = !!caps.data?.capabilities?.['adj_factor']
-  const hasDailyBatchCap = !!caps.data?.capabilities?.['kline.daily.batch']
-  const hasMinuteCap = !!caps.data?.capabilities?.['kline.minute.batch']
+  // 路由感知能力门控: 矩阵判定生效源可用性, 未加载回退套餐视角
+  const hasAdjCap = usableOr('adj_factor', !!tfCaps?.['adj_factor'])
+  const hasDailyBatchCap = usableOr('daily', !!tfCaps?.['kline.daily.batch'])
+  const hasMinuteCap = usableOr('minute', !!tfCaps?.['kline.minute.batch'])
   const indexAuto = prefs.data?.pipeline_pull_index ?? true
   const etfAuto = prefs.data?.pipeline_pull_etf ?? false
   const pipelineSteps = [
@@ -261,7 +276,7 @@ export function Data() {
     window.addEventListener('data-card-visible-change', handler)
     return () => window.removeEventListener('data-card-visible-change', handler)
   }, [])
-  const cardVisible = getCardVisibility(caps.data?.capabilities)
+  const cardVisible = getCardVisibility(mergedCaps)
   // 引用 cardVisibleTick 触发重渲染(避免 lint 警告)
   void cardVisibleTick
 
@@ -271,6 +286,15 @@ export function Data() {
       qc.invalidateQueries({ queryKey: QK.pipelineJobs })
       // 同步任务结束后 regime 覆盖范围可能变化, 一并刷新画像
       qc.invalidateQueries({ queryKey: QK.regimeCoverage })
+      // 同步重写了指数日K/enriched/日K → 失效消费这些数据的查询。
+      // 侧边栏指数查询挂在 Layout 常驻不重挂载 (refetchOnWindowFocus 已关),
+      // 不失效会一直显示同步前的旧值; 自选相关查询在页面正打开时同理。
+      if (job.data.status === 'succeeded') {
+        qc.invalidateQueries({ queryKey: QK.indexQuotes })
+        qc.invalidateQueries({ queryKey: ['index-daily'] })
+        qc.invalidateQueries({ queryKey: ['watchlist-enriched'] })
+        qc.invalidateQueries({ queryKey: ['kline-batch'] })
+      }
       const t = setTimeout(() => setActiveJobId(null), 5_000)
       return () => clearTimeout(t)
     }
@@ -390,8 +414,7 @@ export function Data() {
             skipped={skippedCards.has('instruments')}
             stagePct={activeCard === 'instruments' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="instruments"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
+            capLimits={mergedCaps}
             auto
             onShowFields={() => setSchemaTable('instruments')}
           />
@@ -408,9 +431,8 @@ export function Data() {
             skipped={skippedCards.has('daily')}
             stagePct={activeCard === 'daily' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="daily"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
-            customProvider={getCustomProviderName('daily')}
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'daily')}
             auto
             onShowFields={() => setSchemaTable('daily')}
             onSettings={hasData ? () => setOpenSettings(v => v === 'daily' ? null : 'daily') : undefined}
@@ -429,9 +451,8 @@ export function Data() {
             skipped={skippedCards.has('adj_factor')}
             stagePct={activeCard === 'adj_factor' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="adj_factor"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
-            customProvider={getCustomProviderName('adj_factor')}
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'adj_factor')}
             auto
             onShowFields={() => setSchemaTable('adj_factor')}
           />
@@ -448,8 +469,7 @@ export function Data() {
             skipped={skippedCards.has('enriched')}
             stagePct={activeCard === 'enriched' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="enriched"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
+            capLimits={mergedCaps}
             auto
             subLabel={status.data?.indicators_ready === false ? '字段 · 指标计算中…' : '字段 · 指标 · 信号'}
             localBadgeSuffix={`${prefs.data?.enriched_batch_size ?? 1000}只/批`}
@@ -470,8 +490,7 @@ export function Data() {
             skipped={skippedCards.has('index_daily')}
             stagePct={activeCard === 'index_daily' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="daily"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
+            capLimits={mergedCaps}
             auto={indexAuto}
             subLabel={indexOverviewLabel}
             fieldTabs={[
@@ -492,9 +511,8 @@ export function Data() {
             stats={etfOverviewStats}
             loading={isLoading}
             tierKey="etf"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
-            customProvider={getCustomProviderName('etf')}
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'daily')}
             auto={etfAuto}
             subLabel="维表 · 日K · 指标"
             fieldTabs={[
@@ -517,9 +535,8 @@ export function Data() {
             skipped={skippedCards.has('minute')}
             stagePct={activeCard === 'minute' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="minute"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
-            customProvider={getCustomProviderName('minute')}
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'minute')}
             auto={minuteAuto}
             onShowFields={() => setSchemaTable('minute')}
             onSettings={hasData ? () => setOpenSettings(v => v === 'minute' ? null : 'minute') : undefined}
@@ -535,9 +552,8 @@ export function Data() {
             stats={s?.financials ? { rows: s.financials.rows } : null}
             loading={isLoading}
             tierKey="financials"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
-            customProvider={getCustomProviderName('financials')}
+            capLimits={mergedCaps}
+            customProvider={routeProviderDisplay(matrix.data, 'financial')}
             subLabel={`历史股本 · ${historicalShareRows.toLocaleString()} 条`}
             onSettings={hasData ? () => setOpenSettings(v => v === 'financials' ? null : 'financials') : undefined}
             settingsOpen={openSettings === 'financials'}
@@ -556,8 +572,7 @@ export function Data() {
             skipped={skippedCards.has('regime')}
             stagePct={activeCard === 'regime' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="regime"
-            capLimits={caps.data?.capabilities}
-            tierLabel={caps.data?.label}
+            capLimits={mergedCaps}
             auto={prefs.data?.pipeline_regime_enabled === true}
             subLabel="状态 · 综合分 · 指标"
             onSettings={hasData ? () => setOpenSettings(v => v === 'regime' ? null : 'regime') : undefined}
@@ -581,17 +596,27 @@ export function Data() {
               <span className="text-xs text-accent animate-pulse">首次使用请点击右侧按钮同步数据</span>
             )}
             <button
-              onClick={() => startSync.mutate()}
+              onClick={() => adjGate.guard(() => startSync.mutate())}
               disabled={isStarting}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 disabled:opacity-40 transition-all duration-150"
             >
-              {(isRunning || isStarting) ? (
+              {(isStarting || isRunning) ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <Play className="h-3.5 w-3.5" />
               )}
               {isStarting ? '启动中…' : isRunning ? '同步中…' : '立即同步'}
             </button>
+            {isRunning && !!activeJobId && (
+              <button
+                onClick={() => setShowStopConfirm(true)}
+                title="停止当前同步任务"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-danger/12 border border-danger/30 text-danger text-xs font-medium hover:bg-danger/20 transition-all duration-150"
+              >
+                <Square className="h-3 w-3 fill-current" />
+                停止
+              </button>
+            )}
             <button
               onClick={() => setOpenSettings('pipeline-scope')}
               className="inline-flex items-center gap-1 px-2 py-1 rounded-btn text-secondary hover:text-accent hover:bg-accent/8 text-xs transition-colors duration-150"
@@ -632,7 +657,7 @@ export function Data() {
               </button>
               <div className="w-px h-4 bg-border" />
               <Link
-                to="/settings?tab=data-sources"
+                to="/settings?tab=data-sources&highlight=data-sources"
                 className="inline-flex items-center gap-1 px-2 py-1 rounded-btn text-secondary hover:text-accent hover:bg-accent/8 text-xs transition-colors duration-150"
                 title="切换数据源"
               >
@@ -653,17 +678,17 @@ export function Data() {
       />
 
       <div className="px-8 py-6 space-y-6 max-w-6xl">
-        {/* None 档提示 —— 非阻断: 无需 Key 也可获取历史日K, 仅实时行情等扩展能力受限 */}
+        {/* 无 Key 提示 —— 非阻断: 历史日K走免费通道, 实时等能力取决于所选数据源 */}
         {isNoKey && (
           <div className="flex items-center gap-2 rounded-card border border-border bg-elevated/40 px-3 py-2 text-xs">
             <Info className="h-4 w-4 shrink-0 text-muted" />
             <span className="text-secondary leading-relaxed">
-              当前为 None 档,将使用免费数据源获取历史日K(无需注册)。
-              配置 API Key 可解锁实时行情监控等扩展能力,前往
-              <Link to="/settings?tab=account" className="mx-0.5 font-medium text-accent hover:underline">
-                配置
+              当前无需 API Key,历史日K将使用免费通道获取。
+              实时行情、分钟K等能力取决于所选数据源,可在
+              <Link to="/settings?tab=data-sources&highlight=data-sources" className="mx-0.5 font-medium text-accent hover:underline">
+                数据源设置
               </Link>
-              。
+              中配置。
             </span>
           </div>
         )}
@@ -972,7 +997,7 @@ export function Data() {
         {openSettings === 'daily' && (
           <SettingsModal title="日 K · 向前扩展历史" onClose={() => setOpenSettings(null)}>
             <ExtendHistoryPanel
-              caps={caps.data}
+              hasCap={hasDailyBatchCap}
               isRunning={!!activeJobId}
               earliestDate={s?.daily?.earliest_date ?? null}
               onStart={() => setOpenSettings(null)}
@@ -985,7 +1010,7 @@ export function Data() {
         {showRepair && (
           <SettingsModal title="日 K · 修正 / 补数据" onClose={() => setShowRepair(false)}>
             <RepairDailyPanel
-              caps={caps.data}
+              hasCap={hasDailyBatchCap}
               isRunning={!!activeJobId}
               latestDate={s?.daily?.latest_date ?? null}
               onStart={() => setShowRepair(false)}
@@ -1037,7 +1062,7 @@ export function Data() {
       <AnimatePresence>
         {openSettings === 'page-settings' && (
           <SettingsModal title="页面设置 · 数据画像卡片" onClose={() => setOpenSettings(null)}>
-            <PageSettingsModal caps={caps.data?.capabilities} />
+            <PageSettingsModal caps={mergedCaps} />
           </SettingsModal>
         )}
       </AnimatePresence>
@@ -1135,9 +1160,7 @@ export function Data() {
                   )}
                 </button>
                 {!hasDailyBatchCap && (
-                  <span className="text-[10px] text-warning/80 bg-warning/8 rounded px-1.5 py-px font-medium">
-                    需 Starter+ / Pro 批量日 K 权限
-                  </span>
+                  <MissingCapChip capKey="kline.daily.batch" />
                 )}
               </div>
             </div>
@@ -1148,13 +1171,72 @@ export function Data() {
       <AnimatePresence>
         {openSettings === 'minute' && (
           <SettingsModal title="分钟 K · 同步设置" onClose={() => setOpenSettings(null)}>
-            <MinuteSyncConfig caps={caps.data} onJobStart={(jobId) => { setActiveJobId(jobId); setOpenSettings(null) }} />
+            <MinuteSyncConfig hasCap={hasMinuteCap} onJobStart={(jobId) => { setActiveJobId(jobId); setOpenSettings(null) }} />
           </SettingsModal>
+        )}
+      </AnimatePresence>
+
+      {/* 停止同步二次确认弹窗 */}
+      <AnimatePresence>
+        {showStopConfirm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+              onClick={() => !stopSync.isPending && setShowStopConfirm(false)}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 12 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.97, y: 8 }}
+              transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+              className="relative w-[90vw] max-w-[420px] rounded-card border border-border bg-base shadow-2xl p-6"
+            >
+              <div className="flex items-start gap-3">
+                <div className="shrink-0 h-10 w-10 rounded-full bg-danger/12 flex items-center justify-center">
+                  <AlertTriangle className="h-5 w-5 text-danger" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-foreground mb-1.5">确认停止数据同步？</h3>
+                  <p className="text-xs text-secondary leading-relaxed">
+                    当前任务将在<span className="text-foreground font-medium">正在拉取的分块完成后</span>中断（协作式停止，不会损坏已写入的数据）。
+                  </p>
+                  <p className="mt-2 text-[11px] text-danger/90 leading-relaxed">
+                    停止后再次拉取需要重新走完整管道（拉取 → 指标计算 → 监控规则），无法从停止处续跑。
+                  </p>
+                  <div className="mt-2 flex items-start gap-1.5 text-[11px] text-muted">
+                    <Info className="h-3.5 w-3.5 shrink-0 mt-px text-muted" />
+                    <span>已写入的部分数据会保留，下次同步时覆盖或补齐。</span>
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-2 mt-5">
+                <button
+                  onClick={() => setShowStopConfirm(false)}
+                  disabled={stopSync.isPending}
+                  className="px-3 py-1.5 rounded-btn bg-elevated text-secondary hover:bg-elevated/80 text-sm transition-colors disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={() => stopSync.mutate()}
+                  disabled={stopSync.isPending}
+                  className="px-3 py-1.5 rounded-btn bg-danger/90 text-base text-sm font-medium hover:bg-danger disabled:opacity-50 transition-colors"
+                >
+                  {stopSync.isPending ? '停止中…' : '确认停止'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
 
       {/* 清除数据二次确认弹窗 */}
       <AnimatePresence>
+        {adjGate.dialog}
         {showClearConfirm && (
           <div className="fixed inset-0 z-50 flex items-center justify-center">
             <motion.div

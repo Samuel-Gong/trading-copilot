@@ -43,8 +43,27 @@ const strategyPoolSaveQueue = createStrategyPoolSaveQueue(async pool => {
   return saved.strategy_ids
 })
 
+// 旧版按周期隔离的双池已合并为统一池。迁移时仍保留旧版持久化层对
+// “本地从未保存”的辨别能力，避免空分钟池把服务端策略池误覆盖为空。
+function loadUnifiedLocalPool(): unknown {
+  const daily = storage.strategyPool.getOptional()
+  const minute = normalizeStrategyPool(storage.strategyPoolMinute.getOptional())
+  if (minute.length === 0) {
+    storage.strategyPoolMinute.remove()
+    return daily
+  }
+  const merged = normalizeStrategyPool([
+    ...normalizeStrategyPool(daily),
+    ...minute,
+  ])
+  storage.strategyPool.set(merged)
+  storage.strategyPoolMinute.remove()
+  return merged
+}
+
+/** 日线与分钟策略共用的统一策略池。 */
 export function useStrategyPool() {
-  const localPoolRef = useRef<unknown>(storage.strategyPool.getOptional())
+  const localPoolRef = useRef<unknown>(loadUnifiedLocalPool())
   const poolRef = useRef<string[]>([])
   const [pool, setPool] = useState<string[]>([])
   const [isHydrated, setIsHydrated] = useState(false)
@@ -163,6 +182,14 @@ export function useStrategyPool() {
     commit(() => newOrder)
   }, [commit])
 
+  // 清除池中不存在于 validIds 的失效策略(如本地开发残留的自定义策略)。
+  // 调用方传入"全周期合并的策略列表" ID, 池内日线/分钟策略一并校验。
+  // 仅当确实有失效项时才更新,避免无谓重渲染。
+  const prune = useCallback((validIds: Iterable<string>) => {
+    const validSet = validIds instanceof Set ? validIds : new Set(validIds)
+    commit(previous => previous.filter(id => validSet.has(id)))
+  }, [commit])
+
   const isInPool = useCallback((id: string) => pool.includes(id), [pool])
 
   const retry = useCallback(() => {
@@ -189,6 +216,7 @@ export function useStrategyPool() {
     addToPool,
     removeFromPool,
     reorderPool,
+    prune,
     isInPool,
   }
 }

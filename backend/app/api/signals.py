@@ -18,10 +18,20 @@ def _data_dir(request: Request) -> Path:
     return request.app.state.repo.store.data_dir
 
 
-def _invalidate() -> None:
-    """失效 pipeline 的自定义信号缓存，下次计算重新加载。"""
+def _invalidate(request: Request) -> None:
+    """失效自定义信号表达式缓存, 并清掉含旧信号列的计算缓存。
+
+    信号增删会改变注入列集合: 只清表达式缓存不够, repo 内存缓存 /
+    strategy 磁盘缓存里算好的历史窗口仍不含新 csg_ 列 (或仍含已删列),
+    需要一并清除, 否则创建信号后立即运行策略仍会报缺列。
+    """
     from app.indicators.pipeline import invalidate_custom_signals
     invalidate_custom_signals()
+    from app.services import strategy_cache
+    strategy_cache.clear_cache(_data_dir(request))
+    repo = request.app.state.repo
+    if hasattr(repo, "clear_cache"):
+        repo.clear_cache()
 
 
 class ConditionModel(BaseModel):
@@ -38,6 +48,10 @@ class SignalModel(BaseModel):
     kind: str        # entry | exit | both
     conditions: list[ConditionModel]
     enabled: bool = True
+
+
+class AIGenerateRequest(BaseModel):
+    description: str
 
 
 # ── 字段选项 / 运算符 ───────────────────────────────────
@@ -73,6 +87,24 @@ def get_options():
             groups.append({"key": cat, "label": label,
                            "fields": [{"key": f, "label": ENRICHED_COLUMNS.get(f, f)} for f in cat_fields]})
 
+    # 注册表因子 (虚拟/自定义/复合): 历史路径由 compute_signals 复用评分物化
+    # 管线补算; 已是物化列的基础因子 (rsi_14 等) 上面已分组, 此处跳过。
+    from app.factors.registry import all_factors
+
+    factor_groups: dict[str, list[dict[str, str]]] = {}
+    for spec in all_factors():
+        if spec.id in allowed:
+            continue
+        label = spec.label
+        if spec.warmup_bars > 1:
+            label = f"{label} · 预热{spec.warmup_bars}日"
+        if list(spec.asset_types) == ["stock"]:
+            label = f"{label} · 仅股票"
+        factor_groups.setdefault(spec.group or "因子", []).append({"key": spec.id, "label": label})
+    for group_label, group_fields in factor_groups.items():
+        groups.append({"key": f"factor:{group_label}", "label": f"因子 · {group_label}", "fields": group_fields})
+        fields.extend(group_fields)
+
     return {
         "fields": fields,
         "groups": groups,
@@ -106,8 +138,43 @@ def save_signal(req: SignalModel, request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     custom_signals.save_one(_data_dir(request), sig)
-    _invalidate()
+    _invalidate(request)
     return {"ok": True, "signal": sig}
+
+
+# ── AI 生成 ─────────────────────────────────────────────
+
+
+@router.post("/ai/generate")
+async def ai_generate_signal(req: AIGenerateRequest):
+    """AI 根据自然语言描述生成自定义信号条件。
+
+    不落盘：只返回 {name, conditions} 供前端回填表单，由用户确认后走
+    常规 save 流程。校验复用 custom_signals.validate()（白名单安全闸门）。
+    """
+    from app.services.ai_provider import generate_ai_text
+    from app.strategy import custom_signals_ai
+
+    description = req.description.strip()
+    if not description:
+        raise HTTPException(status_code=400, detail="请先描述信号思路")
+    if len(description) > 500:
+        raise HTTPException(status_code=400, detail="描述过长（最多 500 字）")
+
+    messages = custom_signals_ai.build_messages(description)
+    try:
+        # max_tokens=None 不传上限: 推理模型思考 token 计入预算, 显式限制
+        # 会挤占正文导致 JSON 截断/0 字 (与四个分析器同因, 见 0ee3aa8)
+        text = await generate_ai_text(messages, temperature=0.2, max_tokens=None)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"AI 生成失败: {e}") from e
+
+    try:
+        return custom_signals_ai.parse_and_validate(text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ── 删除 ───────────────────────────────────────────────
@@ -120,5 +187,5 @@ def delete_signal(signal_id: str, request: Request):
     deleted = custom_signals.delete_one(_data_dir(request), signal_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="信号不存在")
-    _invalidate()
+    _invalidate(request)
     return {"ok": True}

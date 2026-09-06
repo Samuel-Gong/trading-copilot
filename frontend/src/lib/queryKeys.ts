@@ -15,17 +15,26 @@ export const QK = {
   version:        ['version'] as const,
   preferences:    ['preferences'] as const,
   dataSources:    ['data-sources'] as const,
+  capabilityMatrix: ['capability-matrix'] as const,
   quoteStatus:    ['quote-status'] as const,
   quoteInterval:  ['quote-interval'] as const,
   overviewMarket: (asOf?: string) => ['overview-market', asOf ?? 'latest'] as const,
   indexQuotes:    ['index-quotes'] as const,
-  indexList:      ['index-list'] as const,
 
   // Watchlist
   watchlist:            ['watchlist'] as const,
+  watchlistGroups:      ['watchlist-groups'] as const,
   watchlistQuotes:      ['watchlist-quotes'] as const,
   watchlistEnriched:    (ext?: string) => ['watchlist-enriched', ext] as const,
-  watchlistKlineBatch:  (symbols: string) => ['watchlist-kline-batch', symbols] as const,
+  // 异动边缘总览 (开启监控时才查询, 参数为 min_closeness/limit)
+  abnormalOverview:     (minCloseness: number, limit: number) => ['abnormal-overview', minCloseness, limit] as const,
+  // 盘中异动信号聚合 (异动监控「盘中」tab)
+  abnormalIntraday:     (limit: number) => ['abnormal-intraday', limit] as const,
+  // 不用 watchlist- 前缀: 日K历史盘中几乎不变, 若被 SSE quotes_updated 高频失效
+  // (expert 1s) 会导致全自选日K每秒重拉, staleTime 形同虚设。
+  // 刷新点: staleTime 过期 + Watchlist 增删自选/改蜡烛天数时的手动失效;
+  // 当日最后一根蜡烛由 Watchlist 用 enriched 实时 OHLC 前端修补 (零额外请求)。
+  watchlistKlineBatch:  (symbols: string) => ['kline-batch', symbols] as const,
   portfolioWatchPool:   ['portfolio-watch-pool'] as const,
   portfolioAccounts:    ['portfolio-accounts'] as const,
   portfolioTrades:      (accountId?: string) =>
@@ -45,7 +54,7 @@ export const QK = {
   screener:             ['screener'] as const,
   screenerStrategyPool: ['screener-strategy-pool'] as const,
   screenerStrategyPoolPersistence: ['screener-strategy-pool-persistence'] as const,
-  screenerStrategies:   (assetType: string = 'stock') => ['screener-strategies', assetType] as const,
+  screenerStrategies:   (assetType: string = 'stock', timeframe: '1d' | '1m' | 'all' = '1d') => ['screener-strategies', assetType, timeframe] as const,
   screenerCachedSummary: ['screener-cached', 'summary'] as const,
   screenerCachedResult: (strategyId: string, asOf?: string, ext?: string) => ['screener-cached', 'strategy', strategyId, asOf ?? '', ext ?? ''] as const,
   screenerCached:       (asOf?: string, ext?: string) => ['screener-cached', 'all', asOf ?? '', ext ?? ''] as const,
@@ -55,6 +64,18 @@ export const QK = {
 
   // Backtest
   backtestStatus:       ['backtest-status'] as const,
+  factorColumns:        ['backtest-factor-columns'] as const,
+  factorLibrary:        (assetType: string) => ['factors-library', assetType] as const,
+  miningRuns:           ['backtest-mining-runs'] as const,
+  miningAvailability:   (assetType: string, profile: string, start: string, end: string) =>
+                          ['backtest-mining-availability', assetType, profile, start, end] as const,
+  miningRun:            (id: string) => ['backtest-mining-run', id] as const,
+  miningResult:         (id: string) => ['backtest-mining-result', id] as const,
+  miningConfig:         ['backtest-mining-config'] as const,
+  researchCandidates:  ['research-candidates'] as const,
+  strategyLinkOptions: (assetType?: 'stock' | 'etf') => assetType
+    ? ['strategy-link-options', assetType] as const
+    : ['strategy-link-options'] as const,
   strategyDetail:       (id: string) => ['strategy-detail', id] as const,
 
   // Data / Pipeline
@@ -65,19 +86,23 @@ export const QK = {
   extData:              ['ext-data'] as const,
   extDataRows:          (id: string, date?: string, limit?: number, columns?: string) => ['ext-data-rows', id, date, limit, columns] as const,
   dimensionMembers:     (id: string, field: string, value: string, date?: string) => ['dimension-members', id, field, value, date] as const,
+  dimensionIntraday:    (id: string, field: string, value: string, date?: string) => ['dimension-intraday', id, field, value, date] as const,
   analysisMenus:        ['analysis-menus'] as const,
   analysisMenu:         (id: string) => ['analysis-menu', id] as const,
 
   // Kline
   kline:                (symbol: string, start: string, end: string, extColumns?: string) =>
                            ['kline', symbol, start, end, extColumns ?? ''] as const,
+  klineLatest:          (symbol: string) => ['kline-latest', symbol] as const,
   stockLevels:          (symbol: string, days?: number) => ['stock-levels', symbol, days ?? 120] as const,
   klineMinute:          (symbol: string, date: string) =>
                              ['kline-minute', symbol, date] as const,
+  klineMinuteRange:     (symbol: string, days: number) =>
+                             ['kline-minute-range', symbol, days] as const,
   indexDaily:           (symbol: string, start: string, end: string) =>
-                           ['index-daily', symbol, start, end] as const,
+                             ['index-daily', symbol, start, end] as const,
   indexMinute:          (symbol: string, date: string) =>
-                           ['index-minute', symbol, date] as const,
+                             ['index-minute', symbol, date] as const,
 
   // Schema
   extDataSchemaAll:     ['ext-data-schema-all'] as const,
@@ -90,6 +115,8 @@ export const QK = {
   // Monitor (监控规则 + 触发记录)
   monitorRules:         ['monitor-rules'] as const,
   monitorRuleOptions:   ['monitor-rule-options'] as const,
+  lots:                 ['lots'] as const,
+  lotsKline:            (symbols: string) => ['lots-kline', symbols] as const,
   alerts:               (source?: string) => ['alerts', source ?? ''] as const,
 
   // AI 大盘复盘
@@ -103,6 +130,8 @@ export const QK = {
   regimeLatest:         ['regime-latest'] as const,
   regimeStates:         (days: number) => ['regime-states', days] as const,
   regimeCoverage:       ['regime-coverage'] as const,
+  regimePhases:         (start?: string, end?: string, limit?: number) => ['regime-phases', start ?? '', end ?? '', limit ?? 0] as const,
+  regimeMainline:       (kind: string, start?: string, end?: string, limit?: number) => ['regime-mainline', kind, start ?? '', end ?? '', limit ?? 0] as const,
 } as const
 
 // ===== SSE 应该 invalidate 的 key 前缀列表 =====
@@ -114,7 +143,11 @@ export const QK = {
 // 且在 monitor "重算" 窗口内读到空结果, 造成策略列表闪烁 (变 0 → 空失效 → 又出现)。
 
 export const SSE_INVALIDATE_PREFIXES = [
-  'watchlist',
+  // 精确前缀: 只命中自选页的实时数据 (quotes/enriched)。不能用宽泛的 'watchlist' ——
+  // 会误伤 ['watchlist'] (自选列表) 和 ['watchlist-groups'] (分组配置, 只随手动操作变化)。
+  // 旧设置里的 'watchlist' 单开关由 useQuoteStream 兼容读取。
+  'watchlist-quotes',
+  'watchlist-enriched',
   'quote-status',
   'index-quotes',
   'overview-market',
