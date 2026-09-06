@@ -688,18 +688,15 @@ def run_all(request: Request, body: Optional[dict] = None):
     # 写入策略缓存 (供页面秒加载)。最新日期判断在缓存写锁内完成, 避免较早
     # 任务在较新任务完成后回退共享快照。
     if results and asset_type == "stock" and timeframe == "1d":
-        try:
-            strategy_cache.write_cache(
-                data_dir,
-                str(as_of),
-                results,
-                preserve_newer=True,
-                latest_available_as_of=repo.enriched_latest_date,
-                only_latest_available=True,
-                expected_generation=cache_generation,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        strategy_cache.write_cache(
+            data_dir,
+            str(as_of),
+            results,
+            preserve_newer=True,
+            latest_available_as_of=repo.enriched_latest_date,
+            only_latest_available=True,
+            expected_generation=cache_generation,
+        )
 
     if body.get("summary_only"):
         return {

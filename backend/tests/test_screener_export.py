@@ -183,16 +183,21 @@ def test_first_single_run_persists_and_other_assets_cannot_overwrite(client, mon
     assert client.get("/api/screener/export?strategy_id=alpha").json()["symbols"] == ["000001.SZ"]
 
 
-def test_cache_write_failure_rejects_run_and_removes_export_snapshot(client, monkeypatch):
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_cache_write_failure_rejects_run_and_removes_export_snapshot(client, monkeypatch, run_kind):
     from app.services.screener import ScreenerResult
 
     data_dir = client.app.state.repo.store.data_dir
     strategy_cache.write_cache(data_dir, DAY, {"alpha": result()})
     engine = client.app.state.strategy_engine
     engine.has = lambda _: True
-    engine.run = lambda sid, ctx, **_: ScreenerResult(
-        as_of=date.fromisoformat(DAY), strategy=sid, rows=[{"symbol": "000002.SZ"}], total=1,
+    result_value = ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy="alpha", rows=[{"symbol": "000002.SZ"}], total=1,
     )
+    if run_kind == "single":
+        engine.run = lambda sid, ctx, **_: result_value
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": result_value}
     monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
     monkeypatch.setattr(api, "_load_ext_value_maps", lambda *_: {})
     monkeypatch.setattr(
@@ -202,7 +207,10 @@ def test_cache_write_failure_rejects_run_and_removes_export_snapshot(client, mon
     )
 
     with pytest.raises(OSError, match="synthetic failure"):
-        client.post("/api/screener/run_preset", json={"strategy_id": "alpha", "as_of": DAY})
+        if run_kind == "single":
+            client.post("/api/screener/run_preset", json={"strategy_id": "alpha", "as_of": DAY})
+        else:
+            client.post("/api/screener/run_all", json={"strategy_ids": ["alpha"], "as_of": DAY})
 
     assert client.get("/api/screener/export").status_code == 404
 
