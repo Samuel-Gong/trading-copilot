@@ -6,17 +6,21 @@ import logging
 import math
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import strategy_cache
 from app.services.screener import ScreenerService
+from app.services.screener_export import ExportError, build_export, export_csv
 from app.strategy import config as strategy_config
 
 logger = logging.getLogger(__name__)
@@ -84,8 +88,35 @@ def _safe_ext_value(value: Any) -> Any:
 # 每次请求 _load_ext_value_maps 都会重新从磁盘读 ext parquet 并重建 {symbol: value}。
 # 用底层 parquet 文件的 (路径, mtime) 签名做 memoize: 文件未变则复用上次的 map,
 # parquet 被重写 (mtime 变化) 时自动失效重算。仅缓存基于 config 的快照/时序路径,
-# 无 config 的 DuckDB view 回退路径不缓存 (少见)。
-_ext_value_map_cache: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
+# 无 config 的 DuckDB view 回退路径不缓存 (少见)。历史分区可能很多, 因此采用
+# 有界 LRU, 避免每个业务日期都永久保留一份全市场 symbol 映射。
+_EXT_VALUE_MAP_CACHE_MAX_ENTRIES = 32
+_ext_value_map_cache: OrderedDict[
+    tuple[str, str, str | None], tuple[Any, dict[str, Any]],
+] = OrderedDict()
+_ext_value_map_cache_lock = threading.Lock()
+
+
+def _get_cached_ext_value_map(cache_key: tuple[str, str, str | None], sig: tuple) -> dict[str, Any] | None:
+    """按文件签名读取并提升 LRU 项; 签名变化时删除旧项。"""
+    with _ext_value_map_cache_lock:
+        cached = _ext_value_map_cache.get(cache_key)
+        if cached is None:
+            return None
+        if cached[0] != sig:
+            _ext_value_map_cache.pop(cache_key, None)
+            return None
+        _ext_value_map_cache.move_to_end(cache_key)
+        return cached[1]
+
+
+def _cache_ext_value_map(cache_key: tuple[str, str, str | None], sig: tuple, value_map: dict[str, Any]) -> None:
+    """写入扩展列映射并淘汰最久未使用的条目。"""
+    with _ext_value_map_cache_lock:
+        _ext_value_map_cache[cache_key] = (sig, value_map)
+        _ext_value_map_cache.move_to_end(cache_key)
+        while len(_ext_value_map_cache) > _EXT_VALUE_MAP_CACHE_MAX_ENTRIES:
+            _ext_value_map_cache.popitem(last=False)
 
 
 def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
@@ -101,22 +132,43 @@ def _ext_parquet_signature(cfg, data_dir) -> Optional[tuple]:
         return None
 
 
-def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str, Any]]:
+def _as_of_is_latest(repo, as_of: date | str | None, asset_type: str = "stock") -> bool:
+    """未指定业务日期时视作当前快照, 否则只接受当前最新交易日。"""
+    if as_of is None:
+        return True
+    try:
+        if asset_type == "stock":
+            latest = repo.enriched_latest_date()
+        else:
+            _, latest = repo.get_enriched_latest_asset(asset_type)
+    except Exception:
+        return False
+    return latest is not None and str(as_of) == str(latest)
+
+
+def _load_ext_value_maps(
+    repo,
+    ext_columns: str | None,
+    as_of: date | str | None = None,
+    asset_type: str = "stock",
+) -> dict[str, dict[str, Any]]:
     """按请求加载扩展列，返回 {输出列名: {symbol: value}}。
 
     策略结果缓存是共享文件，不能被不同 ext_columns 组合污染；因此扩展列只在
     返回前通过该投影映射追加到结果副本中。
 
     基于 config 的路径按 parquet 文件 mtime 签名 memoize, 文件未变时跳过磁盘重读。
+    时序扩展列以 as_of 读取对应分区, 历史请求不拼接当前快照扩展列。
     """
     ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []
     if not ext_specs:
         return {}
+    allow_snapshot_columns = _as_of_is_latest(repo, as_of, asset_type)
 
     import polars as pl
 
     from app.api.ext_data import _read_ext_dataframe
-    from app.services.ext_data import ExtConfigStore
+    from app.services.ext_data import ExtConfigStore, latest_timeseries_partition_on_or_before
 
     db = repo.store.db
     data_dir = repo.store.data_dir
@@ -127,17 +179,26 @@ def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str
     for config_id, field_name in ext_specs:
         out_col = f"{config_id}__{field_name}"
         cfg = configs.get(config_id)
-        cache_key = (config_id, field_name)
+        if cfg is None and not allow_snapshot_columns:
+            continue
+        if cfg is not None and cfg.mode == "snapshot" and not allow_snapshot_columns:
+            continue
+        snapshot_date = None
+        if cfg is not None and cfg.mode == "timeseries" and as_of is not None:
+            snapshot_date = latest_timeseries_partition_on_or_before(cfg, data_dir, as_of)
+            if snapshot_date is None:
+                continue
+        cache_key = (config_id, field_name, snapshot_date)
         sig = _ext_parquet_signature(cfg, data_dir) if cfg else None
         try:
             if cfg:
                 # 命中缓存 (文件签名一致) → 复用, 免去磁盘重读
-                cached = _ext_value_map_cache.get(cache_key)
-                if cached is not None and sig is not None and cached[0] == sig:
-                    value_maps[out_col] = cached[1]
+                cached = _get_cached_ext_value_map(cache_key, sig) if sig is not None else None
+                if cached is not None:
+                    value_maps[out_col] = cached
                     continue
-                # 时序扩展表只取最新分区，避免历史分区把同一 symbol JOIN 放大。
-                ext_df, _ = _read_ext_dataframe(cfg, data_dir)
+                # 时序扩展表按业务日期取单个分区, 避免历史结果读取未来数据。
+                ext_df, _ = _read_ext_dataframe(cfg, data_dir, snapshot_date=snapshot_date)
             else:
                 view_name = f"ext_{config_id}"
                 ext_df = pl.from_arrow(db.query(
@@ -155,7 +216,7 @@ def _load_ext_value_maps(repo, ext_columns: Optional[str]) -> dict[str, dict[str
             }
             value_maps[out_col] = vmap
             if cfg and sig is not None:
-                _ext_value_map_cache[cache_key] = (sig, vmap)
+                _cache_ext_value_map(cache_key, sig, vmap)
         except Exception as e:  # noqa: BLE001
             logger.debug("screener ext column join skipped for %s.%s: %s", config_id, field_name, e)
 
@@ -211,18 +272,39 @@ def _cache_payload_with_ext(cached: dict, ext_values: dict[str, dict[str, Any]])
     return payload
 
 
-def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: dict) -> None:
+def _ensure_context_has_current_data(context, as_of: date) -> None:
+    """拒绝没有当日输入数据的策略运行, 避免空结果成为可导出的快照。"""
+    current = getattr(context, "current", None)
+    if current is not None and current.is_empty():
+        raise HTTPException(status_code=400, detail=f"{as_of} 无可用选股数据")
+
+
+def _update_cache_strategy(
+    data_dir,
+    as_of: str,
+    strategy_id: str,
+    safe_data: dict,
+    latest_available_as_of=None,
+    expected_generation: strategy_cache.CacheGeneration | None = None,
+) -> None:
     """单跑后更新缓存中该策略的结果，保持缓存与最新计算一致。"""
-    from app.services import strategy_cache
-    cached = strategy_cache.read_cache(data_dir)
-    if cached and cached.get("as_of") == as_of:
-        results = cached.get("results", {})
-        results[strategy_id] = {
-            "total": safe_data.get("total", 0),
-            "as_of": as_of,
-            "rows": safe_data.get("rows", []),
-        }
-        strategy_cache.write_cache(data_dir, as_of, results)
+    strategy_cache.write_cache(
+        data_dir,
+        as_of,
+        {
+            strategy_id: {
+                "total": safe_data.get("total", 0),
+                "as_of": as_of,
+                "asset_type": "stock",
+                "timeframe": "1d",
+                "rows": safe_data.get("rows", []),
+            }
+        },
+        preserve_newer=True,
+        latest_available_as_of=latest_available_as_of,
+        only_latest_available=True,
+        expected_generation=expected_generation,
+    )
 
 
 @router.get("/strategies")
@@ -271,7 +353,7 @@ def run_custom(req: CustomRequest, request: Request):
         pool=req.pool,
     )
     safe_data = _safe(asdict(result))
-    ext_values = _load_ext_value_maps(repo, req.ext_columns)
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of, req.asset_type)
     return _result_with_ext(safe_data, ext_values)
 
 
@@ -285,7 +367,12 @@ def run_preset(req: PresetRequest, request: Request):
 
     # 加载用户保存的策略配置
     data_dir = request.app.state.repo.store.data_dir
-    ext_values = _load_ext_value_maps(repo, req.ext_columns)
+    cache_generation = (
+        strategy_cache.cache_generation(data_dir, [req.strategy_id])
+        if req.asset_type == "stock" and req.timeframe == "1d"
+        else None
+    )
+    ext_values = _load_ext_value_maps(repo, req.ext_columns, as_of, req.asset_type)
     overrides = strategy_config.load_override(data_dir, req.strategy_id)
     engine = getattr(request.app.state, "strategy_engine", None)
     if not engine:
@@ -294,7 +381,9 @@ def run_preset(req: PresetRequest, request: Request):
     try:
         if not engine.has(req.strategy_id):
             raise ValueError(f"unknown strategy: {req.strategy_id}")
-        if engine.get(req.strategy_id).meta.get("research_only"):
+        get_strategy = getattr(engine, "get", None)
+        strategy = get_strategy(req.strategy_id) if callable(get_strategy) else None
+        if strategy is not None and getattr(strategy, "meta", {}).get("research_only"):
             raise ValueError(f"unknown strategy: {req.strategy_id}")
         params = dict(overrides.get("params") or {})
         context = svc.build_strategy_context(
@@ -305,6 +394,7 @@ def run_preset(req: PresetRequest, request: Request):
             params_map={req.strategy_id: params},
             overrides_map={req.strategy_id: overrides or {}},
         )
+        _ensure_context_has_current_data(context, as_of)
         result = engine.run(
             req.strategy_id,
             context,
@@ -317,10 +407,16 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
-    # 分钟周期结果不写入盘后缓存 (strategy_cache 是日线语义, as_of/updated_at
-    # 混入分钟结果会污染页面秒加载路径)。
-    if req.timeframe == "1d":
-        _update_cache_strategy(data_dir, str(as_of), req.strategy_id, safe_data)
+    # 股票日线结果才写入盘后缓存; ETF 与分钟周期结果不混入共享日线快照。
+    if req.asset_type == "stock" and req.timeframe == "1d":
+        _update_cache_strategy(
+            data_dir,
+            str(as_of),
+            req.strategy_id,
+            safe_data,
+            repo.enriched_latest_date,
+            cache_generation,
+        )
 
     return _result_with_ext(safe_data, ext_values)
 
@@ -348,6 +444,39 @@ def _cached_with_realtime(request: Request) -> dict:
     return cached
 
 
+@router.get("/export")
+def get_export(
+    request: Request,
+    format: Literal["json", "csv", "txt"] = "json",
+    strategy_id: Annotated[list[str] | None, Query(description="可重复传入; 省略时导出已有结果的股票策略")] = None,
+    as_of: Annotated[date | None, Query(description="要求所有结果属于此日期; 省略时要求日期一致")] = None,
+):
+    """导出已保存的股票日线选股结果, 不触发计算或追加今日曾命中历史行。"""
+    engine = getattr(request.app.state, "strategy_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="策略引擎未初始化")
+    data_dir = request.app.state.repo.store.data_dir
+    overrides = strategy_config.list_overrides(data_dir)
+    names = {
+        meta["id"]: (overrides.get(meta["id"]) or {}).get("name") or meta["name"]
+        for meta in engine.list_strategies()
+        if "stock" in meta.get("asset_types", ["stock"])
+        and "1d" in meta.get("timeframes", ["1d"])
+    }
+    try:
+        payload = build_export(strategy_cache.read_cache(data_dir) or {}, names, strategy_id, as_of)
+    except ExportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    headers = {"Cache-Control": "no-store"}
+    if format == "json":
+        return JSONResponse(payload, headers=headers)
+    headers["Content-Disposition"] = f'attachment; filename="screener-{payload["as_of"]}.{format}"'
+    if format == "csv":
+        return Response(export_csv(payload), media_type="text/csv", headers=headers)
+    content = "".join(f"{symbol}\r\n" for symbol in payload["symbols"])
+    return Response(content, media_type="text/plain", headers=headers)
+
+
 @router.get("/cached")
 def get_cached(
     request: Request,
@@ -366,7 +495,9 @@ def get_cached(
     if not cached.get("results") and cached.get("as_of") is None:
         return {"as_of": None, "results": {}, "updated_at": None}
 
-    ext_values = _load_ext_value_maps(request.app.state.repo, ext_columns)
+    repo = request.app.state.repo
+    cached_as_of = cached.get("as_of")
+    ext_values = _load_ext_value_maps(repo, ext_columns, cached_as_of)
     return _cache_payload_with_ext(cached, ext_values)
 
 
@@ -421,7 +552,9 @@ def get_cached_result(
             "updated_at": cached.get("updated_at"),
         }
 
-    ext_values = _load_ext_value_maps(request.app.state.repo, ext_columns)
+    repo = request.app.state.repo
+    result_as_of = raw_result.get("as_of")
+    ext_values = _load_ext_value_maps(repo, ext_columns, result_as_of)
     result = {
         "as_of": raw_result.get("as_of"),
         "strategy": strategy_id,
@@ -523,14 +656,17 @@ def run_all(request: Request, body: Optional[dict] = None):
         return {"as_of": None, "results": {}}
 
     data_dir = request.app.state.repo.store.data_dir
-
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
         unknown = [
             sid
             for sid in all_ids
-            if not engine.has(sid) or engine.get(sid).meta.get("research_only")
+            if not engine.has(sid)
+            or (
+                callable(getattr(engine, "get", None))
+                and getattr(engine.get(sid), "meta", {}).get("research_only")
+            )
         ]
         if unknown:
             raise HTTPException(status_code=404, detail=f"unknown strategies: {unknown}")
@@ -545,6 +681,12 @@ def run_all(request: Request, body: Optional[dict] = None):
 
     if not all_ids:
         return {"as_of": str(as_of), "results": {}}
+
+    cache_generation = (
+        strategy_cache.cache_generation(data_dir, all_ids)
+        if asset_type == "stock" and timeframe == "1d"
+        else None
+    )
 
     # 批量预加载所有 override 配置
     t0 = time.perf_counter()
@@ -565,6 +707,7 @@ def run_all(request: Request, body: Optional[dict] = None):
             params_map=params_map,
             overrides_map=overrides_map,
         )
+        _ensure_context_has_current_data(context, as_of)
         engine_results = engine.run_all(
             context,
             params_map=params_map,
@@ -580,18 +723,26 @@ def run_all(request: Request, body: Optional[dict] = None):
         results[sid] = {
             "total": result.total,
             "as_of": str(as_of),
+            "asset_type": asset_type,
+            "timeframe": timeframe,
             "rows": safe_rows,
         }
 
     elapsed = (time.perf_counter() - t_total) * 1000
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
-    # 写入策略缓存 (供页面秒加载); 分钟周期结果不落盘 (日线语义缓存)
-    if results and timeframe == "1d":
-        try:
-            strategy_cache.write_cache(data_dir, str(as_of), results)
-        except Exception:  # noqa: BLE001
-            pass
+    # 仅股票日线结果写入共享缓存。最新日期判断在缓存写锁内完成, 避免较早
+    # 任务在较新任务完成后回退快照; ETF 与分钟结果保持请求内瞬态语义。
+    if results and asset_type == "stock" and timeframe == "1d":
+        strategy_cache.write_cache(
+            data_dir,
+            str(as_of),
+            results,
+            preserve_newer=True,
+            latest_available_as_of=repo.enriched_latest_date,
+            only_latest_available=True,
+            expected_generation=cache_generation,
+        )
 
     if body.get("summary_only"):
         return {
@@ -602,7 +753,7 @@ def run_all(request: Request, body: Optional[dict] = None):
             },
         }
 
-    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"))
+    ext_values = _load_ext_value_maps(repo, body.get("ext_columns"), as_of, asset_type)
     return {"as_of": str(as_of), "results": _results_with_ext(results, ext_values)}
 
 

@@ -1,0 +1,1091 @@
+from __future__ import annotations
+
+import csv
+import io
+import threading
+from datetime import date
+from types import SimpleNamespace
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.api import screener as api
+from app.api import strategy as strategy_api
+from app.services import strategy_cache
+from app.services.screener_export import ExportError, build_export, export_csv
+from app.strategy.engine import StrategyEngine
+
+DAY = "2026-09-04"
+NAMES = {"alpha": "测试策略甲", "beta": "测试策略乙"}
+
+
+def result(rows=None, day=DAY, **extra):
+    return {"as_of": day, "asset_type": "stock", "timeframe": "1d", "total": 1,
+            "rows": rows if rows is not None else [{"symbol": "000001.SZ", "name": "合成股票"}], **extra}
+
+
+def test_export_preserves_order_units_membership_and_cache():
+    cached = {"results": {
+        "alpha": result([{"symbol": "000001.SZ", "change_pct": -0.025,
+                          "turnover_rate": 5, "score": float("nan")}]),
+        "beta": result([{"symbol": "000001.SZ", "score": 90}, {"symbol": "600000.SH"}]),
+    }, "today_ever_rows": {"alpha": {"999999.SZ": {"symbol": "999999.SZ"}}}}
+    payload = build_export(cached, NAMES, ["beta", "alpha", "beta"])
+    assert list(payload["results"]) == ["beta", "alpha"]
+    assert payload["symbols"] == ["000001.SZ", "600000.SH"]
+    assert payload["total"] == 2 and payload["as_of"] == DAY
+    assert payload["results"]["alpha"]["rows"][0] == {
+        "symbol": "000001.SZ", "change_pct": -0.025, "turnover_rate": 5, "score": None,
+    }
+    payload["results"]["beta"]["rows"][0]["score"] = 0
+    assert cached["results"]["beta"]["rows"][0]["score"] == 90
+
+
+def test_csv_encoding_escaping_formulas_and_empty():
+    payload = build_export({"results": {"alpha": result([
+        {"symbol": "000001.SZ", "name": '测试,"股票"\n换行', "change_pct": -0.05},
+        {"symbol": "600000.SH", "name": ' \t=HYPERLINK("x")'},
+    ])}}, {"alpha": "+公式策略"})
+    encoded = export_csv(payload)
+    assert encoded.startswith(b"\xef\xbb\xbf")
+    rows = list(csv.DictReader(io.StringIO(encoded.decode("utf-8-sig"))))
+    assert rows[0]["symbol"] == "000001.SZ"
+    assert rows[0]["name"] == '测试,"股票"\n换行'
+    assert rows[0]["strategy_name"] == "'+公式策略"
+    assert rows[0]["change_pct"] == "-0.05" and rows[0]["score"] == ""
+    assert rows[1]["name"].startswith("'")
+    empty = build_export({"results": {"alpha": result([])}}, NAMES)
+    assert empty["total"] == 0 and empty["symbols"] == []
+    assert len(export_csv(empty).decode("utf-8-sig").splitlines()) == 1
+
+
+@pytest.mark.parametrize(("cached", "ids", "as_of", "status"), [
+    ({}, None, None, 404),
+    ({"results": {"deleted": result()}}, None, None, 404),
+    ({"results": {"alpha": result()}}, ["unknown"], None, 404),
+    ({"results": {"alpha": result()}}, ["alpha", "beta"], None, 409),
+    ({"results": {"alpha": result()}}, None, date(2026, 9, 3), 409),
+    ({"results": {"alpha": result(), "beta": result(day="2026-09-03")}}, None, None, 409),
+    ({"results": {"alpha": result(asset_type="etf")}}, None, None, 409),
+    ({"results": {"alpha": result(timeframe="1m")}}, None, None, 409),
+    ({"results": {"alpha": {"as_of": DAY, "rows": []}}}, None, None, 409),
+    ({"results": {"alpha": result(day="invalid")}}, None, None, 409),
+    ({"results": {"alpha": result([{"symbol": 1}])}}, None, None, 409),
+    ({"results": {"alpha": result([{"symbol": "000001.SZ\n600000.SH"}])}}, None, None, 409),
+])
+def test_export_rejects_incomplete_or_wrong_context(cached, ids, as_of, status):
+    with pytest.raises(ExportError) as exc:
+        build_export(cached, NAMES, ids, as_of)
+    assert exc.value.status_code == status
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    app = FastAPI()
+    app.include_router(api.router)
+    app.include_router(strategy_api.router)
+    app.state.repo = SimpleNamespace(
+        store=SimpleNamespace(data_dir=tmp_path),
+        enriched_latest_date=lambda: date.fromisoformat(DAY),
+        get_enriched_latest_asset=lambda _asset_type: (None, None),
+    )
+    strategy_defs = {
+        sid: SimpleNamespace(meta={"id": sid, "name": name}, basic_filter={})
+        for sid, name in NAMES.items()
+    }
+    app.state.strategy_engine = SimpleNamespace(
+        list_strategies=lambda: [
+            {"id": sid, "name": name, "asset_types": ["stock"], "timeframes": ["1d"]}
+            for sid, name in NAMES.items()
+        ],
+        has=lambda sid: sid in strategy_defs,
+        get=lambda sid: strategy_defs[sid],
+    )
+    app.state.monitor_engine = SimpleNamespace(
+        latest_strategy_results=lambda **_: {},
+        invalidate_strategy_state=lambda: None,
+    )
+    monkeypatch.setattr(api.strategy_config, "list_overrides", lambda _: {})
+    return TestClient(app)
+
+
+def test_http_formats_and_dates(client):
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {"alpha": result([{"symbol": "000002.SZ", "score": float("inf")}])})
+    realtime = {"alpha": result([{"symbol": "000003.SZ"}])}
+    client.app.state.monitor_engine.latest_strategy_results = lambda **_: realtime
+    response = client.get("/api/screener/export", params={"strategy_id": "alpha", "as_of": DAY})
+    assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
+    assert response.json()["symbols"] == ["000002.SZ"]
+    assert response.json()["results"]["alpha"]["rows"][0]["score"] is None
+    txt = client.get("/api/screener/export?strategy_id=alpha&format=txt")
+    assert txt.content == b"000002.SZ\r\n"
+    assert txt.headers["content-disposition"] == f'attachment; filename="screener-{DAY}.txt"'
+    csv_response = client.get("/api/screener/export?strategy_id=alpha&format=csv")
+    assert csv_response.content.startswith(b"\xef\xbb\xbf")
+    assert csv_response.headers["content-type"] == "text/csv; charset=utf-8"
+    for query, status in [("as_of=2026-09-03", 409), ("format=xlsx", 422),
+                          ("as_of=not-a-date", 422), ("strategy_id=alpha&strategy_id=beta", 409)]:
+        assert client.get(f"/api/screener/export?{query}").status_code == status
+    client.app.state.strategy_engine = None
+    assert client.get("/api/screener/export").status_code == 503
+
+
+def test_http_empty_vs_missing(client):
+    client.app.state.monitor_engine.latest_strategy_results = lambda **_: {"alpha": result()}
+    assert client.get("/api/screener/export").status_code == 404
+    strategy_cache.write_cache(client.app.state.repo.store.data_dir, DAY, {"alpha": result([])})
+    assert client.get("/api/screener/export").json()["symbols"] == []
+    assert client.get("/api/screener/export?format=txt").content == b""
+
+
+@pytest.mark.parametrize("format", ["json", "csv", "txt"])
+@pytest.mark.parametrize("monitor_day", ["2026-09-03", DAY, "2026-09-07"])
+def test_any_monitor_snapshot_cannot_change_saved_export(client, format, monitor_day):
+    strategy_cache.write_cache(client.app.state.repo.store.data_dir, DAY, {"alpha": result()})
+    client.app.state.monitor_engine.latest_strategy_results = lambda **_: {
+        "alpha": result([{"symbol": "600000.SH"}], day=monitor_day),
+    }
+    response = client.get("/api/screener/export", params={"as_of": DAY, "format": format})
+    assert response.status_code == 200
+    assert "000001.SZ" in response.text and "600000.SH" not in response.text
+    latest = client.get("/api/screener/export").json()
+    assert latest["as_of"] == DAY and latest["symbols"] == ["000001.SZ"]
+
+
+def test_export_requires_existing_session(client, monkeypatch):
+    from app.main import auth_middleware
+    from app.services import auth
+
+    client.app.middleware("http")(auth_middleware)
+    monkeypatch.setattr(auth, "is_configured", lambda: True)
+    monkeypatch.setattr(auth, "is_valid_session", lambda token: token == "synthetic-session")
+    strategy_cache.write_cache(client.app.state.repo.store.data_dir, DAY, {"alpha": result()})
+    assert client.get("/api/screener/export").status_code == 401
+    client.cookies.set("tf_session", "invalid")
+    assert client.get("/api/screener/export?format=csv").status_code == 401
+    client.cookies.set("tf_session", "synthetic-session")
+    assert client.get("/api/screener/export").status_code == 200
+
+
+def test_first_single_run_persists_and_other_assets_cannot_overwrite(client, monkeypatch):
+    from app.services.screener import ScreenerResult
+
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    engine.run = lambda sid, ctx, **_: ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy=sid, rows=[{"symbol": "000001.SZ"}], total=1,
+    )
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
+    monkeypatch.setattr(api, "_load_ext_value_maps", lambda *_: {})
+    for asset, timeframe in [("stock", "1d"), ("etf", "1d"), ("stock", "1m")]:
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": DAY, "asset_type": asset, "timeframe": timeframe,
+        })
+        assert response.status_code == 200
+        cached = strategy_cache.read_cache(client.app.state.repo.store.data_dir)
+        if asset == "stock" and timeframe == "1d":
+            original = cached
+        else:
+            assert cached == original
+    assert client.get("/api/screener/export?strategy_id=alpha").json()["symbols"] == ["000001.SZ"]
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_cache_write_failure_rejects_run_and_removes_export_snapshot(client, monkeypatch, run_kind):
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {"alpha": result()})
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    result_value = ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy="alpha", rows=[{"symbol": "000002.SZ"}], total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda sid, ctx, **_: result_value
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": result_value}
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
+    monkeypatch.setattr(api, "_load_ext_value_maps", lambda *_: {})
+    monkeypatch.setattr(
+        strategy_cache.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("synthetic failure")),
+    )
+
+    with pytest.raises(OSError, match="synthetic failure"):
+        if run_kind == "single":
+            client.post("/api/screener/run_preset", json={"strategy_id": "alpha", "as_of": DAY})
+        else:
+            client.post("/api/screener/run_all", json={"strategy_ids": ["alpha"], "as_of": DAY})
+
+    assert client.get("/api/screener/export").status_code == 404
+
+
+def test_batch_run_marks_stock_daily_results_and_does_not_cache_other_contexts(client, monkeypatch):
+    from app.services.screener import ScreenerResult
+
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    engine.run_all = lambda *_, **__: {"alpha": ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy="alpha", rows=[{"symbol": "000001.SZ"}], total=1,
+    )}
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
+    for asset, timeframe in [("stock", "1d"), ("etf", "1d"), ("stock", "1m")]:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": DAY, "asset_type": asset,
+            "timeframe": timeframe, "summary_only": True,
+        })
+        assert response.status_code == 200
+        cached = strategy_cache.read_cache(client.app.state.repo.store.data_dir)
+        if asset == "stock" and timeframe == "1d":
+            original = cached
+            assert cached["results"]["alpha"]["asset_type"] == "stock"
+            assert cached["results"]["alpha"]["timeframe"] == "1d"
+        else:
+            assert cached == original
+
+
+@pytest.mark.parametrize(("overrides", "expected_count"), [
+    ({}, 2), ({"display_limit": 3}, 3), ({"display_limit": None}, 5),
+])
+@pytest.mark.parametrize("format", ["json", "csv", "txt"])
+@pytest.mark.parametrize(("run_kind", "pool"), [
+    ("single", None), ("single", ["000002.SZ", "000004.SZ"]), ("batch", None),
+])
+def test_export_matches_real_engine_result_limits(client, monkeypatch, overrides, expected_count, format, run_kind, pool):
+    import polars as pl
+
+    from app.strategy.engine import StrategyDataContext, StrategyDef, StrategyEngine
+
+    engine = StrategyEngine(strategy_dirs=[])
+    engine._strategies["alpha"] = StrategyDef(
+        meta={"id": "alpha", "name": "合成策略", "limit": 2, "scoring": {}},
+        basic_filter={"enabled": False}, entry_signals=[], exit_signals=[],
+            stop_loss=None, trailing_stop=None, trailing_take_profit_activate=None,
+            trailing_take_profit_drawdown=None, max_hold_days=None,
+        filter_fn=lambda df, params: pl.col("close") > 0, filter_history_fn=None,
+        lookback_days=1, source="custom",
+    )
+    client.app.state.strategy_engine = engine
+    quotes = pl.DataFrame({"symbol": [f"{i:06d}.SZ" for i in range(1, 6)], "close": [10.] * 5})
+    context = StrategyDataContext("stock", "1d", date.fromisoformat(DAY), current=quotes)
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: context)
+    monkeypatch.setattr(api.strategy_config, "load_override", lambda *_: overrides)
+    if run_kind == "single":
+        run = client.post("/api/screener/run_preset", json={"strategy_id": "alpha", "as_of": DAY, "pool": pool})
+    else:
+        monkeypatch.setattr(api.strategy_config, "list_overrides", lambda *_: {"alpha": overrides})
+        run = client.post("/api/screener/run_all", json={"strategy_ids": ["alpha"], "as_of": DAY})
+    assert run.status_code == 200
+    rows = run.json()["rows"] if run_kind == "single" else run.json()["results"]["alpha"]["rows"]
+    selected = [row["symbol"] for row in rows]
+    assert len(selected) == (min(expected_count, len(pool)) if pool else expected_count)
+    if pool:
+        assert selected == pool[:expected_count]
+    exported = client.get("/api/screener/export", params={"format": format})
+    assert exported.status_code == 200
+    if format == "json":
+        assert exported.json()["symbols"] == selected
+    elif format == "csv":
+        rows = csv.DictReader(io.StringIO(exported.content.decode("utf-8-sig")))
+        assert [row["symbol"] for row in rows] == selected
+    else:
+        assert exported.text.splitlines() == selected
+
+
+@pytest.mark.parametrize("format", ["json", "csv", "txt"])
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_run_keeps_newer_pool_cache(client, monkeypatch, format, run_kind):
+    from app.strategy.engine import StrategyResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result([{"symbol": "000001.SZ"}]),
+        "beta": result([{"symbol": "600000.SH"}]),
+    })
+    original = strategy_cache.read_cache(data_dir)
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = StrategyResult(
+        as_of=date(2026, 9, 3), strategy_id="alpha",
+        rows=[{"symbol": "000003.SZ"}], total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda sid, context, **_: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
+    if run_kind == "single":
+        historical = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03",
+        })
+        rows = historical.json()["rows"]
+    else:
+        historical = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03",
+        })
+        rows = historical.json()["results"]["alpha"]["rows"]
+    assert historical.status_code == 200
+    assert rows[0]["symbol"] == "000003.SZ"
+    assert strategy_cache.read_cache(data_dir) == original
+    exported = client.get("/api/screener/export", params={"format": format})
+    assert exported.status_code == 200
+    assert "000001.SZ" in exported.text and "600000.SH" in exported.text
+    assert "000003.SZ" not in exported.text
+    assert client.get("/api/screener/export?as_of=2026-09-03").status_code == 409
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_empty_input_date_cannot_replace_export_cache(client, monkeypatch, run_kind):
+    import polars as pl
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {"alpha": result()})
+    original = strategy_cache.read_cache(data_dir)
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    calls: list[str] = []
+
+    def unexpected_run(*_args, **_kwargs):
+        calls.append(run_kind)
+        raise AssertionError("空输入不应执行策略")
+
+    if run_kind == "single":
+        engine.run = unexpected_run
+    else:
+        engine.run_all = unexpected_run
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(current=pl.DataFrame()),
+    )
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2099-01-01",
+        })
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2099-01-01",
+        })
+
+    assert response.status_code == 400
+    assert "无可用选股数据" in response.json()["detail"]
+    assert calls == []
+    assert strategy_cache.read_cache(data_dir) == original
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_run_without_cache_is_not_export_snapshot(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
+
+    assert response.status_code == 200
+    assert rows[0]["symbol"] == "000003.SZ"
+    assert strategy_cache.read_cache(client.app.state.repo.store.data_dir) is None
+    assert client.get("/api/screener/export").status_code == 404
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_run_without_latest_date_never_creates_export_snapshot(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    client.app.state.repo.enriched_latest_date = lambda: None
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
+
+    assert response.status_code == 200
+    assert rows[0]["symbol"] == "000003.SZ"
+    assert strategy_cache.read_cache(client.app.state.repo.store.data_dir) is None
+    assert client.get("/api/screener/export").status_code == 404
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_timeseries_ext_columns_use_latest_partition_at_or_before_requested_date(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+    from app.services.screener import ScreenerResult
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="forecast", mode="timeseries")],
+        ),
+    )
+    requested_dates: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        requested_dates.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["000003.SZ"], "signal": [snapshot_date]}), snapshot_date
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+    data_dir = client.app.state.repo.store.data_dir
+    for snapshot_date in ("2026-09-01", "2026-09-05"):
+        part = data_dir / "ext_data" / "forecast" / "timeseries" / f"date={snapshot_date}" / "part.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.touch()
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03", "ext_columns": "forecast.signal",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03", "ext_columns": "forecast.signal",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
+
+    assert response.status_code == 200
+    assert requested_dates == ["2026-09-01"]
+    assert rows[0]["forecast__signal"] == "2026-09-01"
+
+
+def test_timeseries_partition_rejects_future_only_data(tmp_path):
+    from app.services.ext_data import latest_timeseries_partition_on_or_before
+
+    future_part = tmp_path / "ext_data" / "forecast" / "timeseries" / "date=2026-09-05" / "part.parquet"
+    future_part.parent.mkdir(parents=True)
+    future_part.touch()
+
+    assert latest_timeseries_partition_on_or_before(
+        SimpleNamespace(id="forecast"), tmp_path, "2026-09-03",
+    ) is None
+
+
+def test_ext_value_map_cache_evicts_least_recently_used_historical_partition(monkeypatch):
+    def cache_key(snapshot_date):
+        return "forecast", "signal", snapshot_date
+
+    def signature(snapshot_date):
+        return (f"/{snapshot_date}/part.parquet", 1.0),
+    monkeypatch.setattr(api, "_EXT_VALUE_MAP_CACHE_MAX_ENTRIES", 2)
+    api._ext_value_map_cache.clear()
+    try:
+        api._cache_ext_value_map(cache_key("2026-09-01"), signature("2026-09-01"), {"A": 1})
+        api._cache_ext_value_map(cache_key("2026-09-02"), signature("2026-09-02"), {"A": 2})
+        assert api._get_cached_ext_value_map(cache_key("2026-09-01"), signature("2026-09-01")) == {"A": 1}
+
+        api._cache_ext_value_map(cache_key("2026-09-03"), signature("2026-09-03"), {"A": 3})
+
+        assert api._get_cached_ext_value_map(cache_key("2026-09-02"), signature("2026-09-02")) is None
+        assert list(api._ext_value_map_cache) == [cache_key("2026-09-01"), cache_key("2026-09-03")]
+    finally:
+        api._ext_value_map_cache.clear()
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_historical_snapshot_ext_columns_are_omitted(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+    from app.services.screener import ScreenerResult
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    historical_result = ScreenerResult(
+        as_of=date(2026, 9, 3),
+        strategy="alpha",
+        rows=[{"symbol": "000003.SZ"}],
+        total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_, **__: historical_result
+    else:
+        engine.run_all = lambda *_, **__: {"alpha": historical_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000003.SZ"]}),
+        ),
+    )
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="snapshot", mode="snapshot")],
+        ),
+    )
+    read_requests: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        read_requests.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["000003.SZ"], "signal": ["future-value"]}), None
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-03", "ext_columns": "snapshot.signal",
+        })
+        rows = response.json()["rows"]
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-03", "ext_columns": "snapshot.signal",
+        })
+        rows = response.json()["results"]["alpha"]["rows"]
+
+    assert response.status_code == 200
+    assert read_requests == []
+    assert "snapshot__signal" not in rows[0]
+
+
+def test_historical_unknown_ext_column_skips_stale_view(client, monkeypatch):
+    queried_views: list[str] = []
+    client.app.state.repo.store.db = SimpleNamespace(
+        query=lambda sql: queried_views.append(sql),
+    )
+
+    from app.services import ext_data as ext_data_service
+
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(load_all=lambda: []),
+    )
+
+    value_maps = api._load_ext_value_maps(
+        client.app.state.repo,
+        "deleted_config.signal",
+        "2026-09-03",
+    )
+
+    assert value_maps == {}
+    assert queried_views == []
+
+
+def test_current_snapshot_ext_column_without_as_of_is_preserved(client, monkeypatch):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="snapshot", mode="snapshot")],
+        ),
+    )
+    requested_dates: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        requested_dates.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["000003.SZ"], "signal": ["current-value"]}), None
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+
+    value_maps = api._load_ext_value_maps(client.app.state.repo, "snapshot.signal")
+
+    assert requested_dates == [None]
+    assert value_maps == {"snapshot__signal": {"000003.SZ": "current-value"}}
+
+
+def test_etf_latest_date_allows_current_snapshot_ext_column(client, monkeypatch):
+    import polars as pl
+
+    from app.api import ext_data as ext_data_api
+    from app.services import ext_data as ext_data_service
+
+    client.app.state.repo.store.db = SimpleNamespace()
+    client.app.state.repo.get_enriched_latest_asset = lambda asset_type: (
+        None,
+        date(2026, 9, 3) if asset_type == "etf" else None,
+    )
+    monkeypatch.setattr(
+        ext_data_service,
+        "ExtConfigStore",
+        lambda *_args: SimpleNamespace(
+            load_all=lambda: [SimpleNamespace(id="snapshot", mode="snapshot")],
+        ),
+    )
+    requested_dates: list[str | None] = []
+
+    def read_ext(_config, _data_dir, snapshot_date=None):
+        requested_dates.append(snapshot_date)
+        return pl.DataFrame({"symbol": ["510300.SH"], "signal": ["etf-current"]}), None
+
+    api._ext_value_map_cache.clear()
+    monkeypatch.setattr(ext_data_api, "_read_ext_dataframe", read_ext)
+
+    value_maps = api._load_ext_value_maps(
+        client.app.state.repo,
+        "snapshot.signal",
+        "2026-09-03",
+        "etf",
+    )
+
+    assert requested_dates == [None]
+    assert value_maps == {"snapshot__signal": {"510300.SH": "etf-current"}}
+
+
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_change_only_invalidates_affected_export_snapshot(client, operation):
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(),
+        "gamma": result(),
+    })
+    invalidations: list[None] = []
+    client.app.state.monitor_engine.invalidate_strategy_state = lambda: invalidations.append(None)
+
+    if operation == "save":
+        engine = client.app.state.strategy_engine
+        engine.has = lambda _: True
+        engine.get = lambda _: SimpleNamespace(basic_filter={})
+        engine.find_dependents = lambda _: ["beta"]
+        response = client.post("/api/strategies/config", json={
+            "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+        })
+    else:
+        client.app.state.strategy_engine.find_dependents = lambda _: ["beta"]
+        response = client.delete("/api/strategies/config/alpha")
+
+    assert response.status_code == 200
+    assert response.json()["invalidated_strategy_ids"] == ["alpha", "beta"]
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached is not None
+    assert cached["results"] == {"gamma": result()}
+    assert invalidations == [None]
+
+
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_change_invalidates_composite_using_override_child(client, operation):
+    data_dir = client.app.state.repo.store.data_dir
+    custom_dir = data_dir / "strategies" / "custom"
+    composite_dir = data_dir / "strategies" / "composite"
+    custom_dir.mkdir(parents=True)
+    composite_dir.mkdir(parents=True)
+    for strategy_id in ("alpha", "beta"):
+        (custom_dir / f"{strategy_id}.py").write_text(
+            f'''import polars as pl
+META = {{"id": "{strategy_id}", "name": "{strategy_id}", "asset_types": ["stock"], "timeframes": ["1d"]}}
+EXECUTION_BACKEND = "polars_expr"
+def filter(df, params):
+    return pl.lit(True)
+''',
+            encoding="utf-8",
+        )
+    (composite_dir / "blend.py").write_text(
+        '''META = {
+    "id": "blend", "name": "blend", "asset_types": ["stock"], "timeframes": ["1d"],
+    "children": [{"strategy_id": "beta", "weight": 1.0}],
+}
+EXECUTION_BACKEND = "composite"
+''',
+        encoding="utf-8",
+    )
+    engine = StrategyEngine(
+        strategy_dirs=[custom_dir, composite_dir],
+        override_loader=lambda strategy_id: strategy_api.strategy_config.load_override(data_dir, strategy_id),
+    )
+    client.app.state.strategy_engine = engine
+    strategy_api.strategy_config.save_override(data_dir, "blend", {
+        "children": [{"strategy_id": "alpha", "weight": 1.0}],
+    })
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+        "blend": result(rows=[{"symbol": "000001.SZ"}]),
+    })
+
+    if operation == "save":
+        response = client.post("/api/strategies/config", json={
+            "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+        })
+    else:
+        response = client.delete("/api/strategies/config/alpha")
+
+    assert response.status_code == 200
+    assert response.json()["invalidated_strategy_ids"] == ["alpha", "blend"]
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached is not None
+    assert cached["results"] == {"beta": result(rows=[{"symbol": "600000.SH"}])}
+
+
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_dependency_error_invalidates_all_export_snapshot(client, operation):
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+    })
+    engine = client.app.state.strategy_engine
+    engine.find_dependents = lambda _: (_ for _ in ()).throw(TypeError("dependency failure"))
+
+    if operation == "save":
+        engine.has = lambda _: True
+        engine.get = lambda _: SimpleNamespace(basic_filter={})
+        with pytest.raises(TypeError, match="dependency failure"):
+            client.post("/api/strategies/config", json={
+                "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+            })
+    else:
+        with pytest.raises(TypeError, match="dependency failure"):
+            client.delete("/api/strategies/config/alpha")
+
+    assert strategy_cache.read_cache(data_dir) is None
+
+
+@pytest.mark.parametrize("operation", ["save", "reset"])
+def test_strategy_config_failure_still_clears_realtime_results(client, monkeypatch, operation):
+    class MonitorEngine:
+        def __init__(self):
+            self.results = {
+                "alpha": result(),
+                "beta": result(rows=[{"symbol": "600000.SH"}]),
+            }
+
+        def latest_strategy_results(self):
+            return self.results
+
+        def invalidate_strategy_state(self):
+            self.results = {}
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+        "gamma": result(rows=[{"symbol": "000003.SZ"}]),
+    })
+    client.app.state.monitor_engine = MonitorEngine()
+    engine = client.app.state.strategy_engine
+    engine.find_dependents = lambda _: ["beta"]
+    monkeypatch.setattr(
+        strategy_cache.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("cache replacement failed")),
+    )
+
+    if operation == "save":
+        engine.has = lambda _: True
+        engine.get = lambda _: SimpleNamespace(basic_filter={})
+        with pytest.raises(OSError, match="cache replacement failed"):
+            client.post("/api/strategies/config", json={
+                "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
+            })
+    else:
+        with pytest.raises(OSError, match="cache replacement failed"):
+            client.delete("/api/strategies/config/alpha")
+
+    cached = api._cached_with_realtime(SimpleNamespace(app=client.app))
+    assert cached["results"] == {}
+
+
+def test_clear_strategy_results_preserves_unaffected_cached_rows(tmp_path):
+    strategy_cache.write_cache(tmp_path, DAY, {
+        "alpha": result(),
+        "beta": result(rows=[{"symbol": "600000.SH"}]),
+    })
+
+    strategy_cache.clear_strategy_results(tmp_path, {"alpha"})
+
+    cached = strategy_cache.read_cache(tmp_path)
+    assert cached is not None
+    assert cached["results"] == {"beta": result(rows=[{"symbol": "600000.SH"}])}
+    assert cached["today_ever_matched"] == {"beta": ["600000.SH"]}
+    assert cached["today_ever_rows"] == {"beta": {"600000.SH": {"symbol": "600000.SH"}}}
+
+
+def test_clear_strategy_results_fails_closed_when_atomic_replace_fails(tmp_path, monkeypatch):
+    strategy_cache.write_cache(tmp_path, DAY, {"alpha": result(), "beta": result()})
+    monkeypatch.setattr(strategy_cache.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("synthetic failure")))
+
+    with pytest.raises(OSError, match="synthetic failure"):
+        strategy_cache.clear_strategy_results(tmp_path, {"alpha"})
+
+    assert strategy_cache.read_cache(tmp_path) is None
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_reload_cannot_publish_an_inflight_old_strategy_result(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    engine.reload = lambda: None
+    old_started = threading.Event()
+    release_old = threading.Event()
+    old_result = ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy="alpha", rows=[{"symbol": "000001.SZ"}], total=1,
+    )
+    new_result = ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy="alpha", rows=[{"symbol": "000002.SZ"}], total=1,
+    )
+
+    def old_run(*_args, **_kwargs):
+        old_started.set()
+        assert release_old.wait(timeout=2)
+        return old_result if run_kind == "single" else {"alpha": old_result}
+
+    if run_kind == "single":
+        engine.run = old_run
+    else:
+        engine.run_all = old_run
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000001.SZ"]}),
+        ),
+    )
+    old_response: dict[str, object] = {}
+
+    def run_old_request():
+        if run_kind == "single":
+            old_response["value"] = client.post("/api/screener/run_preset", json={
+                "strategy_id": "alpha", "as_of": DAY,
+            })
+        else:
+            old_response["value"] = client.post("/api/screener/run_all", json={
+                "strategy_ids": ["alpha"], "as_of": DAY,
+            })
+
+    old_thread = threading.Thread(target=run_old_request)
+    old_thread.start()
+    assert old_started.wait(timeout=2)
+    assert client.post("/api/strategies/reload").status_code == 200
+    if run_kind == "single":
+        engine.run = lambda *_args, **_kwargs: new_result
+        new_response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": DAY,
+        })
+    else:
+        engine.run_all = lambda *_args, **_kwargs: {"alpha": new_result}
+        new_response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": DAY,
+        })
+    assert new_response.status_code == 200
+    release_old.set()
+    old_thread.join(timeout=2)
+
+    assert not old_thread.is_alive()
+    assert old_response["value"].status_code == 200
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached["results"]["alpha"]["rows"] == [{"symbol": "000002.SZ"}]
+    assert client.get("/api/screener/export").json()["symbols"] == ["000002.SZ"]
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_stale_run_cannot_replace_newer_snapshot(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    latest = {"date": date(2026, 9, 4)}
+    client.app.state.repo.enriched_latest_date = lambda: latest["date"]
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    old_result = ScreenerResult(
+        as_of=date(2026, 9, 4), strategy="alpha", rows=[{"symbol": "000001.SZ"}], total=1,
+    )
+
+    def complete_newer_run(*_args, **_kwargs):
+        strategy_cache.write_cache(data_dir, "2026-09-07", {
+            "alpha": result([{"symbol": "000007.SZ"}], day="2026-09-07"),
+            "beta": result([{"symbol": "600007.SH"}], day="2026-09-07"),
+        })
+        latest["date"] = date(2026, 9, 7)
+        return old_result if run_kind == "single" else {"alpha": old_result}
+
+    if run_kind == "single":
+        engine.run = complete_newer_run
+    else:
+        engine.run_all = complete_newer_run
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000001.SZ"]}),
+        ),
+    )
+
+    if run_kind == "single":
+        response = client.post("/api/screener/run_preset", json={
+            "strategy_id": "alpha", "as_of": "2026-09-04",
+        })
+    else:
+        response = client.post("/api/screener/run_all", json={
+            "strategy_ids": ["alpha"], "as_of": "2026-09-04",
+        })
+
+    assert response.status_code == 200
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached["as_of"] == "2026-09-07"
+    assert set(cached["results"]) == {"alpha", "beta"}
+
+
+@pytest.mark.parametrize("run_kind", ["single", "batch"])
+def test_latest_date_check_is_serialized_with_cache_write(client, monkeypatch, run_kind):
+    import polars as pl
+
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    old_result = ScreenerResult(
+        as_of=date(2026, 9, 4), strategy="alpha", rows=[{"symbol": "000001.SZ"}], total=1,
+    )
+    if run_kind == "single":
+        engine.run = lambda *_args, **_kwargs: old_result
+    else:
+        engine.run_all = lambda *_args, **_kwargs: {"alpha": old_result}
+    monkeypatch.setattr(
+        api.ScreenerService,
+        "build_strategy_context",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            current=pl.DataFrame({"symbol": ["000001.SZ"]}),
+        ),
+    )
+
+    old_latest_read = threading.Event()
+    release_old = threading.Event()
+
+    def blocked_latest_date():
+        old_latest_read.set()
+        assert release_old.wait(timeout=2)
+        return date(2026, 9, 4)
+
+    monkeypatch.setattr(client.app.state.repo, "enriched_latest_date", blocked_latest_date)
+    response: dict[str, object] = {}
+
+    def run_old_request():
+        if run_kind == "single":
+            response["value"] = client.post("/api/screener/run_preset", json={
+                "strategy_id": "alpha", "as_of": "2026-09-04",
+            })
+        else:
+            response["value"] = client.post("/api/screener/run_all", json={
+                "strategy_ids": ["alpha"], "as_of": "2026-09-04",
+            })
+
+    old_thread = threading.Thread(target=run_old_request)
+    old_thread.start()
+    assert old_latest_read.wait(timeout=2)
+
+    newer_write_started = threading.Event()
+    newer_write_finished = threading.Event()
+
+    def write_newer_snapshot():
+        newer_write_started.set()
+        strategy_cache.write_cache(data_dir, "2026-09-07", {
+            "alpha": result([{"symbol": "000007.SZ"}], day="2026-09-07"),
+            "beta": result([{"symbol": "600007.SH"}], day="2026-09-07"),
+        })
+        newer_write_finished.set()
+
+    newer_thread = threading.Thread(target=write_newer_snapshot)
+    newer_thread.start()
+    assert newer_write_started.wait(timeout=2)
+    # 最新日期读取和旧快照写入必须同处缓存锁内, 否则新快照会先完成并被旧任务覆盖。
+    assert not newer_write_finished.wait(timeout=0.5)
+    release_old.set()
+    old_thread.join(timeout=2)
+    newer_thread.join(timeout=2)
+
+    assert not old_thread.is_alive() and not newer_thread.is_alive()
+    assert response["value"].status_code == 200
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached["as_of"] == "2026-09-07"
+    assert set(cached["results"]) == {"alpha", "beta"}

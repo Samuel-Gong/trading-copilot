@@ -345,3 +345,122 @@ def test_delete_with_nested_python_strategy_reference_is_side_effect_free(
     assert blocked.json()["detail"]["references"] == ["strategies/custom/my_strategy.py"]
     assert get_factor("uf_python_ref") is not None
     assert store.exists(data_dir, "uf_python_ref")
+
+
+def test_delete_cannot_be_undone_by_concurrent_update(
+    tmp_path, monkeypatch, cleanup_registry,
+) -> None:
+    """更新读到旧定义后与删除交错时, 最终不得把已删除因子复活。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    from threading import Event
+    from types import SimpleNamespace
+
+    from app.factors import store
+    from app.factors.registry import get_factor
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=Path(tmp_path)))
+    client = TestClient(app)
+    data_dir = Path(tmp_path)
+    factor_id = "uf_delete_update_race"
+    cleanup_registry.add(factor_id)
+    created = client.post("/api/factors/custom", json={
+        "id": factor_id,
+        "label": "删除更新竞态",
+        "formula": "rank(-ts_sum(change_pct, 5))",
+    })
+    assert created.status_code == 200
+
+    update_reached_persist = Event()
+    delete_finished = Event()
+    real_persist = store.persist_definition
+
+    def _delayed_update_persist(data_dir_arg, definition, **kwargs):
+        if definition.get("label") == "并发更新":
+            update_reached_persist.set()
+            delete_finished.wait(timeout=0.2)
+        return real_persist(data_dir_arg, definition, **kwargs)
+
+    def _delete():
+        response = client.delete(f"/api/factors/custom/{factor_id}")
+        delete_finished.set()
+        return response
+
+    monkeypatch.setattr(store, "persist_definition", _delayed_update_persist)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        update = pool.submit(client.post, f"/api/factors/custom/{factor_id}/update", json={
+            "label": "并发更新",
+            "formula": "rank(-ts_sum(change_pct, 5))",
+        })
+        assert update_reached_persist.wait(timeout=1)
+        delete = pool.submit(_delete)
+        assert update.result(timeout=2).status_code == 200
+        assert delete.result(timeout=2).status_code == 200
+
+    assert not store.exists(data_dir, factor_id)
+    assert get_factor(factor_id) is None
+
+
+def test_delete_blocks_concurrent_composite_reference_creation(
+    tmp_path, monkeypatch, cleanup_registry,
+) -> None:
+    """引用扫描后并发创建复合因子时, 不得留下指向已删除成员的定义。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    from threading import Event
+    from types import SimpleNamespace
+
+    from app.api import factors as factors_api
+    from app.factors import store
+    from app.factors.registry import get_factor
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=Path(tmp_path)))
+    client = TestClient(app)
+    data_dir = Path(tmp_path)
+    member_id = "uf_reference_race"
+    composite_id = "cf_reference_race"
+    cleanup_registry.update({member_id, composite_id})
+    created = client.post("/api/factors/custom", json={
+        "id": member_id,
+        "label": "引用竞态成员",
+        "formula": "rank(-ts_sum(change_pct, 5))",
+    })
+    assert created.status_code == 200
+
+    scan_completed = Event()
+    create_finished = Event()
+    real_find_references = factors_api._find_references
+
+    def _delayed_reference_scan(data_dir_arg, factor_id):
+        references = real_find_references(data_dir_arg, factor_id)
+        scan_completed.set()
+        create_finished.wait(timeout=0.2)
+        return references
+
+    def _create_composite():
+        response = client.post("/api/factors/composite", json={
+            "id": composite_id,
+            "label": "并发引用",
+            "members": {member_id: 1.0, "momentum_10d": 1.0},
+        })
+        create_finished.set()
+        return response
+
+    monkeypatch.setattr(factors_api, "_find_references", _delayed_reference_scan)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        delete = pool.submit(client.delete, f"/api/factors/custom/{member_id}")
+        assert scan_completed.wait(timeout=1)
+        create = pool.submit(_create_composite)
+        assert delete.result(timeout=2).status_code == 200
+        assert create.result(timeout=2).status_code == 400
+
+    assert get_factor(member_id) is None
+    assert get_factor(composite_id) is None
+    assert not store.exists(data_dir, member_id)
+    assert not store.exists(data_dir, composite_id)

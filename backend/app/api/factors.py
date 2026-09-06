@@ -260,7 +260,7 @@ def create_custom_factor(req: CustomFactorCreateRequest, request: Request) -> di
     definition = {
         "id": factor_id,
         "kind": "custom",
-        "version": _next_version(data_dir, factor_id),
+        "version": 1,
         "label": req.label,
         "group": req.group,
         "formula": req.formula,
@@ -276,7 +276,9 @@ def create_custom_factor(req: CustomFactorCreateRequest, request: Request) -> di
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _trial_nonempty(request, req.formula)
     try:
-        store.persist_definition(data_dir, definition)
+        with store.definitions_transaction(data_dir):
+            definition["version"] = _next_version(data_dir, factor_id)
+            store.persist_definition(data_dir, definition)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "id": factor_id, "version": definition["version"]}
@@ -287,21 +289,22 @@ def create_composite_factor(req: CompositeFactorCreateRequest, request: Request)
     """保存复合因子: 成员校验 + 循环引用检查 (无需试算, 值由成员物化路径计算)。"""
     data_dir = _data_dir(request)
     factor_id = _resolve_id(req.id, req.label, "cf")
-    definition = {
-        "id": factor_id,
-        "kind": "composite",
-        "version": _next_version(data_dir, factor_id),
-        "label": req.label,
-        "group": req.group,
-        "members": req.members,
-        "description": req.description,
-        "direction": req.direction,
-        "status": "draft",
-        "created_at": store._now(),
-        "updated_at": store._now(),
-    }
     try:
-        store.persist_definition(data_dir, definition)
+        with store.definitions_transaction(data_dir):
+            definition = {
+                "id": factor_id,
+                "kind": "composite",
+                "version": _next_version(data_dir, factor_id),
+                "label": req.label,
+                "group": req.group,
+                "members": req.members,
+                "description": req.description,
+                "direction": req.direction,
+                "status": "draft",
+                "created_at": store._now(),
+                "updated_at": store._now(),
+            }
+            store.persist_definition(data_dir, definition)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "id": factor_id, "version": definition["version"]}
@@ -322,30 +325,33 @@ def update_custom_factor(factor_id: str, req: CustomFactorUpdateRequest, request
     公式变化时状态回 draft (生命周期语义: 编辑后需重新检验激活); 仅改名称/分组保留状态。
     """
     data_dir = _data_dir(request)
-    target = None
-    for definition in store.load_all(data_dir):
-        if str(definition.get("id")) == factor_id:
-            target = definition
-            break
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"自定义因子不存在: {factor_id}")
-    if str(target.get("kind", "custom")) != "custom":
-        raise HTTPException(status_code=400, detail=f"仅自定义因子支持公式编辑 (kind={target.get('kind')})")
-    formula_changed = str(target.get("formula")) != req.formula
-    if formula_changed:
-        _trial_nonempty(request, req.formula)
-    target.update({
-        "label": req.label,
-        "group": req.group,
-        "formula": req.formula,
-        "description": req.description,
-        "direction": req.direction,
-        "version": int(target.get("version", 1)) + 1,  # 版本提升 → 注册表允许覆盖
-        "status": "draft" if formula_changed else str(target.get("status", "draft")),
-        "updated_at": store._now(),
-    })
     try:
-        store.persist_definition(data_dir, target)
+        with store.definitions_transaction(data_dir):
+            target = next(
+                (item for item in store.load_all(data_dir) if str(item.get("id")) == factor_id),
+                None,
+            )
+            if target is None:
+                raise HTTPException(status_code=404, detail=f"自定义因子不存在: {factor_id}")
+            if str(target.get("kind", "custom")) != "custom":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"仅自定义因子支持公式编辑 (kind={target.get('kind')})",
+                )
+            formula_changed = str(target.get("formula")) != req.formula
+            if formula_changed:
+                _trial_nonempty(request, req.formula)
+            target.update({
+                "label": req.label,
+                "group": req.group,
+                "formula": req.formula,
+                "description": req.description,
+                "direction": req.direction,
+                "version": int(target.get("version", 1)) + 1,
+                "status": "draft" if formula_changed else str(target.get("status", "draft")),
+                "updated_at": store._now(),
+            })
+            store.persist_definition(data_dir, target)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "id": factor_id, "version": target["version"], "status": target["status"]}
@@ -387,7 +393,7 @@ def delete_custom_factor(factor_id: str, request: Request, force: bool = Query(d
     data_dir = _data_dir(request)
     from app.factors.registry import get_factor
 
-    with store.factor_transaction(data_dir, factor_id):
+    with store.definitions_transaction(data_dir):
         if get_factor(factor_id) is None and not store.exists(data_dir, factor_id):
             raise HTTPException(status_code=404, detail=f"因子不存在: {factor_id}")
         references = _find_references(data_dir, factor_id)
@@ -421,19 +427,19 @@ class FactorStatusRequest(BaseModel):
 def update_factor_status(factor_id: str, req: FactorStatusRequest, request: Request) -> dict:
     """生命周期状态迁移 (P4): draft->active->watch->retired, 编辑后回 draft。"""
     data_dir = _data_dir(request)
-    target = None
-    for definition in store.load_all(data_dir):
-        if str(definition.get("id")) == factor_id:
-            target = definition
-            break
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"自定义因子不存在: {factor_id}")
-    target["status"] = req.status
-    target["updated_at"] = store._now()
     try:
-        # 动态因子先注销再注册: 元数据变更 (status/group) 不提升版本,
-        # 直接 register 会因"版本未提升"被拒 (启动加载后的真实路径)
-        store.persist_definition(data_dir, target, replace_registered=True)
+        with store.definitions_transaction(data_dir):
+            target = next(
+                (item for item in store.load_all(data_dir) if str(item.get("id")) == factor_id),
+                None,
+            )
+            if target is None:
+                raise HTTPException(status_code=404, detail=f"自定义因子不存在: {factor_id}")
+            target["status"] = req.status
+            target["updated_at"] = store._now()
+            # 动态因子先注销再注册: 元数据变更 (status/group) 不提升版本,
+            # 直接 register 会因"版本未提升"被拒 (启动加载后的真实路径)
+            store.persist_definition(data_dir, target, replace_registered=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "id": factor_id, "status": req.status}
@@ -450,17 +456,17 @@ def update_factor_group(factor_id: str, req: FactorGroupRequest, request: Reques
     group = req.group.strip()
     if not group:
         raise HTTPException(status_code=400, detail="分组名不能为空")
-    target = None
-    for definition in store.load_all(data_dir):
-        if str(definition.get("id")) == factor_id:
-            target = definition
-            break
-    if target is None:
-        raise HTTPException(status_code=404, detail=f"自定义因子不存在: {factor_id}")
-    target["group"] = group
-    target["updated_at"] = store._now()
     try:
-        store.persist_definition(data_dir, target, replace_registered=True)
+        with store.definitions_transaction(data_dir):
+            target = next(
+                (item for item in store.load_all(data_dir) if str(item.get("id")) == factor_id),
+                None,
+            )
+            if target is None:
+                raise HTTPException(status_code=404, detail=f"自定义因子不存在: {factor_id}")
+            target["group"] = group
+            target["updated_at"] = store._now()
+            store.persist_definition(data_dir, target, replace_registered=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "id": factor_id, "group": group}

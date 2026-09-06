@@ -32,7 +32,7 @@ COMPOSITE_ID_PATTERN = re.compile(r"^cf_[a-z0-9_]{1,40}$")
 MAX_COMPOSITE_MEMBERS = 8
 STATUSES = frozenset({"draft", "active", "watch", "retired"})
 _LOCKS_GUARD = threading.Lock()
-_FACTOR_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_DATA_DIR_LOCKS: dict[str, threading.RLock] = {}
 
 
 def _dir(data_dir: Path) -> Path:
@@ -46,11 +46,11 @@ def _path(data_dir: Path, factor_id: str) -> Path:
 
 
 @contextmanager
-def factor_transaction(data_dir: Path, factor_id: str):
-    """串行化同一数据目录、同一因子的完整持久化事务。"""
-    key = (str(data_dir.resolve()), factor_id)
+def definitions_transaction(data_dir: Path):
+    """串行化同一数据目录的因子定义与引用图事务。"""
+    key = str(data_dir.resolve())
     with _LOCKS_GUARD:
-        lock = _FACTOR_LOCKS.setdefault(key, threading.RLock())
+        lock = _DATA_DIR_LOCKS.setdefault(key, threading.RLock())
     with lock:
         yield
 
@@ -215,7 +215,7 @@ def persist_definition(
 ) -> FactorSpec:
     """先原子落盘再注册; 注册失败时恢复磁盘和既有注册表状态。"""
     factor_id = str(definition["id"])
-    with factor_transaction(data_dir, factor_id):
+    with definitions_transaction(data_dir):
         spec = to_spec(definition)
         target = _path(data_dir, factor_id)
         previous = target.read_bytes() if target.exists() else None

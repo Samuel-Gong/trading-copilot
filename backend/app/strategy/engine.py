@@ -637,17 +637,24 @@ class StrategyEngine:
         return True
 
     def find_dependents(self, strategy_id: str) -> list[str]:
-        """返回引用了 strategy_id 作为子策略的所有 composite 策略 id。
+        """返回当前有效配置中引用 strategy_id 的所有 composite 策略 id。
 
         供删除校验使用: 删除被引用的子策略会令 composite 加载失败,
         删除前应阻止(fail-closed)或提示用户先解除引用。策略数量通常很小,
-        线性遍历注册表即可, 无需维护反向索引。
+        线性遍历注册表即可, 无需维护反向索引。若有用户覆盖的 children,
+        其语义与执行时一致: 非空 children 列表替代 META.children。
         """
         dependents: list[str] = []
         for sid, strategy in self._strategies.items():
             if strategy.execution_backend != "composite" or strategy.composite is None:
                 continue
-            if any(c.strategy_id == strategy_id for c in strategy.composite.children):
+            children = strategy.composite.children
+            if self._override_loader is not None:
+                override = self._override_loader(sid)
+                override_children = override.get("children") if isinstance(override, dict) else None
+                if isinstance(override_children, list) and override_children:
+                    children = _parse_composite_children(override_children).children
+            if any(c.strategy_id == strategy_id for c in children):
                 dependents.append(sid)
         return dependents
 

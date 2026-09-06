@@ -48,7 +48,7 @@ def _get_public_strategy(engine: StrategyEngine, strategy_id: str) -> StrategyDe
         strategy = engine.get(strategy_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if strategy.meta.get("research_only"):
+    if getattr(strategy, "meta", {}).get("research_only"):
         raise HTTPException(status_code=404, detail=f"unknown strategy: {strategy_id}")
     return strategy
 
@@ -64,13 +64,52 @@ def _data_dir(request: Request) -> Path:
     return request.app.state.repo.store.data_dir
 
 
-def _invalidate_strategy_runtime(request: Request) -> None:
+def _strategy_and_dependents(engine, strategy_id: str) -> set[str]:
+    """返回配置变更后必须重跑的策略及其直接叠加策略。"""
+    affected = {strategy_id}
+    find_dependents = getattr(engine, "find_dependents", None)
+    if find_dependents is not None:
+        affected.update(find_dependents(strategy_id))
+    return affected
+
+
+def _invalidate_strategy_runtime(request: Request, strategy_ids: set[str] | None = None) -> None:
     from app.services import strategy_cache
 
-    strategy_cache.clear_cache(_data_dir(request))
     monitor_engine = getattr(request.app.state, "monitor_engine", None)
+    monitor_error: Exception | None = None
     if monitor_engine is not None:
-        monitor_engine.invalidate_strategy_state()
+        try:
+            monitor_engine.invalidate_strategy_state()
+        except Exception as e:
+            logger.exception("策略监控状态失效失败")
+            monitor_error = e
+    try:
+        if strategy_ids is None:
+            strategy_cache.clear_cache(_data_dir(request))
+        else:
+            strategy_cache.clear_strategy_results(_data_dir(request), strategy_ids)
+    except Exception as cache_error:
+        if monitor_error is not None:
+            raise monitor_error from cache_error
+        raise
+    if monitor_error is not None:
+        raise monitor_error
+
+
+def _affected_strategies_or_invalidate_all(
+    request: Request, engine: StrategyEngine, strategy_id: str,
+) -> set[str]:
+    """解析依赖失败时全量失效, 避免叠加策略继续导出过期结果。"""
+    try:
+        return _strategy_and_dependents(engine, strategy_id)
+    except Exception:
+        logger.exception("解析策略 %s 的依赖失败, 改为全量清理运行缓存", strategy_id)
+        try:
+            _invalidate_strategy_runtime(request)
+        except Exception:
+            logger.exception("解析策略依赖失败后的全量缓存清理失败")
+        raise
 
 
 def _missing_custom_signals(data_dir: Path, required_features) -> list[str]:
@@ -449,7 +488,9 @@ def save_config(req: SaveConfigRequest, request: Request):
     overrides = _strip_defaults(req.strategy_id, req.overrides, engine)
 
     strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
-    return {"ok": True}
+    affected = _affected_strategies_or_invalidate_all(request, engine, req.strategy_id)
+    _invalidate_strategy_runtime(request, affected)
+    return {"ok": True, "invalidated_strategy_ids": sorted(affected)}
 
 
 @router.patch("/config")
@@ -521,7 +562,9 @@ def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
 def reset_config(strategy_id: str, request: Request):
     _get_public_strategy(_get_engine(request), strategy_id)
     strategy_config.delete_override(_data_dir(request), strategy_id)
-    return {"ok": True}
+    affected = _affected_strategies_or_invalidate_all(request, _get_engine(request), strategy_id)
+    _invalidate_strategy_runtime(request, affected)
+    return {"ok": True, "invalidated_strategy_ids": sorted(affected)}
 
 
 # ── AI 生成 ───────────────────────────────────────────────────────────
