@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services import strategy_cache
 
 
@@ -88,3 +90,17 @@ def test_guarded_write_replaces_future_cache_beyond_latest_available_data(tmp_pa
     cached = strategy_cache.read_cache(tmp_path)
     assert cached["as_of"] == "2026-07-20"
     assert cached["results"]["a"]["rows"][0]["symbol"] == "000002.SZ"
+
+
+def test_cache_write_failure_removes_previous_export_snapshot(tmp_path, monkeypatch):
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000001.SZ")})
+    monkeypatch.setattr(
+        strategy_cache.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("synthetic failure")),
+    )
+
+    with pytest.raises(OSError, match="synthetic failure"):
+        strategy_cache.write_cache(tmp_path, "2026-07-20", {"a": _result("000002.SZ")})
+
+    assert strategy_cache.read_cache(tmp_path) is None

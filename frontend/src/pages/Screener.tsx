@@ -4,7 +4,7 @@ import { motion } from 'framer-motion'
 import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, Download } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
-import { createScreenerRequestCoordinator, type CoordinatedRequest } from '@/lib/screenerRequestCoordinator'
+import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -51,7 +51,9 @@ type RunAllRequestVariables = {
 }
 
 type QueuedRunAllRequest = {
-  vars: RunAllRequestVariables
+  vars: Required<Pick<RunAllRequestVariables, 'date' | 'extColumns' | 'assetType'>>
+    & Pick<RunAllRequestVariables, 'strategyIds'>
+    & { context: ScreenerRequestContext }
 }
 
 export function Screener() {
@@ -113,16 +115,20 @@ export function Screener() {
   const runAllDateRef = useRef<string | null>(null)
   const transientColumnRefreshRef = useRef<string | null>(null)
   const latestDataDateRef = useRef<string | null>(null)
+  const strategyPoolContextKeyRef = useRef<string | null>(null)
   const requestCoordinatorRef = useRef(createScreenerRequestCoordinator<QueuedRunAllRequest>())
   const requestCoordinator = requestCoordinatorRef.current
+  const requestContextRef = useRef(createScreenerRequestContext({ asOf: '', assetType: 'stock' }))
+  const requestContext = requestContextRef.current
   const qc = useQueryClient()
 
-  const invalidateScreenerRequests = useCallback(() => {
+  const invalidateScreenerRequests = useCallback((next: Partial<Omit<ScreenerRequestContext, 'version'>> = {}) => {
+    const context = requestContext.invalidate(next)
     const epoch = requestCoordinator.invalidate()
     runAllDateRef.current = null
     transientColumnRefreshRef.current = null
-    return epoch
-  }, [requestCoordinator])
+    return { context, epoch }
+  }, [requestContext, requestCoordinator])
 
   // 结果列配置 — 默认内置列，异步合并后端/localStorage 偏好
   const [columns, setColumns] = useState<ColumnConfig[]>([...SCREENER_BUILTIN_COLUMNS])
@@ -212,7 +218,7 @@ export function Screener() {
     const previousLatest = latestDataDateRef.current
     latestDataDateRef.current = latest
     if (previousLatest && asOf !== previousLatest) return
-    invalidateScreenerRequests()
+    invalidateScreenerRequests({ asOf: latest })
     setAsOf(latest)
     setTransientBatchResults(null)
     setResult(null)
@@ -250,6 +256,49 @@ export function Screener() {
     [strategyPresets],
   )
   const visiblePool = useMemo(() => pool.filter(id => availableStrategyIds.has(id)), [pool, availableStrategyIds])
+  const visiblePoolContextKey = visiblePool.join('\u0000')
+
+  const invalidateStrategyPoolContext = useCallback((nextPool: string[]) => {
+    strategyPoolContextKeyRef.current = nextPool
+      .filter(id => availableStrategyIds.has(id))
+      .join('\u0000')
+    invalidateScreenerRequests()
+    setTransientBatchResults(null)
+    setResult(null)
+    setHitCounts({})
+    setExpiredCounts({})
+  }, [availableStrategyIds, invalidateScreenerRequests])
+
+  const updateStrategyPool = useCallback((nextPool: string[]) => {
+    invalidateStrategyPoolContext(nextPool)
+    reorderPool(nextPool)
+  }, [invalidateStrategyPoolContext, reorderPool])
+
+  const addStrategyToPool = useCallback((strategyId: string) => {
+    if (pool.includes(strategyId)) return
+    invalidateStrategyPoolContext([...pool, strategyId])
+    addToPool(strategyId)
+  }, [addToPool, invalidateStrategyPoolContext, pool])
+
+  const removeStrategyFromPool = useCallback((strategyId: string) => {
+    if (!pool.includes(strategyId)) return
+    invalidateStrategyPoolContext(pool.filter(id => id !== strategyId))
+    removeFromPool(strategyId)
+  }, [invalidateStrategyPoolContext, pool, removeFromPool])
+
+  useEffect(() => {
+    if (strategyPoolContextKeyRef.current === null) {
+      strategyPoolContextKeyRef.current = visiblePoolContextKey
+      return
+    }
+    if (strategyPoolContextKeyRef.current === visiblePoolContextKey) return
+    strategyPoolContextKeyRef.current = visiblePoolContextKey
+    invalidateScreenerRequests()
+    setTransientBatchResults(null)
+    setResult(null)
+    setHitCounts({})
+    setExpiredCounts({})
+  }, [invalidateScreenerRequests, visiblePoolContextKey])
 
   // 策略文件加载失败时提示用户(避免"策略静默消失"被误判为正常)
   const loadErrors = strategies.data?.load_errors ?? []
@@ -270,18 +319,18 @@ export function Screener() {
     if (!strategyPoolReady || !canPruneUnavailable) return
     const pruned = pruneUnavailableStrategyPool(pool, allStrategyIds, true)
     if (strategyPoolsEqual(pool, pruned)) return
-    reorderPool(pruned)
+    updateStrategyPool(pruned)
   }, [
     allStrategyIds,
     canPruneUnavailable,
     pool,
-    reorderPool,
+    updateStrategyPool,
     strategyPoolReady,
   ])
 
   // 进入页面自动跑策略池中的策略，获取命中数
   const runAll = useMutation({
-    mutationFn: (vars: RunAllRequestVariables & CoordinatedRequest) => {
+    mutationFn: (vars: QueuedRunAllRequest['vars'] & CoordinatedRequest) => {
       const { date, strategyIds, extColumns, assetType: requestedAssetType } = vars
       const latestDataDate = tradingDatesQuery.data?.latest_date ?? dataStatus.data?.enriched?.latest_date
       const includeRows = requiresTransientBatchRows(date, latestDataDate)
@@ -294,8 +343,8 @@ export function Screener() {
       )
     },
     onSuccess: (data, vars) => {
-      if (!requestCoordinator.isCurrent(vars.epoch)) return
-      if (data.as_of) setAsOf(data.as_of)
+      if (!requestCoordinator.isCurrent(vars.epoch) || !requestContext.matches(vars.context)) return
+      if (data.as_of !== vars.context.asOf) return
       const counts: Record<string, number> = {}
       const rows: ScreenerBatchResultSource['results'] = {}
       for (const [id, item] of Object.entries(data.results)) {
@@ -307,8 +356,8 @@ export function Screener() {
         ? {
             as_of: data.as_of,
             results: rows,
-            asset_type: vars.assetType ?? assetType,
-            ext_columns: vars.extColumns ?? '',
+            asset_type: vars.context.assetType,
+            ext_columns: vars.extColumns,
           }
         : null)
       for (const [id, item] of Object.entries(data.results)) {
@@ -338,14 +387,16 @@ export function Screener() {
   const requestRunAll = useCallback((
     vars: RunAllRequestVariables = {},
   ) => {
+    const context = requestContext.current()
+    const bound = bindScreenerRequestContext(vars, context)
+    if (!bound) return
     requestCoordinator.request({
       vars: {
-        ...vars,
-        assetType: vars.assetType ?? assetType,
+        ...bound,
         extColumns: vars.extColumns ?? extColumnsParam,
       },
     }, startRunAll)
-  }, [assetType, extColumnsParam, requestCoordinator, startRunAll])
+  }, [extColumnsParam, requestContext, requestCoordinator, startRunAll])
 
   // 历史结果只驻留在页面内存。用户变更扩展列后重新读取该日期的明细，
   // 避免“全部”视图继续展示旧列；历史请求仍不会写入共享导出快照。
@@ -577,11 +628,16 @@ export function Screener() {
       id: string
       date: string
       assetType: 'stock' | 'etf'
+      context: ScreenerRequestContext
       epoch: number
     }) =>
       api.screenerRunPreset(id, undefined, date || undefined, extColumnsParam || undefined, requestedAssetType),
     onSuccess: (data, vars) => {
-      if (!requestCoordinator.isCurrent(vars.epoch) || vars.id !== activeStrategyRef.current) return
+      if (
+        !requestCoordinator.isCurrent(vars.epoch)
+        || !requestContext.matches(vars.context)
+        || vars.id !== activeStrategyRef.current
+      ) return
       setResult(data)
       setTransientBatchResults(current => updateTransientBatchResult(current, vars.id, {
         as_of: data.as_of,
@@ -597,6 +653,7 @@ export function Screener() {
 
   const handleRun = (s: ScreenerStrategy) => {
     if (activeStrategy !== s.id || showAll) invalidateScreenerRequests()
+    const context = requestContext.current()
     handleStrategySwitch(s.id)
     activeStrategyRef.current = s.id
     setActiveStrategy(s.id)
@@ -605,17 +662,21 @@ export function Screener() {
     // ETF 模式: 无股票盘后缓存, 始终实时单跑。
     // 传空日期让后端用 ETF 自己的最新交易日 (asOf 跟随的是股票 enriched, 两者可能不同日)。
     if (assetType !== 'stock') {
-      run.mutate({ id: s.id, date: '', assetType, epoch: requestCoordinator.currentEpoch() })
+      run.mutate({ id: s.id, date: '', assetType: context.assetType, context, epoch: requestCoordinator.currentEpoch() })
       return
     }
     // 摘要命中时由 singleCachedQuery 按需加载明细；缺失时才单独计算。
-    if (summaryQuery.data?.results[s.id]?.as_of === asOf || runAll.isPending) return
-    run.mutate({ id: s.id, date: asOf, assetType, epoch: requestCoordinator.currentEpoch() })
+    if (summaryQuery.data?.results[s.id]?.as_of === context.asOf) return
+    if (runAll.isPending) {
+      requestRunAll({ date: context.asOf, strategyIds: [s.id], assetType: context.assetType })
+      return
+    }
+    run.mutate({ id: s.id, date: context.asOf, assetType: context.assetType, context, epoch: requestCoordinator.currentEpoch() })
   }
 
   // 日期变化交给统一 effect 计算一次，避免这里与 effect 重复请求。
   const handleDateChange = (newDate: string) => {
-    invalidateScreenerRequests()
+    invalidateScreenerRequests({ asOf: newDate })
     setAsOf(newDate)
     setTransientBatchResults(null)
     setResult(null)
@@ -623,7 +684,7 @@ export function Screener() {
 
   const handleAssetTypeChange = (nextAssetType: 'stock' | 'etf') => {
     if (nextAssetType === assetType) return
-    invalidateScreenerRequests()
+    invalidateScreenerRequests({ assetType: nextAssetType })
     setTransientBatchResults(null)
     setHitCounts({})
     setExpiredCounts({})
@@ -680,7 +741,7 @@ export function Screener() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['screener-strategies'] })
       qc.invalidateQueries({ queryKey: ['screener-cached'] })
-      if (asOf) requestRunAll({ date: asOf })
+      if (requestContext.current().asOf) requestRunAll()
     },
   })
 
@@ -1171,19 +1232,25 @@ export function Screener() {
         onSaved={(limit, invalidatedStrategyIds) => {
           if (settingsStrategyId) {
             invalidateScreenerRequests()
+            const context = requestContext.current()
             setStrategyLimits(prev => ({ ...prev, [settingsStrategyId]: limit }))
             const affected = invalidatedStrategyIds.length ? invalidatedStrategyIds : [settingsStrategyId]
             if (result?.strategy && affected.includes(result.strategy)) setResult(null)
             const transient = transientBatchResults
-            if (transient?.asset_type === assetType && affected.some(id => id in transient.results)) {
+            if (
+              transient?.as_of === context.asOf
+              && transient.asset_type === context.assetType
+              && affected.some(id => id in transient.results)
+            ) {
               setTransientBatchResults(removeTransientBatchResults(transient, affected))
-              requestRunAll({ date: asOf, strategyIds: Object.keys(transient.results) })
+              requestRunAll({ strategyIds: Object.keys(transient.results) })
               return
             }
             run.mutate({
               id: settingsStrategyId,
-              date: assetType === 'stock' ? asOf : '',
-              assetType,
+              date: context.assetType === 'stock' ? context.asOf : '',
+              assetType: context.assetType,
+              context,
               epoch: requestCoordinator.currentEpoch(),
             })
           }
@@ -1209,7 +1276,7 @@ export function Screener() {
         }}
         onDeleted={() => {
           if (settingsStrategyId) {
-            removeFromPool(settingsStrategyId)
+            removeStrategyFromPool(settingsStrategyId)
             const rules = storage.strategyRules.get({})
             delete rules[settingsStrategyId]; storage.strategyRules.set(rules)
             setStrategyLimits(prev => { const next = {...prev}; delete next[settingsStrategyId]; return next })
@@ -1222,7 +1289,7 @@ export function Screener() {
         <StrategyPoolDialog
           pool={pool}
           onConfirm={(newPool) => {
-            reorderPool(newPool)
+            updateStrategyPool(newPool)
           }}
           onClose={() => setShowPoolDialog(false)}
         />
@@ -1237,7 +1304,7 @@ export function Screener() {
           if (!data.presets.some(s => s.id === id)) {
             throw new Error(`策略 ${id} 已保存但未加载，请检查策略代码`)
           }
-          addToPool(id)
+          addStrategyToPool(id)
         }}
       />
 
@@ -1246,7 +1313,7 @@ export function Screener() {
         onClose={() => setShowComposite(false)}
         onSavedId={async id => {
           await qc.fetchQuery({ queryKey: QK.screenerStrategies('all'), queryFn: () => api.screenerStrategies(), staleTime: 0 })
-          addToPool(id)
+          addStrategyToPool(id)
         }}
       />
 

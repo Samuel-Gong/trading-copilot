@@ -183,6 +183,30 @@ def test_first_single_run_persists_and_other_assets_cannot_overwrite(client, mon
     assert client.get("/api/screener/export?strategy_id=alpha").json()["symbols"] == ["000001.SZ"]
 
 
+def test_cache_write_failure_rejects_run_and_removes_export_snapshot(client, monkeypatch):
+    from app.services.screener import ScreenerResult
+
+    data_dir = client.app.state.repo.store.data_dir
+    strategy_cache.write_cache(data_dir, DAY, {"alpha": result()})
+    engine = client.app.state.strategy_engine
+    engine.has = lambda _: True
+    engine.run = lambda sid, ctx, **_: ScreenerResult(
+        as_of=date.fromisoformat(DAY), strategy=sid, rows=[{"symbol": "000002.SZ"}], total=1,
+    )
+    monkeypatch.setattr(api.ScreenerService, "build_strategy_context", lambda *_, **__: None)
+    monkeypatch.setattr(api, "_load_ext_value_maps", lambda *_: {})
+    monkeypatch.setattr(
+        strategy_cache.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("synthetic failure")),
+    )
+
+    with pytest.raises(OSError, match="synthetic failure"):
+        client.post("/api/screener/run_preset", json={"strategy_id": "alpha", "as_of": DAY})
+
+    assert client.get("/api/screener/export").status_code == 404
+
+
 def test_batch_run_marks_stock_daily_results_and_does_not_cache_other_contexts(client, monkeypatch):
     from app.services.screener import ScreenerResult
 

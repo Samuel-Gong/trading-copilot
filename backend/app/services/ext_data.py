@@ -482,7 +482,7 @@ def latest_timeseries_partition_on_or_before(
     data_dir: Path,
     as_of: date | str,
 ) -> str | None:
-    """返回不晚于业务日期的最近时序分区，缺失时不读取未来数据。"""
+    """返回不晚于业务日期的最近时序分区, 缺失时不读取未来数据。"""
     try:
         requested = date.fromisoformat(str(as_of))
         partitions = list((_config_dir(config.id, data_dir) / "timeseries").iterdir())

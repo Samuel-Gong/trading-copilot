@@ -44,7 +44,11 @@ const {
   removeTransientBatchResults,
   updateTransientBatchResult,
 } = await import(moduleUrl)
-const { createScreenerRequestCoordinator } = await import(requestCoordinatorUrl)
+const {
+  bindScreenerRequestContext,
+  createScreenerRequestContext,
+  createScreenerRequestCoordinator,
+} = await import(requestCoordinatorUrl)
 
 
 test('仅在历史日期早于最新数据日期时请求批量明细', () => {
@@ -117,24 +121,54 @@ test('配置变更会移除目标策略及叠加策略的历史临时结果', ()
 
 test('失效后的批量重跑会等待旧请求结束，并拒绝旧上下文', () => {
   const coordinator = createScreenerRequestCoordinator()
+  const context = createScreenerRequestContext({ asOf: '2026-09-03', assetType: 'stock' })
   const started = []
   const start = request => started.push(request)
 
-  coordinator.request({ id: 'old-date' }, start)
-  assert.deepEqual(started, [{ id: 'old-date', epoch: 0 }])
+  coordinator.request({ id: 'old-date', context: context.current() }, start)
+  assert.deepEqual(started, [{
+    id: 'old-date',
+    context: { asOf: '2026-09-03', assetType: 'stock', version: 0 },
+    epoch: 0,
+  }])
 
+  context.invalidate({ asOf: '2026-09-04' })
   coordinator.invalidate()
-  coordinator.request({ id: 'new-config' }, start)
+  coordinator.request({ id: 'new-config', context: context.current() }, start)
 
   assert.equal(coordinator.isCurrent(started[0].epoch), false)
+  assert.equal(context.matches(started[0].context), false)
   assert.equal(started.length, 1)
 
   coordinator.settle(start)
   assert.deepEqual(started, [
-    { id: 'old-date', epoch: 0 },
-    { id: 'new-config', epoch: 1 },
+    {
+      id: 'old-date',
+      context: { asOf: '2026-09-03', assetType: 'stock', version: 0 },
+      epoch: 0,
+    },
+    {
+      id: 'new-config',
+      context: { asOf: '2026-09-04', assetType: 'stock', version: 1 },
+      epoch: 1,
+    },
   ])
   assert.equal(coordinator.isCurrent(started[1].epoch), true)
+  assert.equal(context.matches(started[1].context), true)
+})
+
+
+test('旧渲染闭包不能以新代际发起旧日期或旧资产请求', () => {
+  const context = createScreenerRequestContext({ asOf: '2026-09-04', assetType: 'stock' })
+
+  assert.equal(bindScreenerRequestContext({ date: '2026-09-03' }, context.current()), null)
+  assert.equal(bindScreenerRequestContext({ assetType: 'etf' }, context.current()), null)
+  assert.deepEqual(bindScreenerRequestContext({ strategyIds: ['alpha'] }, context.current()), {
+    strategyIds: ['alpha'],
+    date: '2026-09-04',
+    assetType: 'stock',
+    context: { asOf: '2026-09-04', assetType: 'stock', version: 0 },
+  })
 })
 
 

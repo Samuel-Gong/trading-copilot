@@ -128,7 +128,7 @@ def clear_strategy_results(data_dir: Path, strategy_ids: set[str]) -> None:
             tmp = path.with_name(path.name + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default), encoding="utf-8")
             os.replace(tmp, path)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("按策略清理策略缓存失败: %s", e)
             path.unlink(missing_ok=True)
             path.with_name(path.name + ".tmp").unlink(missing_ok=True)
@@ -281,13 +281,16 @@ def _write_cache_locked(
         "enriched_mtime": enriched_mtime,
         "updated_at": int(time.time() * 1000),
     }
+    tmp = path.with_name(path.name + ".tmp")
     try:
         # 原子写: 先写临时文件再 os.replace, 避免读侧读到半写的 JSON
-        tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default), encoding="utf-8")
         os.replace(tmp, path)
         total_rows = sum(len(r.get("rows", [])) for r in merged_results.values())
         total_ever = sum(len(v) for v in today_ever_matched.values())
         logger.info("策略缓存已写入: %s, %d 策略, %d 命中, %d 曾命中", as_of, len(merged_results), total_rows, total_ever)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("写入策略缓存失败: %s", e)
+        path.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+        raise
