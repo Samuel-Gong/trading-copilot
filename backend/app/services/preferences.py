@@ -220,7 +220,7 @@ def get_realtime_watchlist_symbols() -> list[str]:
     try:
         from app.services import watchlist
         rows = watchlist.list_symbols()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("load watchlist for realtime failed: %s", e)
         return []
     out: list[str] = []
@@ -233,7 +233,7 @@ def get_realtime_watchlist_symbols() -> list[str]:
     return out
 
 
-def set_realtime_watchlist_symbols(symbols: list[str]) -> list[str]:  # noqa: ARG001
+def set_realtime_watchlist_symbols(_symbols: list[str]) -> list[str]:
     """兼容旧接口: Free 实时标的现在由自选页前 5 个决定。"""
     return get_realtime_watchlist_symbols()
 

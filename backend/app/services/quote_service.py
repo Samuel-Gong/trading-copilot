@@ -1059,7 +1059,7 @@ class QuoteService:
             sleep_between_batches(i, lim.rpm)
             try:
                 resp.extend(tf.quotes.get(symbols=batch) or [])
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("自选实时批次 %d/%d 拉取失败: %s", i + 1, len(batches), e)
 
         if not resp:
@@ -1143,7 +1143,7 @@ class QuoteService:
         if not daily_df.is_empty() and self._repo:
             try:
                 self._repo.merge_live_daily_asset("stock", daily_df)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("自选实时日K写盘失败: %s", e)
             self._flush_live_enriched(daily_df, quote_extra, asset_type="stock", merge=True)
 
@@ -1151,7 +1151,7 @@ class QuoteService:
         if not etf_daily_df.is_empty() and self._repo:
             try:
                 self._repo.merge_live_daily_asset("etf", etf_daily_df)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("自选实时 ETF 日K写盘失败: %s", e)
             self._flush_live_enriched(
                 etf_daily_df, self._build_quote_extra(etf_records), asset_type="etf", merge=True,
@@ -1161,7 +1161,7 @@ class QuoteService:
         if not index_daily_df.is_empty() and self._repo:
             try:
                 self._repo.merge_live_daily_asset("index", index_daily_df)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 logger.warning("自选实时指数日K写盘失败: %s", e)
             self._flush_live_enriched(
                 index_daily_df,

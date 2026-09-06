@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +31,8 @@ CUSTOM_ID_PATTERN = re.compile(r"^uf_[a-z0-9_]{1,40}$")
 COMPOSITE_ID_PATTERN = re.compile(r"^cf_[a-z0-9_]{1,40}$")
 MAX_COMPOSITE_MEMBERS = 8
 STATUSES = frozenset({"draft", "active", "watch", "retired"})
+_LOCKS_GUARD = threading.Lock()
+_FACTOR_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 
 
 def _dir(data_dir: Path) -> Path:
@@ -39,6 +43,16 @@ def _dir(data_dir: Path) -> Path:
 
 def _path(data_dir: Path, factor_id: str) -> Path:
     return _dir(data_dir) / f"{factor_id}.json"
+
+
+@contextmanager
+def factor_transaction(data_dir: Path, factor_id: str):
+    """串行化同一数据目录、同一因子的完整持久化事务。"""
+    key = (str(data_dir.resolve()), factor_id)
+    with _LOCKS_GUARD:
+        lock = _FACTOR_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
 
 
 def load_all(data_dir: Path) -> list[dict]:
@@ -53,7 +67,7 @@ def load_all(data_dir: Path) -> list[dict]:
 
 
 def save_one(data_dir: Path, definition: dict) -> None:
-    """原子保存单个定义；写入失败时保留旧文件。"""
+    """原子保存单个定义; 写入失败时保留旧文件。"""
     target = _path(data_dir, str(definition["id"]))
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(definition, ensure_ascii=False, indent=2)
@@ -77,7 +91,7 @@ def save_one(data_dir: Path, definition: dict) -> None:
 
 
 def exists(data_dir: Path, factor_id: str) -> bool:
-    """定义文件是否存在，不产生任何副作用。"""
+    """定义文件是否存在, 不产生任何副作用。"""
     return _path(data_dir, factor_id).is_file()
 
 
@@ -199,30 +213,32 @@ def persist_definition(
     *,
     replace_registered: bool = False,
 ) -> FactorSpec:
-    """先原子落盘再注册；注册失败时恢复磁盘和既有注册表状态。"""
-    spec = to_spec(definition)
-    target = _path(data_dir, str(definition["id"]))
-    previous = target.read_bytes() if target.exists() else None
-    save_one(data_dir, definition)
+    """先原子落盘再注册; 注册失败时恢复磁盘和既有注册表状态。"""
+    factor_id = str(definition["id"])
+    with factor_transaction(data_dir, factor_id):
+        spec = to_spec(definition)
+        target = _path(data_dir, factor_id)
+        previous = target.read_bytes() if target.exists() else None
+        save_one(data_dir, definition)
 
-    previous_spec: FactorSpec | None = None
-    try:
-        if replace_registered:
-            previous_spec = unregister_factor(spec.id)
-        register_factor(spec)
-    except Exception:
-        if previous is None:
-            target.unlink(missing_ok=True)
-        else:
-            _write_bytes_atomically(target, previous)
-        if replace_registered and previous_spec is not None and get_factor(spec.id) is None:
-            register_factor(previous_spec)
-        raise
-    return spec
+        previous_spec: FactorSpec | None = None
+        try:
+            if replace_registered:
+                previous_spec = unregister_factor(spec.id)
+            register_factor(spec)
+        except Exception:
+            if previous is None:
+                target.unlink(missing_ok=True)
+            else:
+                _write_bytes_atomically(target, previous)
+            if replace_registered and previous_spec is not None and get_factor(spec.id) is None:
+                register_factor(previous_spec)
+            raise
+        return spec
 
 
 def _write_bytes_atomically(target: Path, payload: bytes) -> None:
-    """回滚辅助：以同目录临时文件原子恢复原始字节。"""
+    """回滚辅助: 以同目录临时文件原子恢复原始字节。"""
     fd, temporary_name = tempfile.mkstemp(
         dir=target.parent,
         prefix=f".{target.name}.",

@@ -365,7 +365,7 @@ def _find_references(data_dir, factor_id: str) -> list[str]:
                 if factor_id in text:
                     references.append(relative)
             except (OSError, UnicodeError):
-                # 无法验证也视为引用风险；非 force 删除必须失败闭合。
+                # 无法验证也视为引用风险; 非 force 删除必须失败闭合。
                 references.append(f"{relative} (无法验证)")
     factors_dir = data_dir / "user_data" / "custom_factors"
     if factors_dir.is_dir():
@@ -387,25 +387,29 @@ def delete_custom_factor(factor_id: str, request: Request, force: bool = Query(d
     data_dir = _data_dir(request)
     from app.factors.registry import get_factor
 
-    if get_factor(factor_id) is None and not store.exists(data_dir, factor_id):
-        raise HTTPException(status_code=404, detail=f"因子不存在: {factor_id}")
-    references = _find_references(data_dir, factor_id)
-    if references and not force:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "该因子仍有引用, 拒绝删除 (可带 force=true 强制)", "references": references},
+    with store.factor_transaction(data_dir, factor_id):
+        if get_factor(factor_id) is None and not store.exists(data_dir, factor_id):
+            raise HTTPException(status_code=404, detail=f"因子不存在: {factor_id}")
+        references = _find_references(data_dir, factor_id)
+        if references and not force:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "该因子仍有引用, 拒绝删除 (可带 force=true 强制)",
+                    "references": references,
+                },
+            )
+        definition = next(
+            (item for item in store.load_all(data_dir) if str(item.get("id")) == factor_id),
+            None,
         )
-    definition = next(
-        (item for item in store.load_all(data_dir) if str(item.get("id")) == factor_id),
-        None,
-    )
-    deleted = store.delete_one(data_dir, factor_id)
-    try:
-        unregister_factor(factor_id)
-    except ValueError as exc:
-        if deleted and definition is not None:
-            store.save_one(data_dir, definition)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        deleted = store.delete_one(data_dir, factor_id)
+        try:
+            unregister_factor(factor_id)
+        except ValueError as exc:
+            if deleted and definition is not None:
+                store.save_one(data_dir, definition)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "id": factor_id, "removed_references": references}
 
 

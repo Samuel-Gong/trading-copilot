@@ -156,7 +156,7 @@ def test_atomic_save_preserves_old_file_when_replace_fails(tmp_path, monkeypatch
     }
     store.save_one(tmp_path, original)
 
-    def _fail_replace(source, target):  # noqa: ARG001
+    def _fail_replace(_source, _target):
         raise OSError("replace failed")
 
     monkeypatch.setattr(store.os, "replace", _fail_replace)
@@ -176,7 +176,7 @@ def test_persist_definition_writes_before_registry_mutation(
     }
     cleanup_registry.add("uf_write_fail")
 
-    def _fail_save(data_dir, value):  # noqa: ARG001
+    def _fail_save(_data_dir, _value):
         raise OSError("disk full")
 
     monkeypatch.setattr(store, "save_one", _fail_save)
@@ -207,3 +207,62 @@ def test_persist_definition_rolls_back_file_when_registration_fails(
 
     assert store.load_all(tmp_path) == [original]
     assert get_factor("uf_register_fail").label == "旧定义"
+
+
+def test_concurrent_same_version_updates_keep_disk_and_registry_consistent(
+    tmp_path, monkeypatch, cleanup_registry,
+) -> None:
+    """同 ID 同版本并发更新中, 失败事务不得回滚另一成功事务的文件。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    original = {
+        "id": "uf_concurrent",
+        "kind": "custom",
+        "version": 1,
+        "label": "旧定义",
+        "formula": "close",
+        "status": "draft",
+    }
+    store.save_one(tmp_path, original)
+    store.register_definition(original)
+    cleanup_registry.add("uf_concurrent")
+
+    first_entered_register = Event()
+    second_finished_save = Event()
+    real_save = store.save_one
+    real_register = store.register_factor
+
+    def _tracked_save(data_dir, definition):
+        real_save(data_dir, definition)
+        if definition["label"] == "并发 B":
+            second_finished_save.set()
+
+    def _delayed_register(spec):
+        if spec.label == "并发 A":
+            first_entered_register.set()
+            second_finished_save.wait(timeout=0.2)
+        real_register(spec)
+
+    monkeypatch.setattr(store, "save_one", _tracked_save)
+    monkeypatch.setattr(store, "register_factor", _delayed_register)
+    update_a = {**original, "version": 2, "label": "并发 A"}
+    update_b = {**original, "version": 2, "label": "并发 B"}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(store.persist_definition, tmp_path, update_a)
+        assert first_entered_register.wait(timeout=1)
+        second = pool.submit(store.persist_definition, tmp_path, update_b)
+        outcomes = []
+        for future in (first, second):
+            try:
+                outcomes.append(("ok", future.result(timeout=2)))
+            except ValueError as exc:
+                outcomes.append(("error", str(exc)))
+
+    assert [kind for kind, _ in outcomes].count("ok") == 1
+    assert [kind for kind, _ in outcomes].count("error") == 1
+    persisted = store.load_all(tmp_path)[0]
+    registered = get_factor("uf_concurrent")
+    assert persisted["version"] == registered.version == 2
+    assert persisted["label"] == registered.label
