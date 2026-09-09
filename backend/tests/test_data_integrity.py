@@ -576,7 +576,8 @@ def _write_full_partition(root, table: str, day: date, quote_ts: int | None) -> 
     }).write_parquet(part / "part.parquet")
 
 
-def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
+@pytest.mark.parametrize("today", [date(2026, 9, 10), date(2026, 9, 11)])
+def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch, today):
     """用户 bug 场景复刻: 昨天盘中快照 + 今天实时分区 → 管道应放弃"只刷今天",
     降级为从坏日起的范围拉取, 并把坏 enriched 分区删后重算。"""
     from app.config import settings as app_settings
@@ -584,7 +585,7 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     from app.services import instrument_sync, kline_sync
     from app.tickflow.repository import DataStore, KlineRepository
 
-    today = datetime.now(CN_TZ).date()
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: today)
     yesterday = today - timedelta(days=1)
     while yesterday.weekday() >= 5:
         yesterday -= timedelta(days=1)

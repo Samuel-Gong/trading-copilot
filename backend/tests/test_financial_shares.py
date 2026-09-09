@@ -287,7 +287,7 @@ def test_sync_all_fetch_failure_keeps_complete_previous_snapshot(tmp_path, monke
     monkeypatch.setattr(
         financial_sync,
         "_resolve_financial_provider",
-        lambda: ("custom", object()),
+        lambda _name=None: ("custom", object()),
     )
 
     def fetch(table, _symbols, _capset, latest_only=True, strict=False):
@@ -319,7 +319,7 @@ def test_sync_all_empty_table_keeps_complete_previous_snapshot(tmp_path, monkeyp
     monkeypatch.setattr(
         financial_sync,
         "_resolve_financial_provider",
-        lambda: ("custom", object()),
+        lambda _name=None: ("custom", object()),
     )
 
     def fetch(table, _symbols, _capset, latest_only=True, strict=False):
@@ -348,7 +348,7 @@ def test_fuyao_sync_all_preserves_unsupported_shares(tmp_path, monkeypatch):
     monkeypatch.setattr(
         financial_sync,
         "_resolve_financial_provider",
-        lambda: ("custom", provider),
+        lambda _name=None: ("custom", provider),
     )
 
     def fetch(table, _symbols, _capset, latest_only=True, strict=False):
@@ -447,7 +447,7 @@ def test_financial_report_reader_never_observes_partial_set_publish(tmp_path, mo
     monkeypatch.setattr(
         financial_sync,
         "_resolve_financial_provider",
-        lambda: ("custom", object()),
+        lambda _name=None: ("custom", object()),
     )
     monkeypatch.setattr(
         financial_sync,

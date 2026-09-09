@@ -63,10 +63,11 @@ def _get_symbols(data_dir: Path) -> list[str]:
         return []
 
 
-def _resolve_financial_provider() -> tuple[str, object | None]:
+def _resolve_financial_provider(provider_name: str | None = None) -> tuple[str, object | None]:
     """解析选定财务源，返回 (tickflow/custom/unavailable, provider)。"""
     from app.services import preferences
-    provider_name = preferences.get_financial_provider()
+    if provider_name is None:
+        provider_name = preferences.get_financial_provider()
     if provider_name == "tickflow":
         return ("tickflow", None)
     from app.data_providers import custom as custom_sources
@@ -87,8 +88,10 @@ def _financial_provider_lease():
     from app.data_providers import custom as custom_sources
     from app.services import preferences
 
-    provider_name = preferences.get_financial_provider()
-    provider_kind, resolved_provider = _resolve_financial_provider()
+    # 名称与类型必须来自同一次路由快照，不能在两次 getter 间混入另一来源。
+    with preferences.provider_route_lock():
+        provider_name = preferences.get_financial_provider()
+        provider_kind, resolved_provider = _resolve_financial_provider(provider_name)
     if provider_kind != "custom":
         token = _PINNED_FINANCIAL_PROVIDER.set((provider_kind, resolved_provider))
         try:

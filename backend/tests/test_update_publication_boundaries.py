@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -159,3 +160,32 @@ def test_update_conflicts_are_http_409(error):
         response = client.get("/update")
     assert response.status_code == 409
     assert response.json() == {"detail": "请稍后重试"}
+
+
+def test_financial_initial_route_flip_cannot_publish_wrong_source_after_aba(tmp_path, monkeypatch):
+    """初始化中 A→TickFlow，再在提交前切回 A，不得给 A 发布 TickFlow 结果。"""
+    from app.data_providers import custom as custom_sources
+    from app.services import financial_sync
+    from app.tickflow.capabilities import CapabilitySet
+
+    calls = []
+
+    def changing_route():
+        calls.append(None)
+        return "custom_a" if len(calls) == 1 else "tickflow"
+
+    monkeypatch.setattr(preferences, "get_financial_provider", changing_route)
+    monkeypatch.setattr(custom_sources, "provider_has_dataset", lambda name, dataset: True)
+    monkeypatch.setattr(custom_sources, "lease_provider", lambda name: nullcontext((object(), 7)))
+    monkeypatch.setattr(custom_sources, "registry_generation", lambda: 7)
+
+    def fetch(*args, **kwargs):
+        actual_kind, _ = financial_sync._PINNED_FINANCIAL_PROVIDER.get()
+        # 模拟慢取数期间用户又切回 A，最终仅检查名称不能发现混合租约。
+        monkeypatch.setattr(preferences, "get_financial_provider", lambda: "custom_a")
+        return pl.DataFrame({"symbol": ["600000.SH"], "source": [actual_kind]})
+
+    monkeypatch.setattr(financial_sync, "_fetch_table", fetch)
+    financial_sync._sync_table("metrics", ["600000.SH"], tmp_path, CapabilitySet())
+    assert financial_sync.get_financial_df(tmp_path, "metrics")["source"].item() == "custom"
+    assert len(calls) == 1
