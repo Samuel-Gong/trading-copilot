@@ -97,7 +97,7 @@ def test_dependencies_and_warmup() -> None:
     # change_pct 是 base 因子, 依赖为其自身列
     assert compiled.dependencies == frozenset({"change_pct"})
     assert compiled.referenced_factors == frozenset({"change_pct"})
-    assert compiled.warmup_bars == 6  # ts 窗口 5 + 1
+    assert compiled.warmup_bars == 5
     assert compiled.cross_sectional
 
     compiled = compile_formula("close + ma20_bias")
@@ -108,6 +108,14 @@ def test_dependencies_and_warmup() -> None:
     compiled = compile_formula("turnover_z_60d * 2")
     assert compiled.ok
     assert compiled.warmup_bars == 61  # 引用因子 warmup 传递
+
+    nested = compile_formula("ts_mean(ts_mean(close, 512), 512)")
+    assert nested.ok
+    assert nested.warmup_bars == 1023
+
+    wrapped_factor = compile_formula("ts_mean(turnover_z_60d, 512)")
+    assert wrapped_factor.ok
+    assert wrapped_factor.warmup_bars == 572
 
 
 def test_base_columns_contract() -> None:

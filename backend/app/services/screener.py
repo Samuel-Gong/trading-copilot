@@ -433,11 +433,11 @@ class ScreenerService:
         )
 
     def _load_minute_history(self, as_of: date, current: pl.DataFrame | None) -> pl.DataFrame:
-        """分钟策略数据源: 优先 as_of 当日分钟分区, 缺失时回退全市场最近分区。
+        """分钟策略数据源: 只读取 as_of 当日分钟分区，缺失时失败闭合。
 
         只按日期直读单个分区文件 (get_minute_by_dates), 与全量 glob 扫描解耦,
-        内存只随当日分区大小 (~67万行) 走。标的池限定为 enriched 快照 universe;
-        分区与快照的日期差是允许的 (分钟分区可能比 enriched 更新, 行自带时间戳)。
+        内存只随当日分区大小 (~67万行) 走。标的池限定为 enriched 快照 universe。
+        历史请求不得回退到其他日期，否则会把未来分钟行情伪装成 as_of 当日数据。
         """
         if self.asset_type != "stock":
             raise ValueError("分钟策略当前仅支持 A 股")
@@ -448,13 +448,9 @@ class ScreenerService:
             return pl.DataFrame()
         df = self.repo.get_minute_by_dates(symbols, [as_of])
         if df.is_empty():
-            fallback = self.repo.latest_minute_date_global()
-            if fallback is None:
-                raise ValueError(
-                    "无分钟K数据 — 请先在 数据→分钟K 完成同步, 或开启盘中增量刷新"
-                )
-            if fallback != as_of:
-                df = self.repo.get_minute_by_dates(symbols, [fallback])
+            raise ValueError(
+                f"{as_of.isoformat()} 无分钟K数据 — 请先完成该交易日分钟K同步"
+            )
         return df
 
     def latest_date(self) -> date | None:

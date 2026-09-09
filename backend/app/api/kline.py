@@ -19,6 +19,7 @@ from app.price_limits import is_risk_warning_name, price_limit_pct
 from app.db_safe import is_valid_ext_ident
 from app.services import kline_sync
 from app.services.enriched_job import run_enriched_job_with_repository_refresh
+import contextlib
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +64,14 @@ def _gzip_payload(request: Request, payload: dict, *, pref_key: str) -> dict | R
 def _minute_allowed(capset) -> bool:
     """是否有分钟K权限 (TickFlow Pro+ 或 custom minute 源)。"""
     from app.tickflow.capabilities import Cap
-    if capset.has(Cap.KLINE_MINUTE_BATCH):
-        return True
     from app.services import preferences
     provider = preferences.get_minute_data_provider()
-    _, fallback, error = kline_sync._resolve_minute_provider(provider)
+    resolved, fallback, error = kline_sync._resolve_minute_provider(provider)
     if error is not None:
         logger.warning("minute provider resolution failed while checking access: %s", error)
-    return not fallback
+    if not fallback:
+        return resolved is not None
+    return capset.has(Cap.KLINE_MINUTE_BATCH)
 
 
 @lru_cache(maxsize=8192)
@@ -328,16 +329,14 @@ def _get_previous_closes(
     end = max(trade_dates)
     close_column = "close" if asset_type == "index" else "raw_close"
     frames = []
-    try:
+    with contextlib.suppress(Exception):
         frames.append(repo.get_daily_asset_before(
             asset_type,
             symbol,
             start,
             columns=["date", close_column],
         ))
-    except Exception:
-        pass
-    try:
+    with contextlib.suppress(Exception):
         frames.append(repo.get_daily_asset(
             asset_type,
             symbol,
@@ -345,8 +344,6 @@ def _get_previous_closes(
             end,
             columns=["date", close_column],
         ))
-    except Exception:
-        pass
 
     closes_by_date: dict[date, float] = {}
     for frame in frames:
@@ -403,9 +400,14 @@ def get_daily(
 
     if df.is_empty():
         try:
-            raw = kline_sync.sync_daily_batch([symbol], count=days + 30)
+            raw = kline_sync.fetch_daily_routed(
+                [symbol],
+                getattr(request.app.state, "capabilities", None),
+                count=days + 30,
+                asset_type=asset_type,
+            )
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"TickFlow fetch failed: {e}") from e
+            raise HTTPException(status_code=502, detail=f"日 K 拉取失败: {e}") from e
         if raw.is_empty():
             return {"symbol": symbol, "name": stock_name, "stock_info": stock_info, "rows": []}
         # 拉除权因子做前复权 (Starter+ 有权限), 否则空 df → compute_enriched 退回未复权
@@ -414,8 +416,10 @@ def get_daily(
         try:
             from app.tickflow.capabilities import Cap
             if capset and capset.has(Cap.ADJ_FACTOR):
-                factors = kline_sync.fetch_adj_factor_single(symbol)
-        except Exception as e:  # noqa: BLE001
+                factors = kline_sync.fetch_adj_factor_single_routed(
+                    symbol, capset, asset_type=asset_type,
+                )
+        except Exception as e:
             logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
         enriched = compute_enriched(raw, factors=factors)
         rows = enriched.tail(days).to_dicts()
@@ -746,11 +750,11 @@ def get_minute_batch(request: Request, body: dict):
     # - holes:  中间缺K (相邻间距非 1 分钟 / 非午休 91 分钟) → 全天重拉回填,
     #           否则"最后一根+1min"的增量窗口永远不会回看中间的洞。
     # - stale:  仅尾部落后 → 增量拉, 请求量从"每轮全天"降为"每轮一根"量级。
-    _LUNCH_GAP_MIN = 91  # 11:30 → 13:01
+    lunch_gap_min = 91  # 11:30 → 13:01
 
     def _has_holes(sub: pl.DataFrame) -> bool:
         gaps = sub["datetime"].diff().dt.total_minutes().drop_nulls()
-        return gaps.filter((gaps != 1) & (gaps != _LUNCH_GAP_MIN)).len() > 0
+        return gaps.filter((gaps != 1) & (gaps != lunch_gap_min)).len() > 0
 
     result: dict[str, list[dict]] = {}
     full_pull: list[str] = []          # 无数据或中间有洞 → 全天拉
@@ -803,6 +807,7 @@ def get_minute_batch(request: Request, body: dict):
     def _pull(asset: str, sym_list: list[str], start: datetime) -> None:
         if not sym_list:
             return
+        write_generation = kline_sync._minute_generation(repo)
         df_live = kline_sync.sync_minute_batch(
             sym_list,
             start_time=start,
@@ -819,8 +824,13 @@ def get_minute_batch(request: Request, body: dict):
             minute_dir = minute_dirs[asset]
             if isinstance(minute_dir, Path):
                 with repo._write_lock:
-                    kline_sync._write_minute_partition(df_live, minute_dir)
-        except Exception as e:  # noqa: BLE001
+                    generation_matches = (
+                        asset != "stock"
+                        or kline_sync._minute_generation(repo) == write_generation
+                    )
+                    if generation_matches:
+                        kline_sync._write_minute_partition(df_live, minute_dir)
+        except Exception as e:
             logger.warning("minute-batch 补拉落盘失败 (降级为仅返回): %s", e)
         for part in df_live.partition_by("symbol", maintain_order=True):
             live_map[part["symbol"][0]] = part.sort("datetime")
@@ -1250,22 +1260,26 @@ async def clear_minute(request: Request):
     repo = request.app.state.repo
     minute_dir = repo.store.data_dir / "kline_minute"
 
-    # 统计待删除行数 (用于返回)
-    removed = 0
-    if minute_dir.exists():
-        try:
-            # execute_one (cursor+close): 直连 db.execute 的未消费结果集会在 Windows 上
-            # 钉住分区句柄, 导致下方 rmtree 静默删不掉被钉文件
-            result = repo.execute_one("SELECT COUNT(*) AS cnt FROM kline_minute")
-            removed = result[0] if result else 0
-        except Exception:
-            pass
-        # 仅删 kline_minute 目录, 绝不触碰其他目录
-        shutil.rmtree(minute_dir, ignore_errors=True)
-
-    # 刷新视图 (重建空视图)
     from app.jobs.daily_pipeline import _refresh_single_view
-    _refresh_single_view(repo, "kline_minute")
+    # 统计、删除、视图重建与所有分钟写入串行；代际递增使清空前已开始的网络
+    # 请求在取得锁后丢弃结果，不能复活已清空分区。
+    with repo._write_lock:
+        current_generation = getattr(repo, "_minute_generation", 0)
+        if not isinstance(current_generation, int):
+            current_generation = 0
+        repo._minute_generation = current_generation + 1
+        removed = 0
+        if minute_dir.exists():
+            try:
+                # execute_one (cursor+close): 直连 db.execute 的未消费结果集会在 Windows 上
+                # 钉住分区句柄, 导致下方 rmtree 删不掉被钉文件
+                result = repo.execute_one("SELECT COUNT(*) AS cnt FROM kline_minute")
+                removed = result[0] if result else 0
+            except Exception:
+                pass
+            # 仅删 kline_minute 目录, 绝不触碰其他目录；失败必须向调用方报告。
+            shutil.rmtree(minute_dir)
+        _refresh_single_view(repo, "kline_minute")
 
     from app.api.data import invalidate_storage_cache
     invalidate_storage_cache()
@@ -1461,8 +1475,13 @@ async def rebuild_enriched(request: Request):
     try:
         repo = request.app.state.repo
 
-        from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
+        from app.services.pipeline_jobs import (
+            JobCancelledError,
+            job_store,
+            release_run_slot,
+            try_acquire_run_slot,
+        )
         qs = getattr(request.app.state, "quote_service", None)
 
         job_id, is_new = job_store.create()

@@ -21,6 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.indicators.pipeline import run_pipeline
+from app.enriched_generation import EnrichedPublication
 from app.config import settings
 from app.market_time import cn_today
 from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
@@ -34,7 +35,11 @@ logger = logging.getLogger(__name__)
 ProgressCb = Callable[..., None]
 
 
-def _prune_partial_enriched_partitions(daily_dir: Path, enriched_dir: Path) -> list[str]:
+def _prune_partial_enriched_partitions(
+    daily_dir: Path,
+    enriched_dir: Path,
+    publication: EnrichedPublication | None = None,
+) -> list[str]:
     """删除 symbol 覆盖不完整的 enriched 日期分区, 返回被删的日期 (#223)。
 
     自选实时路径会在全市场 enriched 生成前提前创建当日分区 (只有几只自选),
@@ -44,16 +49,19 @@ def _prune_partial_enriched_partitions(daily_dir: Path, enriched_dir: Path) -> l
     data_integrity.prune_enriched_partitions 的修复语义一致。
     daily 同日分区不存在 (今日日K尚未同步) 时不处理, 留给当日正常流程。
     """
-    import shutil
-
     import pyarrow.parquet as pq
+
+    owned = publication is None
+    publication = publication or EnrichedPublication(
+        enriched_dir.parent, "stock", recover=True, scope="pipeline-prune"
+    )
 
     def _rows(part_dir: Path) -> int:
         total = 0
         for f in part_dir.glob("*.parquet"):
             try:
                 total += pq.ParquetFile(f).metadata.num_rows
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return -1  # 不可读 → 不动, 交给既有完整性检查兜底
         return total
 
@@ -64,13 +72,18 @@ def _prune_partial_enriched_partitions(daily_dir: Path, enriched_dir: Path) -> l
             continue
         e_rows, d_rows = _rows(part), _rows(daily_part)
         if e_rows >= 0 and d_rows > 0 and e_rows < d_rows:
-            shutil.rmtree(part, ignore_errors=True)
+            publication.delete_tree(part)
             pruned.append(part.stem.split("=")[1])
+    if owned:
+        publication.commit()
     return pruned
 
 
 def _prune_stale_price_partitions(
-    daily_dir: Path, enriched_dir: Path, max_dates: int = 5
+    daily_dir: Path,
+    enriched_dir: Path,
+    max_dates: int = 5,
+    publication: EnrichedPublication | None = None,
 ) -> list[str]:
     """删除收盘价与官方日线不一致的 enriched 日期分区。
 
@@ -80,7 +93,10 @@ def _prune_stale_price_partitions(
     做值级比对: enriched.raw_close 与 daily.close 任一标的差超过半个最小报价
     单位即删分区, 由后续增量重算按官方日线全市场重建。
     """
-    import shutil
+    owned = publication is None
+    publication = publication or EnrichedPublication(
+        enriched_dir.parent, "stock", recover=True, scope="pipeline-prune"
+    )
 
     common = sorted(
         (
@@ -106,8 +122,10 @@ def _prune_stale_price_partitions(
             continue
         bad = joined.filter((pl.col("raw_close") - pl.col("close")).abs() > 0.005)
         if not bad.is_empty():
-            shutil.rmtree(enriched_dir / f"date={ds}", ignore_errors=True)
+            publication.delete_tree(enriched_dir / f"date={ds}")
             pruned.append(ds)
+    if owned:
+        publication.commit()
     return pruned
 
 
@@ -143,12 +161,17 @@ def _resolve_universe(capset: CapabilitySet, repo=None) -> list[str]:
     repo 传入时过滤自选兜底里的指数 symbol (指数日K走独立 kline_index_* 存储,
     进股票池会污染 kline_daily/kline_minute)。ETF 刻意保留 (既有行为)。
     """
-    if capset.has(Cap.KLINE_DAILY_BATCH):
+    from app.services import preferences as _provider_preferences
+
+    if (
+        _provider_preferences.get_daily_data_provider() == "tickflow"
+        and capset.has(Cap.KLINE_DAILY_BATCH)
+    ):
         try:
             all_a = get_pool("CN_Equity_A", refresh=True)
             if all_a:
                 return sorted(all_a)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("CN_Equity_A pool unavailable, fallback: %s", e)
 
     # Free 用户兜底: instruments parquet + watchlist + demo
@@ -160,7 +183,7 @@ def _resolve_universe(capset: CapabilitySet, repo=None) -> list[str]:
         try:
             inst = pl.read_parquet(inst_path, columns=["symbol"])
             base.update(inst["symbol"].to_list())
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("instruments supplement failed: %s", e)
     # 过滤自选兜底里的指数 symbol (指数日K走独立 kline_index_* 存储,
     # 进股票池会污染 kline_daily/kline_minute)。ETF 刻意保留 (既有行为)。
@@ -249,12 +272,21 @@ def run_now(
                     "integrity: 检测到 %d 个不完整分区(%s), 本次管道改走范围拉取修复",
                     len(integrity_issues), data_integrity.describe_issues(integrity_issues),
                 )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("integrity scan failed (soft, 按无坏数据处理): %s", e)
             integrity_issues = []
     # 日K范围拉取的起点(分支3补缺口/分支4首次/数据修正); 实时增量/跳过时为 None。
     # 供 Step 1.5 除权因子回溯范围对齐: 范围拉取→用日K范围, 非范围→最近N天兜底。
     daily_range_start: _date | None = None
+    daily_failures: list[str] = []
+
+    def _require_complete_daily_range() -> None:
+        if not daily_failures:
+            return
+        failed = sorted(set(daily_failures))
+        raise PipelineStageError([
+            f"日K范围同步不完整: {len(failed)} 只标的所在批次失败"
+        ])
 
     # A 股日K拉取开关(默认开);关闭时跳过日K同步,保留已有数据。
     # 数据修正(override_start_date)时即使关闭开关也强制拉取 — 修正就是来补数据的。
@@ -277,7 +309,9 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
+        _require_complete_daily_range()
         gap_days = (today - start_date).days
         new_daily_days = gap_days
         emit("sync_daily", 45, f"日K 完成,覆盖 {gap_days} 天")
@@ -318,7 +352,9 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
+        _require_complete_daily_range()
         gap_days = (today - start_date).days
         new_daily_days = gap_days
         emit("sync_daily", 45, f"日K 完成,覆盖 {gap_days} 天")
@@ -338,7 +374,9 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
+        _require_complete_daily_range()
         new_daily_days = 365
         emit("sync_daily", 45, "日K 完成")
         logger.info("sync_daily: [%s ~ %s] done", start_date, today)
@@ -356,7 +394,7 @@ def run_now(
             )
             if pruned:
                 logger.info("integrity: 已删除 %d 个待重算的 enriched 分区 (≥ %s)", pruned, repair_start)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("enriched prune failed (soft): %s", e)
 
 
@@ -436,9 +474,21 @@ def run_now(
     # 部分分区修复 (#223) + 收盘价过期分区修复: 删除被实时合并提前创建、覆盖不全
     # 或收盘价停留在竞价前快照的 enriched 分区, 让下方计数比较与增量计算把它们
     # 重新当新日期处理 (值级比对以官方日线为准, 实时源不纠错也能自愈)
+    enriched_publication: EnrichedPublication | None = None
     if enriched_exists:
-        partial_pruned = _prune_partial_enriched_partitions(daily_dir, enriched_dir)
-        stale_pruned = _prune_stale_price_partitions(daily_dir, enriched_dir)
+        enriched_publication = EnrichedPublication(
+            repo.store.data_dir,
+            "stock",
+            recover=True,
+            scope="pipeline-prune-and-rebuild",
+            allow_scope_takeover=True,
+        )
+        partial_pruned = _prune_partial_enriched_partitions(
+            daily_dir, enriched_dir, enriched_publication
+        )
+        stale_pruned = _prune_stale_price_partitions(
+            daily_dir, enriched_dir, publication=enriched_publication
+        )
         pruned_dates = sorted(set(partial_pruned) | set(stale_pruned))
         if pruned_dates:
             logger.warning(
@@ -477,7 +527,10 @@ def run_now(
         emit("compute_enriched", 65, "全量计算 enriched…")
         logger.info("compute_enriched: full rebuild (first=%s, backward=%s, daily=%d, enriched=%d)",
                     not enriched_exists, backward_extension, daily_days, prev_enriched_days)
-        written_enriched = run_pipeline(on_batch_done=_enriched_batch_progress)
+        written_enriched = run_pipeline(
+            on_batch_done=_enriched_batch_progress,
+            publication=enriched_publication,
+        )
         new_enriched_days = len(list(enriched_dir.glob("date=*")))
         emit("compute_enriched", 88, f"enriched 完成,覆盖 {new_enriched_days} 天")
         logger.info("compute_enriched: full rebuild done, %d days", new_enriched_days)
@@ -493,6 +546,7 @@ def run_now(
             new_dates_only=True,
             symbols=symbols_to_recompute or None,
             on_batch_done=_enriched_batch_progress,
+            publication=enriched_publication,
         )
         new_enriched_days = len(list(enriched_dir.glob("date=*")))
         emit("compute_enriched", 88, f"enriched 完成,覆盖 {new_enriched_days} 天")
@@ -501,11 +555,17 @@ def run_now(
         # 无新日期,仅除权因子变更 → 只重算受影响个股的全部日期
         emit("compute_enriched", 65, f"增量计算 enriched ({len(affected_symbols)} 只个股)…")
         logger.info("compute_enriched: adj_factor incremental, %d symbols", len(affected_symbols))
-        written_enriched = run_pipeline(symbols=affected_symbols, on_batch_done=_enriched_batch_progress)
+        written_enriched = run_pipeline(
+            symbols=affected_symbols,
+            on_batch_done=_enriched_batch_progress,
+            publication=enriched_publication,
+        )
         emit("compute_enriched", 88, f"enriched 完成,{len(affected_symbols)} 只个股")
     else:
         written_enriched = 0
         logger.info("compute_enriched: skip (no new daily, no adj_factor changes)")
+    if enriched_publication is not None:
+        enriched_publication.commit()
     _refresh_single_view(repo, "kline_enriched")
     _invalidate("enriched")
 
@@ -858,7 +918,12 @@ def _run_tracked(fn, job_label: str) -> bool:
     重任务执行槽: 再挡一层僵尸并发(reap 后线程仍活时不得并行写 parquet)。
     返回 True 仅表示任务已成功并且执行槽已释放。
     """
-    from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
+    from app.services.pipeline_jobs import (
+        JobCancelledError,
+        job_store,
+        release_run_slot,
+        try_acquire_run_slot,
+    )
 
     job_id, is_new = job_store.create()
     if not is_new:

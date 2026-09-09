@@ -4,10 +4,10 @@
 「工作日但休市」的节假日从轮询窗口里剔除; 返回 None (未知) 时调用方
 维持现状行为 (周几近似 + 快照新鲜度判据兜底), 不引入新依赖。
 
-探测链 (按确定性排序, 先到先得):
-  1. fuyao 交易日历 (已配置 fuyao 时): GET /api/a-share/calendar/trading-days,
+探测严格跟随当前实时行情 Provider，不跨源回退:
+  1. 选定的自定义源若实现交易日历 (fuyao 等):
      今天在近一年交易日列表内 ⇔ 交易日。权威日历, 无时段依赖, 无开盘缓冲问题。
-  2. tickflow 实时行情时间戳: 拉一篮流动性票快照 (单请求), max(timestamp)
+  2. 仅当明确选择 tickflow 时，用实时行情时间戳探测:
      日期 == 今天 ⇔ 交易日。非交易日全市场戳停在上一交易日 (2026-08-29 周六
      实测 5551/5551, 含停牌股 — 戳是快照定版时刻, 非最后成交时刻);
      交易日集合竞价阶段 (9:15-9:30) 戳是否已翻新未实测 → 开盘缓冲窗内
@@ -27,7 +27,8 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, time as dt_time
+from datetime import datetime
+from datetime import time as dt_time
 
 from app.market_time import CN_TZ, cn_now
 
@@ -49,6 +50,7 @@ _CACHE_LOCK = threading.Lock()
 @dataclass
 class _Cache:
     day: object | None = None
+    route_key: tuple[str, int | None] | None = None
     verdict: bool | None = None
     probed_at: float = 0.0
 
@@ -60,21 +62,25 @@ def reset_cache() -> None:
     """清空探针缓存 (测试用)。"""
     with _CACHE_LOCK:
         _CACHE.day = None
+        _CACHE.route_key = None
         _CACHE.verdict = None
         _CACHE.probed_at = 0.0
 
 
-def _probe_fuyao(now: datetime) -> bool | None:
-    """fuyao 交易日历: 今天在列表内 ⇔ 交易日。未配置 fuyao / 失败 → None。"""
+def _probe_custom(now: datetime, provider_name: str) -> bool | None:
+    """选定自定义源的交易日历；缺能力或失败时返回未知。"""
     try:
         from app.data_providers import custom as custom_sources
 
-        if not custom_sources.is_custom_provider("fuyao"):
+        if not custom_sources.is_custom_provider(provider_name):
             return None
-        provider = custom_sources.get_provider("fuyao")
-        days = provider.trading_days()
+        with custom_sources.lease_provider(provider_name) as (provider, _generation):
+            calendar = getattr(provider, "trading_days", None)
+            if not callable(calendar):
+                return None
+            days = calendar()
         return now.date() in days if days else None
-    except Exception:  # noqa: BLE001 — 探针失败按未知处理, 不上抛
+    except Exception:
         return None
 
 
@@ -98,33 +104,48 @@ def _probe_tickflow(now: datetime) -> bool | None:
         if now.time() < _STALE_BUFFER_UNTIL:
             return None
         return False
-    except Exception:  # noqa: BLE001 — 无权限/网络失败按未知处理
+    except Exception:
         return None
 
 
 def is_trading_day(now: datetime | None = None) -> bool | None:
     """今天是否 A 股交易日。True=交易日, False=确定休市, None=未知 (维持周几近似)。
 
-    周末零成本直判; 工作日走探测链 (fuyao 日历 → tickflow 时间戳),
+    周末零成本直判；工作日仅探测当前选定的实时数据源，
     结论按 TTL 缓存。线程安全: 实时行情与分钟增量两个线程共用。
     """
     now = now or cn_now()
     if now.weekday() >= 5:
         return False
 
+    from app.services import preferences
+
+    provider_name = preferences.get_realtime_data_provider()
+    generation: int | None = None
+    if provider_name != "tickflow":
+        try:
+            from app.data_providers import custom as custom_sources
+
+            generation = custom_sources.registry_generation()
+        except Exception:
+            generation = None
+    route_key = (provider_name, generation)
+
     with _CACHE_LOCK:
         if (
             _CACHE.day == now.date()
+            and _CACHE.route_key == route_key
             and (time.monotonic() - _CACHE.probed_at) < _ttl_of(_CACHE.verdict)
         ):
             return _CACHE.verdict
-
-    verdict = _probe_fuyao(now)
-    if verdict is None:
+    if provider_name == "tickflow":
         verdict = _probe_tickflow(now)
+    else:
+        verdict = _probe_custom(now, provider_name)
 
     with _CACHE_LOCK:
         _CACHE.day = now.date()
+        _CACHE.route_key = route_key
         _CACHE.verdict = verdict
         _CACHE.probed_at = time.monotonic()
     return verdict

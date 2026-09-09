@@ -199,10 +199,17 @@ def scoring_value_expr(columns: Collection[str], name: str) -> pl.Expr | None:
         return hit.rolling_sum(window, min_samples=window).over("symbol")
     # ── 扩充批次 (2026-09-05): 全部滚动窗口默认 min_samples=窗口长 (fail-closed) ──
     if name == "log_float_mv":
-        # 换手率 = 成交量/流通股本 → 股本 = volume/turnover_rate, 市值 = close x 股本
+        # volume=手、turnover_rate=百分数值：流通股本=volume*100/(rate/100)。
         return (
             pl.when((pl.col("turnover_rate") > 0) & (pl.col("volume") > 0))
-            .then((pl.col("close") * pl.col("volume") / pl.col("turnover_rate")).log())
+            .then(
+                (
+                    pl.col("close")
+                    * pl.col("volume")
+                    * 10_000.0
+                    / pl.col("turnover_rate")
+                ).log()
+            )
             .otherwise(None)
         )
     if name == "momentum_120d":
@@ -292,24 +299,60 @@ def materialize_scoring_columns(
     # 与单表达式路径不同, 必须整体走帧变换 —— 与检验/试算共用同一条计算路径 (P3)。
     from app.factors.dsl import FACTOR_COLUMN, compile_formula_cached
 
-    for name in names:
-        spec = _registry_get_factor(str(name))
-        if spec is None or spec.kind != "custom" or name in frame.columns:
+    order: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited or name in frame.columns:
+            return
+        if name in visiting:
+            raise ValueError(f"因子依赖存在循环引用: {name}")
+        spec = _registry_get_factor(name)
+        if spec is None:
+            return
+        visiting.add(name)
+        if spec.kind == "custom":
+            compiled = compile_formula_cached(spec.formula_text)
+            if not compiled.ok:
+                raise ValueError(f"自定义因子无法编译: {name}")
+            for referenced in sorted(compiled.referenced_factors):
+                visit(str(referenced))
+        elif spec.kind == "composite":
+            for member_id, _weight in spec.components:
+                visit(str(member_id))
+        visiting.remove(name)
+        visited.add(name)
+        order.append(name)
+
+    for requested in names:
+        visit(str(requested))
+
+    for name in order:
+        if name in frame.columns:
             continue
-        compiled = compile_formula_cached(spec.formula_text)
-        if compiled.frame_transform is None:
+        spec = _registry_get_factor(name)
+        if spec is None:
             continue
-        transformed = compiled.frame_transform(frame)
-        if transformed is None:
+        if spec.kind == "custom":
+            compiled = compile_formula_cached(spec.formula_text)
+            transformed = (
+                compiled.frame_transform(frame)
+                if compiled.frame_transform is not None
+                else None
+            )
+            if transformed is None:
+                raise ValueError(f"自定义因子 {name} 缺少所需输入列")
+            frame = transformed.with_columns(
+                pl.col(FACTOR_COLUMN).alias(name)
+            ).drop(FACTOR_COLUMN)
             continue
-        frame = transformed.with_columns(pl.col(FACTOR_COLUMN).alias(str(name))).drop(FACTOR_COLUMN)
-    expressions = [
-        expression.alias(name)
-        for name in names
-        if name not in frame.columns
-        and (expression := scoring_value_expr(frame.columns, str(name))) is not None
-    ]
-    return frame.with_columns(expressions) if expressions else frame
+        expression = scoring_value_expr(frame.columns, name)
+        if expression is not None:
+            frame = frame.with_columns(expression.alias(name))
+        elif spec.kind == "composite":
+            raise ValueError(f"复合因子 {name} 缺少成员输入列")
+    return frame
 
 
 def _ratio(numerator: pl.Expr, denominator: pl.Expr) -> pl.Expr:

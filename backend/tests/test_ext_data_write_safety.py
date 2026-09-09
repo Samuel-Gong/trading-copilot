@@ -122,6 +122,20 @@ def test_deleted_config_rejects_stale_scheduler_write(tmp_path) -> None:
     assert not (tmp_path / "ext_data" / "concurrent").exists()
 
 
+def test_delete_failure_is_not_reported_as_success(tmp_path, monkeypatch) -> None:
+    store = ExtConfigStore(tmp_path)
+    store.create(_config())
+
+    def fail_delete(_path) -> None:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("shutil.rmtree", fail_delete)
+    with pytest.raises(OSError, match="permission denied"):
+        store.delete("concurrent")
+
+    assert store.get("concurrent") is not None
+
+
 def test_unversioned_config_cannot_create_data_directory(tmp_path) -> None:
     with pytest.raises(ExtConfigChangedError, match="缺少持久化修订号"):
         ext_data.write_ext_parquet(

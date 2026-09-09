@@ -973,8 +973,9 @@ export function RuleEditor({ rule, preset, simple, defaultThresholdCondition, on
             </div>
           </div>
           <div className="rounded-btn bg-base px-3 py-2 text-[10px] leading-relaxed text-muted">
-            按交易所异动规则口径 (3日±20%/30%… 10日+100%、30日+200% 等按板块) 计算
-            个股涨跌幅偏离值的接近度, 上穿阈值时告警; 冷却期内同一标的不重复提醒。
+            按交易所异动规则阈值计算固定窗口的滚动估算接近度，上穿阈值时告警；
+            尚未纳入异常公告后的重置及无涨跌幅限制期，不代表交易所认定或披露义务。
+            冷却期内同一标的不重复提醒。
           </div>
         </div>
       )}

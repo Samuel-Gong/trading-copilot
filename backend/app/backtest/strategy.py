@@ -1556,7 +1556,12 @@ class StrategyBacktestService:
                         logger.warning("basic_filter mask failed: %s", e)
                         return _err(f"基础过滤计算失败: {e}")
 
-            candidate_filter_mask = self._build_candidate_filter_mask(panel, s, params)
+            candidate_filter_mask = self._build_candidate_filter_mask(
+                panel,
+                s,
+                params,
+                as_of=config.end,
+            )
             candidate_mask = basic_mask & candidate_filter_mask
             panel = self._apply_score(panel, s, overrides, universe_mask=candidate_mask, factor_snapshot=factor_snapshot)
             formal_candidate_mask = candidate_mask & formal_range
@@ -2244,6 +2249,8 @@ class StrategyBacktestService:
         panel: pl.DataFrame,
         s: StrategyDef,
         params: dict,
+        *,
+        as_of: date | None = None,
     ) -> pl.Series:
         """生成策略候选层 mask。filter_history/filter 决定候选池, 不包含 entry_signals。"""
         false_mask = pl.Series("_candidate_filter", [False] * len(panel), dtype=pl.Boolean)
@@ -2253,7 +2260,15 @@ class StrategyBacktestService:
         # 优先: filter_history_fn 策略 (涨停/反包等多日形态, 与选股路径共用同一逻辑)
         if s.filter_history_fn:
             try:
-                hit_df = s.filter_history_fn(panel, params)
+                from app.strategy._market_data_runtime import execution_as_of
+
+                cutoff = as_of
+                if cutoff is None and "date" in panel.columns and not panel.is_empty():
+                    cutoff = panel.get_column("date").max()
+                if not isinstance(cutoff, date):
+                    raise ValueError("历史策略缺少执行截止日")
+                with execution_as_of(cutoff):
+                    hit_df = s.filter_history_fn(panel, params)
                 if hit_df is None or hit_df.is_empty():
                     return false_mask
                 # 命中行 (symbol,date) → 转 panel 等长布尔 mask

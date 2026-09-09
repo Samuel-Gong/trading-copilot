@@ -1,6 +1,6 @@
 """批次登记 API — 薄"批次"页 (持仓提醒), 只做胶水, 不含会计语义。
 
-映射/校验/持久化在 strategy.lots 域; 写完派生规则后复用 monitor_rules 的 _sync_engine 同步引擎。
+映射/校验/持久化在 strategy.lots 域；写完派生规则后复用 monitor_rules.sync_engine 同步引擎。
 """
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from app.services.definition_transactions import definitions_transaction
+from app.services.fs_utils import atomic_write_text
 from app.strategy import lots as lots_domain
 from app.strategy import monitor_rules
 
@@ -27,16 +29,40 @@ def _data_dir(request: Request) -> Path:
 
 
 def _resolve_asset_type(request: Request, symbol: str) -> str:
-    """按 symbol 解析资产类型 (stock/etf); 解析失败默认 stock (fail-safe)。"""
+    """按 symbol 解析资产类型 (stock/etf)；不可用时拒绝持久化。"""
     repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="行情仓库未初始化，无法确认资产类型")
     try:
-        return repo.resolve_asset_type(symbol) if repo is not None else "stock"
-    except Exception:
-        # 回退为 stock 会让 etf 批次的止盈止损规则落入错误的监控轮, 必须留痕排查
+        asset_type = repo.resolve_asset_type(symbol)
+    except Exception as exc:
         logging.getLogger(__name__).warning(
-            "resolve_asset_type failed for %s, falling back to stock", symbol, exc_info=True
+            "resolve_asset_type failed for %s", symbol, exc_info=True
         )
-        return "stock"
+        raise HTTPException(status_code=503, detail="资产类型解析失败，请稍后重试") from exc
+    if asset_type not in {"stock", "etf"}:
+        raise HTTPException(status_code=422, detail=f"持仓批次不支持资产类型: {asset_type}")
+    return asset_type
+
+
+def _bundle_paths(data_dir: Path, lot_id: str) -> tuple[Path, Path, Path]:
+    return (
+        data_dir / "user_data" / "lots" / f"{lot_id}.json",
+        data_dir / "user_data" / "monitor_rules" / f"{lot_id}_p.json",
+        data_dir / "user_data" / "monitor_rules" / f"{lot_id}_d.json",
+    )
+
+
+def _snapshot_bundle(paths: tuple[Path, ...]) -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def _restore_bundle(snapshot: dict[Path, bytes | None]) -> None:
+    for path, content in snapshot.items():
+        if content is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic_write_text(path, content.decode("utf-8"))
 
 
 class LotModel(BaseModel):
@@ -53,9 +79,9 @@ class LotModel(BaseModel):
 
 def _reload_engine(request: Request) -> None:
     """批次规则保存/删除后重载引擎 — 复用监控规则 API 的共享重载 (含指数纠正)。"""
-    from app.api.monitor_rules import _sync_engine
+    from app.api.monitor_rules import sync_engine
 
-    _sync_engine(request)
+    sync_engine(request)
 
 
 def sync_lot(request: Request, lot: dict) -> None:
@@ -66,7 +92,7 @@ def sync_lot(request: Request, lot: dict) -> None:
     from app.services import preferences
 
     data_dir = _data_dir(request)
-    with _write_lock:
+    with _write_lock, definitions_transaction(data_dir), monitor_rules.locked():
         default_channels = preferences.get_webhook_default_channels()
         # ETF/指数等资产类型解析 (止盈止损价格规则须走对应资产监控轮才会触发)
         asset_type = _resolve_asset_type(request, lot["symbol"])
@@ -88,12 +114,23 @@ def sync_lot(request: Request, lot: dict) -> None:
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             rules_to_write.append(monitor_rules.normalize(rule))
-        lots_domain.save_one(data_dir, lot)
-        for rid in rules_to_delete:
-            monitor_rules.delete_one(data_dir, rid)
-        for rule in rules_to_write:
-            monitor_rules.save_one(data_dir, rule)
-    _reload_engine(request)
+        snapshot = _snapshot_bundle(_bundle_paths(data_dir, lot["id"]))
+        try:
+            lots_domain.save_one(data_dir, lot)
+            for rid in rules_to_delete:
+                monitor_rules.delete_one(data_dir, rid)
+            for rule in rules_to_write:
+                monitor_rules.save_one(data_dir, rule)
+            _reload_engine(request)
+        except Exception:
+            _restore_bundle(snapshot)
+            try:
+                _reload_engine(request)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "restore monitor engine failed after lot rollback"
+                )
+            raise
 
 
 @router.get("")
@@ -118,14 +155,36 @@ def upsert_lot(lot_in: LotModel, request: Request):
 
 @router.delete("/{lot_id}")
 def delete_lot(lot_id: str, request: Request):
-    if not monitor_rules.ID_RE.match(lot_id):
-        raise HTTPException(status_code=400, detail="批次 id 非法")
+    try:
+        lots_domain.validate_lot_id(lot_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     data_dir = _data_dir(request)
-    with _write_lock:
-        deleted = lots_domain.delete_one(data_dir, lot_id)
-        # 两条派生规则都要删 (用 or 会短路跳过第二条)
-        deleted_p = monitor_rules.delete_one(data_dir, f"{lot_id}_p")
-        deleted_d = monitor_rules.delete_one(data_dir, f"{lot_id}_d")
-    if deleted or deleted_p or deleted_d:
-        _reload_engine(request)
+    with _write_lock, definitions_transaction(data_dir), monitor_rules.locked():
+        # 只有真实批次存在时才允许级联，避免任意合法 id 删除同名普通规则。
+        if lots_domain.load_one(data_dir, lot_id) is None:
+            return {"ok": True}
+        snapshot = _snapshot_bundle(_bundle_paths(data_dir, lot_id))
+        try:
+            deleted = lots_domain.delete_one(data_dir, lot_id)
+            derived_ids = (f"{lot_id}_p", f"{lot_id}_d")
+            deleted_rules: list[bool] = []
+            for rule_id in derived_ids:
+                existing = monitor_rules.load_one(data_dir, rule_id)
+                deleted_rules.append(
+                    bool(existing and existing.get("lot_id") == lot_id)
+                    and monitor_rules.delete_one(data_dir, rule_id)
+                )
+            deleted_p, deleted_d = deleted_rules
+            if deleted or deleted_p or deleted_d:
+                _reload_engine(request)
+        except Exception:
+            _restore_bundle(snapshot)
+            try:
+                _reload_engine(request)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "restore monitor engine failed after lot delete rollback"
+                )
+            raise
     return {"ok": True}

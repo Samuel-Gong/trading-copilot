@@ -83,7 +83,7 @@ GOLDEN_COLUMNS: list[dict] = [
     {"id": "net_income_yoy_latest", "label": "净利增速(最新公告)", "group": "财务", "desc": "最新已公告归母净利润同比(%)"},
     {"id": "debt_ratio_latest", "label": "资产负债率(最新公告)", "group": "财务", "desc": "最新已公告资产负债率(%)"},
     # --- 扩充批次 (2026-09-05): 追加于目录尾部, 前 48 项挖掘调度顺序不变 ---
-    {"id": "log_float_mv", "label": "流通市值对数", "group": "规模", "desc": "ln(收盘价 x 当日成交量 / 换手率), 由换手率反推流通股本, 高值代表大盘"},
+    {"id": "log_float_mv", "label": "流通市值对数", "group": "规模", "desc": "ln(收盘价 x 成交量(手) x 10000 / 换手率(%)), 由换手率反推流通股本"},
     {"id": "momentum_120d", "label": "120日动量", "group": "动量", "desc": "120个交易日累计收益率 (中期动量, 与短窗口互补)"},
     {"id": "mom_accel_20_60", "label": "动量加速度", "group": "动量", "desc": "20日动量 - 60日动量, 衡量近期动量相对中期是否增强"},
     {"id": "rsi_14_delta_5d", "label": "RSI五日变化", "group": "超买超卖", "desc": "RSI(14) - 5日前的RSI(14), 衡量强弱指标的边际变化"},

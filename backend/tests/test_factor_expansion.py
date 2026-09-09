@@ -11,6 +11,7 @@ import numpy as np
 import polars as pl
 import pytest
 
+from app.backtest.matrix import build_market_data_matrix, matrix_feature
 from app.strategy.scoring import materialize_scoring_columns
 
 N_DAYS = 250
@@ -24,8 +25,8 @@ OPEN = np.roll(CLOSE, 1) * 1.005
 OPEN[0] = 99.0 * 1.005  # 隔夜跳空 +0.5%
 PREV_CLOSE = np.roll(CLOSE, 1)
 PREV_CLOSE[0] = 99.0
-VOLUME = 1_000_000 + 500.0 * T                           # 量能缓增
-TURNOVER = VOLUME / 200_000_000.0                        # 流通股本 2 亿股
+VOLUME = 10_000 + 5.0 * T                                # 手（1 手 = 100 股）
+TURNOVER = VOLUME * 10_000.0 / 200_000_000.0             # 百分数值；流通股本 2 亿股
 RET = np.concatenate([[np.nan], CLOSE[1:] / CLOSE[:-1] - 1.0])
 
 # 列代数型因子的依赖列直接给黄金友好值
@@ -128,8 +129,15 @@ def test_obv_trend_bounded_and_golden() -> None:
 def test_log_float_mv_golden_and_fail_closed() -> None:
     frame = _materialize(["log_float_mv"])
     got = _col(frame, "log_float_mv")
-    golden = np.log(CLOSE * VOLUME / TURNOVER)
-    assert np.allclose(got, golden, atol=1e-10)  # = ln(流通市值), 股本=2亿
+    golden = np.log(CLOSE * VOLUME * 10_000.0 / TURNOVER)
+    assert np.allclose(got, golden, atol=1e-10)
+    assert np.allclose(np.exp(got) / CLOSE, 200_000_000.0, rtol=1e-12)
+    market = build_market_data_matrix(
+        _panel(),
+        field_columns={"turnover_rate"},
+    )
+    matrix_got = matrix_feature(market, "log_float_mv")[:, 0]
+    assert np.allclose(matrix_got, got, rtol=2e-6, atol=2e-6)
     # 换手率为 0 → None (fail-closed, 不产生 inf)
     broken = _panel().with_columns(pl.lit(0.0).alias("turnover_rate"))
     out = materialize_scoring_columns(broken, ["log_float_mv"])

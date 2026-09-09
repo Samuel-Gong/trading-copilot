@@ -16,6 +16,7 @@ from typing import Literal
 import polars as pl
 
 from app.market_time import cn_today
+from app.services.environment_sources import ext_source_update
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ def _ext_config_dir_signature(base: Path) -> tuple | None:
                 st = cp.stat()
                 sig.append((d.name, st.st_mtime_ns, st.st_size))
         return tuple(sig)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -273,7 +274,8 @@ class ExtConfigStore:
             if not old.exists():
                 old = self._base.parent / "ext_configs.json.bak"
             if old.exists():
-                self._migrate_legacy(old)
+                with ext_source_update(self._base.parent):
+                    self._migrate_legacy(old)
         if not self._base.exists():
             return []
         configs = []
@@ -322,7 +324,7 @@ class ExtConfigStore:
 
     def create(self, config: ExtConfig) -> None:
         """仅在 id 尚不存在时创建配置。"""
-        with _ext_data_lock(config.id, self._base.parent):
+        with ext_source_update(self._base.parent), _ext_data_lock(config.id, self._base.parent):
             cp = self._config_path(config.id)
             if cp.exists():
                 raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已存在")
@@ -330,7 +332,7 @@ class ExtConfigStore:
 
     def update(self, config: ExtConfig) -> None:
         """仅在磁盘修订号仍匹配时更新配置。"""
-        with _ext_data_lock(config.id, self._base.parent):
+        with ext_source_update(self._base.parent), _ext_data_lock(config.id, self._base.parent):
             if config._storage_revision is None:
                 raise ExtConfigChangedError(
                     f"扩展配置 '{config.id}' 缺少持久化修订号，请重新读取后更新"
@@ -351,10 +353,12 @@ class ExtConfigStore:
             cp = self._config_path(config_id)
         except ValueError:
             return False
-        with _ext_data_lock(config_id, self._base.parent):
+        with ext_source_update(self._base.parent), _ext_data_lock(config_id, self._base.parent):
             if not cp.exists():
                 return False
-            shutil.rmtree(cp.parent, ignore_errors=True)
+            shutil.rmtree(cp.parent)
+            if cp.parent.exists():
+                raise OSError(f"扩展配置目录删除失败: {cp.parent}")
             return True
 
     def _migrate_legacy(self, old_path: Path) -> None:
@@ -702,7 +706,7 @@ def write_ext_parquet(
         lookup = build_code_lookup(data_dir)
         df = df.with_columns(normalize_symbol(df["symbol"], lookup))
 
-    with _ext_data_lock(config.id, data_dir):
+    with ext_source_update(data_dir), _ext_data_lock(config.id, data_dir):
         _assert_current_config(config, data_dir)
         if config.mode == "snapshot":
             # 快照: 与 config.json 同级，直接覆盖
@@ -747,7 +751,7 @@ def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
     - snapshot: 删除 ext_data/{id}/part.parquet
     - timeseries: 删除 ext_data/{id}/timeseries/ 目录
     """
-    with _ext_data_lock(config_id, data_dir):
+    with ext_source_update(data_dir), _ext_data_lock(config_id, data_dir):
         cfg_dir = _config_dir(config_id, data_dir)
         changed = False
         # 删除快照文件
@@ -774,7 +778,7 @@ def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
     Returns:
         修复的文件数。
     """
-    with _ext_data_lock(config.id, data_dir):
+    with ext_source_update(data_dir), _ext_data_lock(config.id, data_dir):
         _assert_current_config(config, data_dir)
         cfg_dir = _config_dir(config.id, data_dir)
         if not cfg_dir.exists():

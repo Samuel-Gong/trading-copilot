@@ -207,6 +207,29 @@ def test_auto_start_no_qualified_factors(client: Any, monkeypatch: pytest.Monkey
     assert client.manager.start_calls == []
 
 
+def test_auto_start_without_partitions_uses_beijing_today(
+    client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api import mining as mining_api
+
+    target = date(2026, 9, 7)
+    captured: dict[str, Any] = {}
+
+    def capture_screening(*_args, **kwargs):
+        captured.update(kwargs)
+        return _screening([])
+
+    monkeypatch.setattr(mining_api, "cn_today", lambda: target)
+    monkeypatch.setattr(mining_api, "enriched_partition_dates", lambda *_a, **_k: [])
+    monkeypatch.setattr(auto_mining, "screen_all_factors", capture_screening)
+
+    response = client.client.post("/api/backtest/mining/auto", json={})
+
+    assert response.status_code == 200
+    assert captured["end"] == target
+
+
 def test_auto_start_rejects_bad_date_range(client: Any) -> None:
     response = client.client.post("/api/backtest/mining/auto", json={
         "start": "2026-09-01", "end": "2026-08-01",

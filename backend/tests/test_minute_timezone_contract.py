@@ -5,11 +5,12 @@
 - _normalize_minute (TickFlow 帧, timestamp 毫秒为 UTC 基准)
 - _try_custom_minute (插件/自定义源帧)
 
-覆盖: 显式转换 / 北京墙钟直通 / UTC 特征自愈 +8 / tz-aware 换算 /
-fail-closed 拒收 / 路由级契约违规回退 TickFlow。
+覆盖: 显式转换 / 北京墙钟直通 / naive 非北京口径拒收 / tz-aware 换算 /
+fail-closed 拒收 / 路由级契约违规时停止且不跨源回退。
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -82,22 +83,15 @@ def test_guard_beijing_naive_passthrough():
     assert out["datetime"].to_list() == _beijing_day()
 
 
-def test_guard_utc_naive_selfhealed_plus8():
-    """01:30/05:00/07:00 (UTC 墙钟特征) → 自动 +8 → 09:30/13:00/15:00。"""
+def test_guard_utc_naive_is_rejected():
+    """naive 01:30 不能靠小时特征猜为 UTC，必须 fail-closed。"""
     df = _minute_frame([
         datetime(2026, 1, 15, 1, 30),
         datetime(2026, 1, 15, 5, 0),
         datetime(2026, 1, 15, 7, 0),
     ])
-    out = kline_sync._enforce_minute_beijing_wallclock(df, source="t")
-    assert out["datetime"].to_list() == _beijing_day()
-
-
-def test_guard_selfheal_is_idempotent():
-    df = _minute_frame([datetime(2026, 1, 15, 1, 30), datetime(2026, 1, 15, 3, 0)])
-    once = kline_sync._enforce_minute_beijing_wallclock(df, source="t")
-    twice = kline_sync._enforce_minute_beijing_wallclock(once, source="t")
-    assert once["datetime"].to_list() == twice["datetime"].to_list()
+    with pytest.raises(ValueError, match="北京墙钟交易时段"):
+        kline_sync._enforce_minute_beijing_wallclock(df, source="t")
 
 
 def test_guard_tzaware_utc_converted():
@@ -123,40 +117,61 @@ def _shanghai_tz():
 def test_guard_unrecognized_convention_fails_closed():
     """21:30/22:15 (境外墙钟特征) 既非北京时段也非 UTC 平移 → 拒收。"""
     df = _minute_frame([datetime(2026, 1, 15, 21, 30), datetime(2026, 1, 15, 22, 15)])
-    with pytest.raises(ValueError, match="口径无法识别"):
+    with pytest.raises(ValueError, match="北京墙钟交易时段"):
         kline_sync._enforce_minute_beijing_wallclock(df, source="t")
 
 
-def test_guard_all_null_datetimes_passthrough():
-    """全 null datetime 维持原行为 (下游落盘过滤), 不误伤。"""
+def test_guard_all_null_datetimes_fails_closed():
+    """全 null datetime 必须拒收，不得生成 date=None 分区。"""
     df = _minute_frame([None, None])
-    out = kline_sync._enforce_minute_beijing_wallclock(df, source="t")
-    assert out.height == 2
-    assert out["datetime"].null_count() == 2
+    with pytest.raises(ValueError, match="null values"):
+        kline_sync._enforce_minute_beijing_wallclock(df, source="t")
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [datetime(2026, 1, 15, 1, 30), datetime(2026, 1, 15, 2, 0), datetime(2026, 1, 15, 9, 30)],
+        [datetime(2026, 1, 15, 9, 30), datetime(2026, 1, 15, 10, 0), datetime(2026, 1, 15, 1, 30)],
+    ],
+)
+def test_guard_mixed_timezone_conventions_fails_closed(values):
+    """无论多数为哪种口径，同批混用时区都必须整批拒收。"""
+    with pytest.raises(ValueError, match="北京墙钟交易时段"):
+        kline_sync._enforce_minute_beijing_wallclock(_minute_frame(values), source="t")
+
+
+def test_write_minute_partition_drops_null_datetime(tmp_path):
+    """落盘层再次防御空时间戳，不创建 date=None 目录。"""
+    assert kline_sync._write_minute_partition(_minute_frame([None]), tmp_path) == 0
+    assert not (tmp_path / "date=None").exists()
 
 
 def test_guard_string_datetimes_classified_after_parse():
-    """trade_time 字符串路径: 先解析再分类 (UTC 特征串同样自愈)。"""
+    """无时区字符串解析后仍须满足北京墙钟契约。"""
     df = pl.DataFrame({
         "symbol": ["600519.SH"],
         "trade_time": ["2026-01-15 01:30:00"],
         "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
         "volume": [1.0], "amount": [1.0],
     }).rename({"trade_time": "datetime"})
-    out = kline_sync._enforce_minute_beijing_wallclock(df, source="t")
-    assert out["datetime"].to_list() == [datetime(2026, 1, 15, 9, 30)]
+    with pytest.raises(ValueError, match="北京墙钟交易时段"):
+        kline_sync._enforce_minute_beijing_wallclock(df, source="t")
 
 
-# ---------- 路由级: 自定义源契约违规 → 回退 TickFlow ----------
+# ---------- 路由级: 自定义源契约违规 → fail-closed ----------
 
 def _setup_custom_provider(monkeypatch, provider: object) -> None:
     monkeypatch.setattr(kline_sync.preferences, "get_minute_data_provider", lambda: "mock_src")
     monkeypatch.setattr("app.data_providers.custom.provider_has_dataset", lambda name, ds: True)
-    monkeypatch.setattr("app.data_providers.custom.get_provider", lambda name: provider)
+    monkeypatch.setattr(
+        "app.data_providers.custom.lease_provider",
+        lambda _name: nullcontext((provider, 1)),
+    )
 
 
-def test_custom_provider_utc_frame_selfhealed(monkeypatch):
-    """插件返回 UTC 墙钟帧 → 路由层守卫 +8 后下发, 不回退。"""
+def test_custom_provider_utc_naive_frame_fails_closed(monkeypatch):
+    """插件返回无时区 UTC 墙钟帧 → 拒绝，不猜测且不跨源回退。"""
     mock_provider = MagicMock()
     mock_provider.get_minute = MagicMock(return_value=_minute_frame(
         [datetime(2026, 1, 15, 1, 30), datetime(2026, 1, 15, 5, 0)]))
@@ -167,11 +182,11 @@ def test_custom_provider_utc_frame_selfhealed(monkeypatch):
         asset_type="stock",
     )
     assert fallback is False
-    assert df["datetime"].to_list() == [datetime(2026, 1, 15, 9, 30), datetime(2026, 1, 15, 13, 0)]
+    assert df.is_empty()
 
 
-def test_custom_provider_garbage_datetime_falls_back(monkeypatch):
-    """插件返回无法识别口径 → fail-closed 回退 TickFlow。"""
+def test_custom_provider_garbage_datetime_fails_closed(monkeypatch):
+    """插件返回无法识别口径 → 返回空帧且不越界回退 TickFlow。"""
     mock_provider = MagicMock()
     mock_provider.get_minute = MagicMock(return_value=_minute_frame(
         [datetime(2026, 1, 15, 21, 30)]))
@@ -181,5 +196,5 @@ def test_custom_provider_garbage_datetime_falls_back(monkeypatch):
         ["600519.SH"], datetime(2026, 1, 15, 9, 25), datetime(2026, 1, 15, 15, 5),
         asset_type="stock",
     )
-    assert fallback is True
-    assert df is None
+    assert fallback is False
+    assert df is not None and df.is_empty()

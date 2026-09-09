@@ -22,6 +22,7 @@ from app.backtest.candidates import CandidateStore
 from app.backtest.factor import FACTOR_COLUMNS
 from app.backtest.mining import compute_candidate_signature, evaluate_candidate_gate
 from app.services.mining_jobs import SUCCESS_RUN_STATUSES, MiningRunStore
+from app.strategy import config as strategy_config
 from app.strategy.ai_generator import AIStrategyGenerator
 from app.strategy.engine import StrategyEngine
 
@@ -110,7 +111,7 @@ class MiningCandidateService:
             return item
 
     def publish(self, run_id: str, signature: str) -> dict[str, Any]:
-        with _LOCK:
+        with _LOCK, strategy_config.definitions_transaction(self.data_dir):
             manifest, summary, path, frame, row, definition = self._load_candidate(
                 run_id, signature
             )

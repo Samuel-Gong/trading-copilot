@@ -95,6 +95,7 @@ def test_recovery_takes_over_when_owner_pid_is_dead_on_windows(tmp_path, monkeyp
         "generation": "stale-generation",
         "publication_id": "stale-publication",
         "owner_pid": 12345,
+        "scope": "unspecified",
         "updated_at_ns": 0,
     }
     (tmp_path / ".matrix_generation_stock.json").write_text(
@@ -228,28 +229,36 @@ def test_matrix_reader_retries_when_generation_changes_during_build(
     assert calls == ["generation-a", "generation-b"]
 
 
-def test_live_flush_write_recovers_stale_marker_from_dead_process(
+def test_live_flush_refuses_stale_multi_partition_publication(
     tmp_path, monkeypatch
 ) -> None:
-    """实时 enriched 落盘(repository 路径)遇到僵死 publishing 标记应接管自愈,
-    而非持续抛错直到下一次盘后管道。"""
+    """全量发布崩溃后，实时单日写不得把新旧混合历史误标为 ready。"""
     from app.tickflow.repository import DataStore, KlineRepository
 
-    (tmp_path / ".matrix_generation_stock.json").write_text(
-        json.dumps({
-            "state": "publishing",
-            "generation": "stale-generation",
-            "publication_id": "stale-publication",
-            "owner_pid": 999999999,
-            "updated_at_ns": 0,
-        }),
-        encoding="utf-8",
+    first = tmp_path / "kline_daily_enriched" / "date=2026-08-13" / "part.parquet"
+    publication = EnrichedPublication(
+        tmp_path,
+        recover=True,
+        scope="pipeline-full-rebuild",
+        allow_scope_takeover=True,
     )
+    publication.write_parquet(
+        _frame(9.0).with_columns(pl.lit(date(2026, 8, 13)).alias("date")),
+        first,
+    )
+    del publication
 
     repo = KlineRepository(DataStore(tmp_path))
-    repo.append_enriched(_frame(10.0))
+    with pytest.raises(EnrichedGenerationUnavailableError, match="different scope"):
+        repo.flush_live_enriched(_frame(10.0))
 
     marker = json.loads(
         (tmp_path / ".matrix_generation_stock.json").read_text(encoding="utf-8")
     )
-    assert marker["state"] == "ready"
+    assert marker["state"] == "publishing"
+    assert first.is_file()
+    assert not (
+        tmp_path / "kline_daily_enriched" / "date=2026-08-14" / "part.parquet"
+    ).exists()
+    with pytest.raises(EnrichedGenerationUnavailableError, match="being published"):
+        get_enriched_generation(tmp_path, "stock")

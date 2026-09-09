@@ -60,7 +60,7 @@ MAX_HOLD_DAYS = 25
 
 class ActiveLimitGeneMatrixStrategy:
     def required_fields(self) -> frozenset[str]:
-        return frozenset({"close", "volume"})
+        return frozenset({"close", "volume", "consecutive_limit_ups"})
 
     def required_warmup_bars(self, params: dict) -> int:
         del params

@@ -961,6 +961,7 @@ export interface RpsRotationData {
   dates: string[]
   columns: Record<string, [string, number][]>
   concept_count: number
+  membership_note: string
 }
 
 // ===== 市场环境(Regime) =====
@@ -1343,7 +1344,7 @@ export interface AbnormalWindowInfo {
   closeness: number
 }
 
-export type AbnormalStatus = 'triggered' | 'edge' | 'watch'
+export type AbnormalStatus = 'estimate' | 'edge' | 'watch' | 'triggered'
 
 export interface AbnormalRow {
   symbol: string
@@ -1355,6 +1356,7 @@ export interface AbnormalRow {
   windows: Record<string, AbnormalWindowInfo>
   max_closeness: number
   status: AbnormalStatus
+  determination: 'rolling_estimate'
 }
 
 export interface AbnormalOverview {
@@ -1362,6 +1364,7 @@ export interface AbnormalOverview {
   cache_date: string | null
   bench_rt_pct: number | null
   includes_today: boolean
+  calculation_scope: 'rolling_estimate'
   rules: Array<{
     board: string
     st: boolean
@@ -1369,7 +1372,7 @@ export interface AbnormalOverview {
     thresholds: Record<string, { up: number; down: number }>
     note: string
   }>
-  counts: { triggered: number; edge: number; watch: number }
+  counts: { estimate: number; edge: number; watch: number; triggered?: number }
   rows: AbnormalRow[]
 }
 
@@ -2213,6 +2216,9 @@ export interface DatasetConfig {
   end_param?: string
   asset_type_param?: string | null
   freq_param?: string | null
+  pct_unit?: 'percent' | 'decimal' | null
+  volume_unit?: 'lots' | 'shares' | null
+  adj_factor_kind?: 'event_ratio' | 'cumulative' | null
   timeout?: number | null
 }
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,6 +93,83 @@ def test_clear_data_bumps_enriched_generations_and_invalidates_panel_cache(
     assert repo.calls == ["clear_cache", "refresh_cache", "rebuild_views"]
 
 
+def test_clear_data_rejects_while_data_pipeline_owns_run_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.pipeline_jobs import release_run_slot, try_acquire_run_slot
+
+    _stub_clear_side_effects(monkeypatch)
+    repo = _RepoStub(tmp_path)
+    target = tmp_path / "kline_daily" / "date=2026-09-07" / "part.parquet"
+    _write_parquet_placeholder(target)
+    assert try_acquire_run_slot("test-pipeline")
+    try:
+        with pytest.raises(data_api.HTTPException) as exc_info:
+            data_api.clear_data(_request(repo))
+        assert exc_info.value.status_code == 409
+        assert target.exists()
+    finally:
+        release_run_slot("test-pipeline")
+
+
+def test_clear_waits_for_inflight_quote_then_removes_its_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_clear_side_effects(monkeypatch)
+    repo = _RepoStub(tmp_path)
+    repo._write_lock = threading.Lock()
+    target = tmp_path / "kline_daily" / "date=2026-09-07" / "part.parquet"
+
+    class QuoteService:
+        def __init__(self) -> None:
+            self.fetch_lock = threading.Lock()
+            self.paused = threading.Event()
+
+        @contextmanager
+        def quiesced(self):
+            self.paused.set()
+            with self.fetch_lock:
+                yield
+
+        def clear_pending_alerts(self) -> None:
+            return None
+
+    quote_service = QuoteService()
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+
+    def quote_writer() -> None:
+        with quote_service.fetch_lock:
+            writer_started.set()
+            assert release_writer.wait(timeout=2)
+            with repo._write_lock:
+                _write_parquet_placeholder(target)
+
+    writer = threading.Thread(target=quote_writer)
+    writer.start()
+    assert writer_started.wait(timeout=2)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(repo=repo, quote_service=quote_service)
+        )
+    )
+    results: list[dict] = []
+    clearer = threading.Thread(
+        target=lambda: results.append(data_api.clear_data(request))
+    )
+    clearer.start()
+    assert quote_service.paused.wait(timeout=2)
+    release_writer.set()
+    writer.join(timeout=2)
+    clearer.join(timeout=2)
+
+    assert not writer.is_alive() and not clearer.is_alive()
+    assert results == [{"deleted_files": 1}]
+    assert not target.exists()
+
+
 def test_clear_data_removes_regime_mainline_history_and_invalidates_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -155,7 +234,7 @@ def test_clear_data_invalidates_benchmark_and_abnormal_move_caches(
     index_path = tmp_path / "kline_index_daily" / "date=2026-08-14" / "part.parquet"
     index_path.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame({
-        "symbol": ["000001.SH"],
+        "symbol": ["000002.SH"],
         "date": [date(2026, 8, 14)],
         "close": [3200.0],
     }).write_parquet(index_path)
@@ -173,6 +252,54 @@ def test_clear_data_invalidates_benchmark_and_abnormal_move_caches(
     assert load_benchmark_momentum(tmp_path) is None
     with _hist_cache_lock:
         assert _hist_cache == {}
+
+
+def test_abnormal_snapshot_cannot_restore_cache_after_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from app.services import abnormal_moves
+
+    loaded = threading.Event()
+    resume = threading.Event()
+
+    class _BlockingRepo:
+        calls = 0
+
+        def get_enriched_latest(self):
+            self.calls += 1
+            if self.calls == 1:
+                frame = pl.DataFrame({
+                    "symbol": ["600000.SH"],
+                    "close": [10.0],
+                    "change_pct": [0.01],
+                    "deviate_3d": [0.1],
+                })
+                loaded.set()
+                assert resume.wait(timeout=5)
+                return frame, date(2026, 8, 14)
+            return pl.DataFrame(), None
+
+        def get_name_map(self, _symbols):
+            return {}
+
+    repo = _BlockingRepo()
+    abnormal_moves.invalidate_abnormal_moves_cache()
+    result: list[dict] = []
+    worker = threading.Thread(target=lambda: result.append(abnormal_moves._hist_snapshot(repo)))
+    worker.start()
+    assert loaded.wait(timeout=5)
+
+    abnormal_moves.invalidate_abnormal_moves_cache()
+    resume.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert repo.calls == 2
+    assert result[0]["rows"] == {}
+    with abnormal_moves._hist_cache_lock:
+        assert abnormal_moves._hist_cache == {}
 
 
 def test_clear_data_restores_ready_generation_when_first_delete_fails(

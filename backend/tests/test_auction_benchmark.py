@@ -8,6 +8,7 @@ fuyao 未配置降级、目标日失败 fallback_prev、彻底失败 no_data、A
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
 
@@ -65,7 +66,7 @@ class _FakeProvider:
 
 
 def _use_provider(monkeypatch, provider) -> _FakeProvider:
-    monkeypatch.setattr(ab, "_provider", lambda: provider)
+    monkeypatch.setattr(ab, "_provider", lambda: nullcontext(provider))
     return provider
 
 
@@ -79,7 +80,7 @@ def test_resolve_rolls_back_non_trading_day(data_dir):
 # ---- 状态与缓存 ----
 
 def test_source_unavailable_without_fuyao(data_dir, monkeypatch):
-    monkeypatch.setattr(ab, "_provider", lambda: None)
+    monkeypatch.setattr(ab, "_provider", lambda: nullcontext(None))
     out = ab.get_auction_benchmark(data_dir, None)
     assert out["state"] == "source_unavailable"
 
@@ -108,7 +109,7 @@ def test_explicit_history_date_uses_cache(data_dir, monkeypatch):
 
 
 def test_failure_falls_back_to_prev(data_dir, monkeypatch):
-    provider = _use_provider(monkeypatch, _FakeProvider(fail_dates={"2026-08-28"}))
+    _use_provider(monkeypatch, _FakeProvider(fail_dates={"2026-08-28"}))
     out = ab.get_auction_benchmark(data_dir, date(2026, 8, 28))
     assert out["state"] == "fallback_prev"
     assert out["trade_date"] == "2026-08-27"
@@ -133,6 +134,46 @@ def test_corrupt_cache_refetches(data_dir, monkeypatch):
     out = ab.get_auction_benchmark(data_dir, date(2026, 8, 28))
     assert out["state"] == "ok"
     assert provider.calls  # 缓存损坏 → 重新拉取
+
+
+def test_explicit_history_rejects_provider_date_after_cutoff(data_dir, monkeypatch):
+    provider = _FakeProvider()
+    original = provider.short_term_benchmark
+
+    def _future_benchmark(date_iso: str | None) -> dict:
+        payload = original(date_iso)
+        payload["date"] = "2026-08-28"
+        return payload
+
+    provider.short_term_benchmark = _future_benchmark
+    _use_provider(monkeypatch, provider)
+
+    out = ab.get_auction_benchmark(data_dir, date(2026, 8, 27))
+
+    assert out["state"] == "no_data"
+    assert "2026-08-27" in out["message"]
+    assert not (data_dir / "auction_benchmark" / "date=2026-08-27.json").exists()
+
+
+@pytest.mark.parametrize("bad_date", [None, "not-a-date", "2026-08-26"])
+def test_explicit_history_rejects_missing_invalid_or_mismatched_date(
+    data_dir, monkeypatch, bad_date
+):
+    provider = _FakeProvider()
+    original = provider.short_term_benchmark
+
+    def bad_benchmark(date_iso: str | None) -> dict:
+        payload = original(date_iso)
+        payload["date"] = bad_date
+        return payload
+
+    provider.short_term_benchmark = bad_benchmark
+    _use_provider(monkeypatch, provider)
+
+    out = ab.get_auction_benchmark(data_dir, date(2026, 8, 27))
+
+    assert out["state"] == "no_data"
+    assert not (data_dir / "auction_benchmark" / "date=2026-08-27.json").exists()
 
 
 # ---- 收益 enrich ----
@@ -166,13 +207,15 @@ def test_enrich_missing_kline_gives_none(data_dir, monkeypatch):
 # ---- AI 复盘摘要 ----
 
 def test_build_recap_context_contains_summary(data_dir, monkeypatch):
-    _use_provider(monkeypatch, _FakeProvider())
-    ctx = ab.build_recap_context(data_dir)
+    provider = _use_provider(monkeypatch, _FakeProvider())
+    ctx = ab.build_recap_context(data_dir, date(2026, 8, 27))
     assert "盘前风向标名单" in ctx and "贵州茅台" in ctx
     assert "白酒" in ctx  # 概念标签
     assert "当日" in ctx  # 收益对照
+    assert "次日" not in ctx  # 历史 D 日复盘不得引用 D+1 收益
+    assert provider.calls == ["2026-08-27"]
 
 
 def test_build_recap_context_empty_without_source(data_dir, monkeypatch):
-    monkeypatch.setattr(ab, "_provider", lambda: None)
+    monkeypatch.setattr(ab, "_provider", lambda: nullcontext(None))
     assert ab.build_recap_context(data_dir) == ""

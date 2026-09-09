@@ -172,15 +172,22 @@ def build_capability_matrix(current: dict[str, str], tickflow_tier: str = "none"
         for s in sources:
             if cap["id"] not in s["datasets"]:
                 continue
+            missing_instruments = (
+                s["available"] and cap["id"] == "daily" and "instruments" not in s["datasets"]
+            )
             entry = {
                 "name": s["name"],
                 "display": s["display"],
                 "kind": s["kind"],
-                "available": s["available"],
-                "status": s["status"],
-                "note": None if s["available"] else (s["status"] or "不可用"),
+                "available": s["available"] and not missing_instruments,
+                "status": "缺少 instruments 标的维表" if missing_instruments else s["status"],
+                "note": (
+                    "日K源必须同时提供 instruments 标的维表"
+                    if missing_instruments
+                    else (None if s["available"] else (s["status"] or "不可用"))
+                ),
             }
-            (candidates if s["available"] else pending).append(entry)
+            (candidates if entry["available"] else pending).append(entry)
         usable = any(c["name"] == effective for c in candidates)
         capabilities.append({
             "id": cap["id"],

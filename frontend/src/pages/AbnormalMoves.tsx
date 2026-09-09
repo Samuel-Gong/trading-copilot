@@ -41,7 +41,8 @@ const WINDOW_LABELS: Record<WindowKey, string> = {
 }
 
 const STATUS_META: Record<AbnormalStatus, { label: string; cls: string; bar: string }> = {
-  triggered: { label: '已触发', cls: 'bg-danger/15 text-danger', bar: 'bg-danger' },
+  estimate: { label: '滚动估算达线', cls: 'bg-danger/15 text-danger', bar: 'bg-danger' },
+  triggered: { label: '旧版滚动估算达线', cls: 'bg-danger/15 text-danger', bar: 'bg-danger' },
   edge: { label: '异动边缘', cls: 'bg-warning/15 text-warning', bar: 'bg-warning' },
   watch: { label: '观察', cls: 'bg-elevated text-secondary', bar: 'bg-muted' },
 }
@@ -659,12 +660,12 @@ function DeviationView({ onPreview }: {
             {ruleChips()}
           </div>
           <p className="mt-2.5 border-t border-border/60 pt-2 text-[10px] leading-relaxed text-muted">
-            口径说明: 偏离值 = 个股 N 日累计涨跌幅 − 对应指数同期涨跌幅 (沪主板: 上证A指/上证指数,
-            科创板: 科创50, 深主板: 深证A指/深证成指, 创业板: 创业板综指, 北: 北证50)。
-            阈值为交易所异常波动披露标准的近似值, 仅供风险提示,
-            不构成监管认定。每只股票在 3日/10日/30日 三档各算一个接近度 (|偏离值| ÷ 该档阈值,
+            口径说明: 偏离值 = 个股 N 日累计涨跌幅 − 对应指数同期涨跌幅 (沪主板: 上证A指,
+            科创板: 科创50, 深主板: 深证A指, 创业板: 创业板综指, 北: 北证50)。
+            当前仅计算固定滚动窗口，尚未纳入异常公告后的重置、无涨跌幅限制期等监管事件；
+            因此达线只表示“滚动估算达线”，不可用于判断交易所已认定或必须披露。每只股票在 3日/10日/30日 三档各算一个接近度 (|偏离值| ÷ 该档阈值,
             阈值随板块不同; 2026-07-06 起主板风险警示股票与普通股票同口径), 表格「接近度」列与状态取三档中的最高值,
-            来源窗口的偏离值颜色加重显示、其余窗口淡化; ≥100% 已触发、≥70% 边缘、≥50% 观察。
+            来源窗口的偏离值颜色加重显示、其余窗口淡化; ≥100% 滚动估算达线、≥70% 边缘、≥50% 观察。
             偏离列亦可在自选/选股的「异动」列组中启用, 并可作为监控规则与自定义信号的阈值字段。
           </p>
         </div>
@@ -720,7 +721,7 @@ function DeviationView({ onPreview }: {
 
           {/* 统计 + 控制 */}
           <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <StatusChip label="已触发" count={counts?.triggered} tone="danger" />
+            <StatusChip label="滚动估算达线" count={counts?.estimate} tone="danger" />
             <StatusChip label="异动边缘" count={counts?.edge} tone="warning" />
             <StatusChip label="观察" count={counts?.watch} tone="muted" />
             {enabled && (
@@ -863,7 +864,7 @@ function DeviationView({ onPreview }: {
                   ))}
                   <th
                     className="w-36 px-2 py-2 text-left"
-                    title="取 3日/10日/30日 三档中最高的 |偏离值|÷对应档阈值; ≥100% 已触发, ≥70% 边缘, ≥50% 观察"
+                    title="取 3日/10日/30日 三档中最高的 |偏离值|÷对应档阈值; ≥100% 仅表示滚动估算达线, ≥70% 边缘, ≥50% 观察"
                   >
                     接近度
                     <span className="ml-1 normal-case text-muted/60">(最高档)</span>
@@ -1007,7 +1008,7 @@ function AbnormalRowView({ row, rank, onPreview }: {
       <td className="px-2 py-1.5">
         <div
           className="flex items-center gap-1.5"
-          title="取 3日/10日/30日 三档中最高的 |偏离值|÷对应档阈值; ≥100% 已触发, ≥70% 边缘, ≥50% 观察"
+          title="取 3日/10日/30日 三档中最高的 |偏离值|÷对应档阈值; ≥100% 仅表示滚动估算达线, ≥70% 边缘, ≥50% 观察"
         >
           <div className="h-1.5 w-20 overflow-hidden rounded-full bg-elevated">
             <div

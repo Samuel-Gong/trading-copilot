@@ -273,7 +273,7 @@ def _group_members_or_none(rule: dict) -> frozenset[str] | None:
     group_id = str(rule.get("group_id") or "")
     try:
         groups = _watchlist_groups_snapshot()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("自选分组数据读取失败, 规则 %s 本轮跳过: %s", rule.get("id"), exc)
         return None
     members = groups.get(group_id)
@@ -443,28 +443,41 @@ class MonitorRuleEngine:
         self._name_map = name_map or {}
 
     # ── 规则管理 ───────────────────────────────────────
-    @staticmethod
-    def _rule_state_signature(rule: dict) -> tuple[Any, ...]:
-        return (
-            rule.get("type"),
-            rule.get("strategy_id"),
-            rule.get("score_min"),
-            rule.get("score_max"),
-            rule.get("asset_type", "stock"),
-            rule.get("scope", "symbols"),
-            rule.get("group_id"),
-            tuple(sorted(str(symbol) for symbol in rule.get("symbols", []))),
-            rule.get("sector"),
-            rule.get("sector_kind"),
-            tuple(sorted(str(target.get("key")) for target in rule.get("sector_targets", []))),
-            rule.get("sector_trigger"),
-            rule.get("direction"),
-            rule.get("threshold_pct"),
-            rule.get("window_minutes"),
-            rule.get("abnormal_window"),
-            rule.get("remind_date"),
-            rule.get("lead_days"),
-        )
+    @classmethod
+    def _freeze_rule_state(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple(sorted(
+                (str(key), cls._freeze_rule_state(item))
+                for key, item in value.items()
+            ))
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return tuple(sorted(
+                (cls._freeze_rule_state(item) for item in value),
+                key=repr,
+            ))
+        return value
+
+    @classmethod
+    def _rule_state_signature(cls, rule: dict) -> tuple[Any, ...]:
+        """只忽略不会改变命中语义的展示与通知字段。"""
+        cosmetic_fields = {
+            "cooldown_seconds",
+            "created_at",
+            "enabled",
+            "id",
+            "message",
+            "name",
+            "severity",
+            "updated_at",
+            "webhook_channels",
+            "webhook_enabled",
+            "webhook_url",
+        }
+        return cls._freeze_rule_state({
+            key: value
+            for key, value in rule.items()
+            if key not in cosmetic_fields
+        })
 
     def set_rules(self, rules: list[dict]) -> None:
         """批量设置规则 (覆盖)。用于启动时 reload。
@@ -798,13 +811,14 @@ class MonitorRuleEngine:
             self._building_strategy_results = state.building_strategy_results
             self._latest_strategy_results = state.building_strategy_results
             self._latest_strategy_result_ids = state.latest_strategy_result_ids
-
-        for event in events:
-            if self._alert_handler:
-                try:
-                    self._alert_handler(event)
-                except Exception as e:
-                    logger.warning("alert handler failed: %s", e)
+            # 状态发布与通知共用规则代际锁，保证 set/remove_rules 返回后不会再发送
+            # 已删除规则的旧事件。RLock 允许 handler 同线程回调规则管理接口。
+            for event in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(event)
+                    except Exception as e:
+                        logger.warning("alert handler failed: %s", e)
 
         return events
 
@@ -817,18 +831,26 @@ class MonitorRuleEngine:
         """
         now = now if now is not None else time.time()
         today_iso = cn_today().isoformat()
-        if self._date_eval_day == today_iso and self._date_eval_rules_version == self._rules_version:
-            return []
+        with self._strategy_state_lock:
+            generation = self._strategy_state_generation
+            rules_version = self._rules_version
+            if (
+                self._date_eval_day == today_iso
+                and self._date_eval_rules_version == rules_version
+            ):
+                return []
+            rules = list(self._rules.values())
+            last_fire = dict(self._last_fire)
         # 跨天首轮清掉已过期日期的按天 cooldown 键, 避免 _last_fire 无限累积
-        self._last_fire = {
+        last_fire = {
             key: value
-            for key, value in self._last_fire.items()
+            for key, value in last_fire.items()
             if not (key[1].startswith("_date_") and key[1] != f"_date_{today_iso}")
         }
 
         today_d = _dt.date.fromisoformat(today_iso)
         events: list[dict] = []
-        for rule in list(self._rules.values()):
+        for rule in rules:
             if rule.get("type") != "date" or rule.get("enabled") is False:
                 continue
             remind = rule.get("remind_date") or ""
@@ -837,10 +859,10 @@ class MonitorRuleEngine:
             # 按天隔离: 窗口内每天最多触发一次
             key = (rule["id"], f"_date_{today_iso}", "date")
             cooldown = int(rule.get("cooldown_seconds") or 86400)
-            last = self._last_fire.get(key)
+            last = last_fire.get(key)
             if last is not None and (now - last) < cooldown:
                 continue
-            self._last_fire[key] = now
+            last_fire[key] = now
 
             symbols = [s for s in rule.get("symbols", []) if s]
             single_symbol = symbols[0] if len(symbols) == 1 else None
@@ -873,13 +895,19 @@ class MonitorRuleEngine:
                 "logic": "and",
             }
             events.append(ev)
-            if self._alert_handler:
-                try:
-                    self._alert_handler(ev)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("alert handler failed: %s", e)
-        self._date_eval_day = today_iso
-        self._date_eval_rules_version = self._rules_version
+
+        with self._strategy_state_lock:
+            if generation != self._strategy_state_generation:
+                return []
+            self._last_fire = last_fire
+            self._date_eval_day = today_iso
+            self._date_eval_rules_version = rules_version
+            for ev in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(ev)
+                    except Exception as e:
+                        logger.warning("alert handler failed: %s", e)
         return events
 
     def evaluate_sectors(
@@ -892,10 +920,14 @@ class MonitorRuleEngine:
         """按板块聚合快照评估 type=sector 规则。"""
         if self._sector_monitor_service is None:
             return []
-        rules = [
-            rule for rule in list(self._rules.values())
-            if rule.get("enabled", True) and rule.get("type") == "sector"
-        ]
+        with self._strategy_state_lock:
+            generation = self._strategy_state_generation
+            rules = [
+                rule for rule in self._rules.values()
+                if rule.get("enabled", True) and rule.get("type") == "sector"
+            ]
+            last_fire = dict(self._last_fire)
+            condition_state = dict(self._sector_condition_state)
         if not rules:
             return []
 
@@ -919,12 +951,35 @@ class MonitorRuleEngine:
         events: list[dict] = []
         for rule in rules:
             try:
-                events.extend(self._evaluate_sector_rule(rule, snapshots, timestamp))
-            except Exception as exc:  # noqa: BLE001
+                events.extend(
+                    self._evaluate_sector_rule(
+                        rule, snapshots, timestamp, last_fire, condition_state,
+                    ),
+                )
+            except Exception as exc:
                 logger.warning("板块规则评估失败 %s: %s", rule.get("id"), exc)
+
+        with self._strategy_state_lock:
+            if generation != self._strategy_state_generation:
+                return []
+            self._last_fire = last_fire
+            self._sector_condition_state = condition_state
+            for event in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(event)
+                    except Exception as exc:
+                        logger.warning("alert handler failed: %s", exc)
         return events
 
-    def _evaluate_sector_rule(self, rule: dict, snapshots: dict[str, dict], now: float) -> list[dict]:
+    def _evaluate_sector_rule(
+        self,
+        rule: dict,
+        snapshots: dict[str, dict],
+        now: float,
+        last_fire: dict[tuple[str, str, str], float],
+        condition_state: dict[tuple[str, str], bool],
+    ) -> list[dict]:
         events: list[dict] = []
         direction = rule.get("direction", "up")
         trigger = rule.get("sector_trigger", "change_pct")
@@ -945,18 +1000,18 @@ class MonitorRuleEngine:
                 value >= threshold if direction == "up" else value <= -threshold
             )
             state_key = (rule["id"], target_key)
-            previous = self._sector_condition_state.get(state_key)
-            self._sector_condition_state[state_key] = condition
+            previous = condition_state.get(state_key)
+            condition_state[state_key] = condition
             if previous is None or previous or not condition:
                 continue
 
             event_type = f"sector_{trigger}_{direction}"
             cooldown_key = (rule["id"], target_key, event_type)
-            last = self._last_fire.get(cooldown_key)
+            last = last_fire.get(cooldown_key)
             cooldown = int(rule.get("cooldown_seconds", 3600))
             if last is not None and now - last < cooldown:
                 continue
-            self._last_fire[cooldown_key] = now
+            last_fire[cooldown_key] = now
             message = rule.get("message", "") or self._sector_message(
                 snapshot, trigger, direction, threshold, window, value,
             )
@@ -991,11 +1046,6 @@ class MonitorRuleEngine:
                 "leader": snapshot.get("leader"),
             }
             events.append(event)
-            if self._alert_handler:
-                try:
-                    self._alert_handler(event)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("alert handler failed: %s", exc)
         return events
 
     @staticmethod
@@ -1037,11 +1087,12 @@ class MonitorRuleEngine:
 
         供调用方 (quote_service) 构建异动快照时预过滤, 不必按最高阈值拉全量。
         """
-        thresholds = [
-            float(r.get("threshold_pct", 70)) / 100
-            for r in list(self._rules.values())
-            if r.get("enabled", True) and r.get("type") == "abnormal"
-        ]
+        with self._strategy_state_lock:
+            thresholds = [
+                float(r.get("threshold_pct", 70)) / 100
+                for r in self._rules.values()
+                if r.get("enabled", True) and r.get("type") == "abnormal"
+            ]
         return min(thresholds) if thresholds else 1.0
 
     def evaluate_abnormal(self, rows: list[dict], *, now: float | None = None) -> list[dict]:
@@ -1051,22 +1102,49 @@ class MonitorRuleEngine:
         min_abnormal_closeness 预过滤)。rows 为空也照常评估 —— 用于把
         已消失标的的边缘状态清理回 False。
         """
-        rules = [
-            rule for rule in list(self._rules.values())
-            if rule.get("enabled", True) and rule.get("type") == "abnormal"
-        ]
+        with self._strategy_state_lock:
+            generation = self._strategy_state_generation
+            rules = [
+                rule for rule in self._rules.values()
+                if rule.get("enabled", True) and rule.get("type") == "abnormal"
+            ]
+            last_fire = dict(self._last_fire)
+            condition_state = dict(self._abnormal_condition_state)
         if not rules:
             return []
         timestamp = time.time() if now is None else now
         events: list[dict] = []
         for rule in rules:
             try:
-                events.extend(self._evaluate_abnormal_rule(rule, rows, timestamp))
-            except Exception as exc:  # noqa: BLE001
+                events.extend(
+                    self._evaluate_abnormal_rule(
+                        rule, rows, timestamp, last_fire, condition_state,
+                    ),
+                )
+            except Exception as exc:
                 logger.warning("异动规则评估失败 %s: %s", rule.get("id"), exc)
+
+        with self._strategy_state_lock:
+            if generation != self._strategy_state_generation:
+                return []
+            self._last_fire = last_fire
+            self._abnormal_condition_state = condition_state
+            for event in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(event)
+                    except Exception as exc:
+                        logger.warning("alert handler failed: %s", exc)
         return events
 
-    def _evaluate_abnormal_rule(self, rule: dict, rows: list[dict], now: float) -> list[dict]:
+    def _evaluate_abnormal_rule(
+        self,
+        rule: dict,
+        rows: list[dict],
+        now: float,
+        last_fire: dict[tuple[str, str, str], float],
+        condition_state: dict[tuple[str, str], bool],
+    ) -> list[dict]:
         events: list[dict] = []
         threshold = float(rule.get("threshold_pct", 70)) / 100
         if not 0 < threshold <= 1.5:
@@ -1107,18 +1185,18 @@ class MonitorRuleEngine:
                     best = (key, closeness, float(value), float(win.get("threshold") or 0))
             condition = best is not None and best[1] >= threshold
             state_key = (rule["id"], symbol)
-            previous = self._abnormal_condition_state.get(state_key)
-            self._abnormal_condition_state[state_key] = condition
+            previous = condition_state.get(state_key)
+            condition_state[state_key] = condition
             if previous is None or previous or not condition:
                 continue
 
             event_type = f"abnormal_{'up' if best[2] > 0 else 'down'}"
             cooldown_key = (rule["id"], symbol, event_type)
-            last = self._last_fire.get(cooldown_key)
+            last = last_fire.get(cooldown_key)
             cooldown = int(rule.get("cooldown_seconds", 3600))
             if last is not None and now - last < cooldown:
                 continue
-            self._last_fire[cooldown_key] = now
+            last_fire[cooldown_key] = now
             event = {
                 "ts": int(now * 1000),
                 "rule_id": rule["id"],
@@ -1141,16 +1219,11 @@ class MonitorRuleEngine:
                 "abnormal_closeness": round(best[1], 4),
             }
             events.append(event)
-            if self._alert_handler:
-                try:
-                    self._alert_handler(event)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("alert handler failed: %s", exc)
         # 本轮未出现的标的 (跌出预过滤区间) 状态置 False 而非删除:
         # 删除会被当成「首轮观测」而不触发, 置 False 才能在回升穿过阈值时再次告警。
-        for key, value in list(self._abnormal_condition_state.items()):
+        for key, value in list(condition_state.items()):
             if key[0] == rule["id"] and key[1] not in seen and value:
-                self._abnormal_condition_state[key] = False
+                condition_state[key] = False
         return events
 
     @staticmethod
@@ -1158,11 +1231,12 @@ class MonitorRuleEngine:
         window, closeness, value, threshold = best
         board = row.get("board") or ""
         tag = f"{board}{'·ST' if row.get('st') else ''}"
-        state = "已达异常波动阈值" if closeness >= 1 else "接近异常波动阈值"
+        state = "滚动估算达线" if closeness >= 1 else "滚动估算接近阈值"
         return (
             f"{row.get('name') or row.get('symbol')} {window}偏离值 "
             f"{value * 100:+.2f}%/阈值{threshold * 100:.0f}% ({tag}) "
-            f"接近度{closeness * 100:.0f}%, {state}"
+            f"接近度{closeness * 100:.0f}%, {state}；"
+            "未计公告重置及无涨跌限制期，不代表交易所认定或披露义务"
         )
 
     def _evaluate_rule(

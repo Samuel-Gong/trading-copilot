@@ -9,6 +9,7 @@ AI 复盘摘要段构建。
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
 
@@ -63,7 +64,7 @@ class _FakeProvider:
 
 
 def _use_provider(monkeypatch, provider) -> _FakeProvider:
-    monkeypatch.setattr(dt, "_provider", lambda: provider)
+    monkeypatch.setattr(dt, "_provider", lambda: nullcontext(provider))
     return provider
 
 
@@ -84,7 +85,7 @@ def test_resolve_older_than_all_partitions_returns_target(data_dir):
 # ---- 状态与缓存 ----
 
 def test_source_unavailable_without_fuyao(data_dir, monkeypatch):
-    monkeypatch.setattr(dt, "_provider", lambda: None)
+    monkeypatch.setattr(dt, "_provider", lambda: nullcontext(None))
     out = dt.get_dragon_tiger(data_dir, None)
     assert out["state"] == "source_unavailable"
 
@@ -115,7 +116,7 @@ def test_explicit_history_date_uses_cache(data_dir, monkeypatch):
 
 def test_unpublished_today_falls_back_to_prev(data_dir, monkeypatch):
     # 08-28 拉取失败 (未发布/未就绪) → 回退 08-27, state=fallback_prev
-    provider = _use_provider(monkeypatch, _FakeProvider(fail_dates={"2026-08-28"}))
+    _use_provider(monkeypatch, _FakeProvider(fail_dates={"2026-08-28"}))
     out = dt.get_dragon_tiger(data_dir, date(2026, 8, 28))
     assert out["state"] == "fallback_prev"
     assert out["trade_date"] == "2026-08-27"
@@ -126,7 +127,7 @@ def test_unpublished_today_falls_back_to_prev(data_dir, monkeypatch):
 
 
 def test_total_failure_returns_no_data(data_dir, monkeypatch):
-    provider = _use_provider(monkeypatch, _FakeProvider(fail_dates={"2026-08-28", "2026-08-27"}))
+    _use_provider(monkeypatch, _FakeProvider(fail_dates={"2026-08-28", "2026-08-27"}))
     out = dt.get_dragon_tiger(data_dir, date(2026, 8, 28))
     assert out["state"] == "no_data"
     assert "2026-08-28" in out.get("message", "")
@@ -142,16 +143,62 @@ def test_corrupt_cache_refetches(data_dir, monkeypatch):
     assert provider.calls  # 缓存损坏 → 重新拉取
 
 
+def test_explicit_history_rejects_provider_date_after_cutoff(data_dir, monkeypatch):
+    provider = _FakeProvider()
+    original = provider.dragon_tiger
+
+    def _future_board(board_type: str, date_iso: str | None) -> dict:
+        payload = original(board_type, date_iso)
+        payload["trade_date"] = "2026-08-28"
+        return payload
+
+    provider.dragon_tiger = _future_board
+    _use_provider(monkeypatch, provider)
+
+    out = dt.get_dragon_tiger(data_dir, date(2026, 8, 27))
+
+    assert out["state"] == "no_data"
+    assert "2026-08-27" in out["message"]
+    assert not (data_dir / "dragon_tiger" / "date=2026-08-27.json").exists()
+
+
+@pytest.mark.parametrize("bad_board,bad_date", [
+    ("all", None),
+    ("org", "not-a-date"),
+    ("hot_money", "2026-08-26"),
+])
+def test_explicit_history_rejects_missing_invalid_or_inconsistent_board_date(
+    data_dir, monkeypatch, bad_board, bad_date
+):
+    provider = _FakeProvider()
+    original = provider.dragon_tiger
+
+    def bad_payload(board_type: str, date_iso: str | None) -> dict:
+        payload = original(board_type, date_iso)
+        if board_type == bad_board:
+            payload["trade_date"] = bad_date
+        return payload
+
+    provider.dragon_tiger = bad_payload
+    _use_provider(monkeypatch, provider)
+
+    out = dt.get_dragon_tiger(data_dir, date(2026, 8, 27))
+
+    assert out["state"] == "no_data"
+    assert not (data_dir / "dragon_tiger" / "date=2026-08-27.json").exists()
+
+
 # ---- AI 复盘摘要 ----
 
 def test_build_recap_context_contains_summary(data_dir, monkeypatch):
-    _use_provider(monkeypatch, _FakeProvider())
-    ctx = dt.build_recap_context(data_dir)
+    provider = _use_provider(monkeypatch, _FakeProvider())
+    ctx = dt.build_recap_context(data_dir, date(2026, 8, 27))
     assert "净买入居前" in ctx and "贵州茅台" in ctx
     assert "机构净买居前" in ctx
     assert "宁波桑田路" in ctx
+    assert provider.calls[0] == ("all", "2026-08-27")
 
 
 def test_build_recap_context_empty_without_source(data_dir, monkeypatch):
-    monkeypatch.setattr(dt, "_provider", lambda: None)
+    monkeypatch.setattr(dt, "_provider", lambda: nullcontext(None))
     assert dt.build_recap_context(data_dir) == ""

@@ -21,6 +21,7 @@ _CACHE_TTL = 5.0
 _cache: dict[str, Any] | None = None
 _cache_key: str | None = None
 _cache_ts: float = 0.0
+_cache_generation: int = 0
 # 缓存跨线程读写锁: market_overview 在 FastAPI 线程池读, invalidate 在数据刷新线程清,
 # 无锁会读到撕裂/过期状态。用模块级 Lock 守护 check-then-set 与 clear。
 _cache_lock = threading.Lock()
@@ -31,11 +32,12 @@ def invalidate_overview_cache() -> None:
 
     清除数据后调用, 避免看板在 TTL 窗口内继续返回旧的聚合结果。
     """
-    global _cache, _cache_key, _cache_ts
+    global _cache, _cache_key, _cache_ts, _cache_generation
     with _cache_lock:
         _cache = None
         _cache_key = None
         _cache_ts = 0.0
+        _cache_generation += 1
 
 
 _DIMENSION_SEP = re.compile(r"[、,，;；|/\s]+")
@@ -365,10 +367,12 @@ def market_overview(request: Request, as_of: date | None = None):
     with _cache_lock:
         if _cache is not None and _cache_key == cache_key and (now - _cache_ts) < _CACHE_TTL:
             return _cache
+        generation = _cache_generation
     # 装配在锁外进行 (耗时), 允许并发未命中时各自构建, 不长时间持锁串行化请求
     data = _build_overview(request, as_of)
     with _cache_lock:
-        _cache = data
-        _cache_key = cache_key
-        _cache_ts = now
+        if _cache_generation == generation:
+            _cache = data
+            _cache_key = cache_key
+            _cache_ts = time.time()
     return data

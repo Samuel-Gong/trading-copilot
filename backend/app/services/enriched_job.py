@@ -42,7 +42,7 @@ def _refresh_repository_with_retry(repo) -> None:
                     "Repository 未确认装载当前 ready enriched generation"
                 )
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise EnrichedRepositoryRefreshError(exc) from exc
@@ -58,7 +58,7 @@ def run_enriched_job_with_repository_refresh(
     def generation() -> tuple[bool, str | None]:
         try:
             return True, repo.get_matrix_data_generation("stock")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("read enriched generation failed", exc_info=True)
             return False, None
 
@@ -74,7 +74,7 @@ def run_enriched_job_with_repository_refresh(
         before = generation()
         try:
             result = operation()
-        except Exception as operation_error:  # noqa: BLE001
+        except Exception as operation_error:
             after = generation()
             if not refresh_required(before, after):
                 raise

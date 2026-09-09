@@ -81,9 +81,7 @@ def _next_trading_day(data_dir: Path, d: date_cls) -> date_cls | None:
 def _provider():
     from app.data_providers import custom as custom_sources
 
-    if not custom_sources.is_custom_provider("fuyao"):
-        return None
-    return custom_sources.get_provider("fuyao")
+    return custom_sources.lease_provider_if_available("fuyao")
 
 
 def _cache_path(data_dir: Path, d: date_cls) -> Path:
@@ -104,6 +102,14 @@ def _store_cache(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
+def _payload_matches_date(payload: dict, expected: date_cls) -> bool:
+    """历史缓存必须带有可解析且与请求交易日一致的业务日。"""
+    try:
+        return date_cls.fromisoformat(str(payload.get("trade_date"))) == expected
+    except (TypeError, ValueError):
+        return False
+
+
 def _raw_items(data: dict) -> list[dict]:
     items = data.get("item")
     return [r for r in items if isinstance(r, dict)] if isinstance(items, list) else []
@@ -117,7 +123,7 @@ def _read_kline_closes(data_dir: Path, d: date_cls) -> dict[str, float]:
         if not files:
             return {}
         df = pl.concat([pl.read_parquet(f, columns=["symbol", "close"]) for f in files])
-        return dict(zip(df["symbol"].to_list(), df["close"].to_list()))
+        return dict(zip(df["symbol"].to_list(), df["close"].to_list(), strict=False))
     except (OSError, pl.exceptions.PolarsError):
         return {}
 
@@ -133,7 +139,7 @@ def _enrich(data_dir: Path, trade_date: date_cls, items: list[dict]) -> list[dic
         files = sorted(root.glob("*.parquet"))
         if files:
             df = pl.concat([pl.read_parquet(f, columns=["symbol", "open", "close"]) for f in files])
-            day0 = dict(zip(df["symbol"].to_list(), zip(df["open"].to_list(), df["close"].to_list())))
+            day0 = dict(zip(df["symbol"].to_list(), zip(df["open"].to_list(), df["close"].to_list(), strict=False), strict=False))
     except (OSError, pl.exceptions.PolarsError):
         day0 = {}
 
@@ -194,48 +200,64 @@ def get_auction_benchmark(data_dir: Path, target: date_cls | None = None) -> dic
     # 历史日缓存优先 (纯本地, 不触发插件注册表加载)
     if trade_date is not None and trade_date < today:
         cached = _load_cache(_cache_path(data_dir, trade_date))
-        if cached is not None:
+        if cached is not None and _payload_matches_date(cached, trade_date):
             return _respond(data_dir, trade_date, cached, cached.get("state") or "ok")
 
-    provider = _provider()
-    if provider is None:
-        return {"state": "source_unavailable"}
+    with _provider() as provider:
+        if provider is None:
+            return {"state": "source_unavailable"}
 
-    from app.plugins.fuyao.client import FuyaoError
+        from app.plugins.fuyao.client import FuyaoError
 
-    explicit = trade_date.isoformat() if trade_date is not None else None
-    try:
-        data = provider.short_term_benchmark(explicit)
+        explicit = trade_date.isoformat() if trade_date is not None else None
         try:
-            actual = date_cls.fromisoformat(str(data.get("date")))
-        except ValueError:
-            actual = trade_date
-        base = _base_payload(data_dir, actual, data)
-        # 历史日不可变 → 落缓存; 当日不缓存 (竞价阶段名单可能变动)
-        if actual is not None and actual < today:
-            with contextlib.suppress(OSError):
-                _store_cache(_cache_path(data_dir, actual), base)
-        return _respond(data_dir, actual, base, "ok")
-    except FuyaoError as e:
-        # 显式日期失败 (非交易日/边界日) → 回退上一交易日一次
-        if trade_date is not None:
-            prev = _prev_trading_day(data_dir, trade_date)
-            if prev is not None:
-                try:
-                    cached_prev = _load_cache(_cache_path(data_dir, prev))
-                    if cached_prev is not None:
-                        return _respond(data_dir, prev, cached_prev, "fallback_prev",
-                                        requested=explicit)
-                    data_prev = provider.short_term_benchmark(prev.isoformat())
-                    base = _base_payload(data_dir, prev, data_prev)
-                    with contextlib.suppress(OSError):
-                        _store_cache(_cache_path(data_dir, prev), base)
-                    return _respond(data_dir, prev, base, "fallback_prev",
-                                    requested=explicit)
-                except FuyaoError:
-                    pass
-        logger.warning("短线风向标拉取失败: %s", e)
-        return {"state": "no_data", "message": str(e)}
+            data = provider.short_term_benchmark(explicit)
+            try:
+                actual = date_cls.fromisoformat(str(data.get("date")))
+            except (TypeError, ValueError):
+                actual = None
+            if actual is None or (trade_date is not None and actual != trade_date):
+                return {
+                    "state": "no_data",
+                    "message": f"上游未返回与交易日 {explicit} 一致的盘前风向标数据",
+                }
+            base = _base_payload(data_dir, actual, data)
+            # 历史日不可变 → 落缓存; 当日不缓存 (竞价阶段名单可能变动)
+            if actual is not None and actual < today:
+                with contextlib.suppress(OSError):
+                    _store_cache(_cache_path(data_dir, actual), base)
+            return _respond(data_dir, actual, base, "ok")
+        except FuyaoError as e:
+            # 显式日期失败 (非交易日/边界日) → 回退上一交易日一次
+            if trade_date is not None:
+                prev = _prev_trading_day(data_dir, trade_date)
+                if prev is not None:
+                    try:
+                        cached_prev = _load_cache(_cache_path(data_dir, prev))
+                        if cached_prev is not None and _payload_matches_date(cached_prev, prev):
+                            return _respond(
+                                data_dir, prev, cached_prev, "fallback_prev", requested=explicit
+                            )
+                        data_prev = provider.short_term_benchmark(prev.isoformat())
+                        try:
+                            actual_prev = date_cls.fromisoformat(str(data_prev.get("date")))
+                        except (TypeError, ValueError):
+                            actual_prev = None
+                        if actual_prev != prev:
+                            return {
+                                "state": "no_data",
+                                "message": f"上游未返回与交易日 {prev.isoformat()} 一致的盘前风向标数据",
+                            }
+                        base = _base_payload(data_dir, prev, data_prev)
+                        with contextlib.suppress(OSError):
+                            _store_cache(_cache_path(data_dir, prev), base)
+                        return _respond(
+                            data_dir, prev, base, "fallback_prev", requested=explicit
+                        )
+                    except FuyaoError:
+                        pass
+            logger.warning("短线风向标拉取失败: %s", e)
+            return {"state": "no_data", "message": str(e)}
 
 
 def _respond(
@@ -258,16 +280,24 @@ def _respond(
     return payload
 
 
-def build_recap_context(data_dir: Path) -> str:
+def build_recap_context(data_dir: Path, target: date_cls | None = None) -> str:
     """AI 复盘的盘前风向标摘要段 (纯文本, 失败返回空串不影响复盘)。"""
     try:
-        payload = get_auction_benchmark(data_dir, None)
+        payload = get_auction_benchmark(data_dir, target)
         if payload.get("state") not in ("ok", "fallback_prev"):
             return ""
         items = payload.get("items") or []
         if not items:
             return ""
         trade_date = payload.get("trade_date") or ""
+        try:
+            actual_date = date_cls.fromisoformat(trade_date)
+        except ValueError:
+            actual_date = None
+        next_date = _next_trading_day(data_dir, actual_date) if actual_date else None
+        allow_next_day = target is None or (
+            next_date is not None and next_date <= target
+        )
         lines = [f"(数据日期: {trade_date})"]
         segs = []
         for i in items:
@@ -275,7 +305,7 @@ def build_recap_context(data_dir: Path) -> str:
                    f"[{'·'.join(i.get('tags') or [])}]")
             if i.get("day0_oc") is not None:
                 seg += f" → 当日开盘买{i['day0_oc']*100:+.2f}%"
-            if i.get("d1_pct") is not None:
+            if allow_next_day and i.get("d1_pct") is not None:
                 seg += f", 次日{i['d1_pct']*100:+.2f}%"
             segs.append(seg)
         lines.append("盘前风向标名单: " + "; ".join(segs))
@@ -283,6 +313,6 @@ def build_recap_context(data_dir: Path) -> str:
         if ocs:
             lines.append(f"名单当日(开盘买→收盘卖)均值 {sum(ocs)/len(ocs)*100:+.2f}%")
         return "\n".join(lines)
-    except Exception as e:  # noqa: BLE001 — 摘要失败不影响复盘主流程
+    except Exception as e:
         logger.debug("盘前风向标复盘摘要构建失败: %s", e)
         return ""

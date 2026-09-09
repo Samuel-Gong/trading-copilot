@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from typing import Any
 
 import httpx
@@ -293,7 +293,7 @@ class PullScheduler:
 
                 # 时间窗口检查: 不在窗口内则跳过本次拉取
                 if not _in_time_window(pull.time_window_start, pull.time_window_end):
-                    fresh.pull.last_run = datetime.now(timezone.utc).isoformat()
+                    fresh.pull.last_run = datetime.now(UTC).isoformat()
                     fresh.pull.last_status = "skipped"
                     fresh.pull.last_message = "不在拉取时间窗口内"
                     schedule_interval = max(pull.schedule_minutes * 60, 60)
@@ -303,9 +303,9 @@ class PullScheduler:
                         if until_window is not None
                         else schedule_interval
                     )
-                    next_dt = datetime.now(timezone.utc).timestamp() + interval
+                    next_dt = datetime.now(UTC).timestamp() + interval
                     fresh.pull.next_run = datetime.fromtimestamp(
-                        next_dt, tz=timezone.utc
+                        next_dt, tz=UTC
                     ).isoformat()
                     store.update(fresh)
                     logger.info("PullScheduler: %s skipped (outside time window)", config.id)

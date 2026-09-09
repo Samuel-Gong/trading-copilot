@@ -3,16 +3,14 @@
 方法签名对齐 custom.GenericHTTPProvider(service 分流点按这套签名调用),
 注入 custom loader 注册表后, 各 service 无需改动即可路由到本 provider。
 
-实现数据集:
+对外声明的数据集:
   - realtime     A 股全市场快照 (分页)
-  - daily        A 股日K, 原始价; 近端窗口走 daily-k-10d 全市场 dump(1 次请求),
-                 深窗口走单标的 historical 接口(≤10 年/次自动分片)
-  - adj_factor   A 股除权因子; adjustment-factors 事件 dump + 自家原始日K前收盘,
-                 按交易所公式推导单事件比值, 涨跌停自检
   - financial    财务五表(股本除外): 三表多期序列 + 指标单期, 字段映射为 TickFlow
-                 canonical 列名, 扶摇独有字段原名透传为扩展列; bps 由估值 pb_mrq
-                 反推; shares 无上游接口恒空
-未声明 minute → provider_has_dataset 为 False, 自动回退 tickflow。
+                 canonical 列名, 扶摇独有字段原名透传为扩展列; bps 估值快照
+                 反推值只从观测日起生效; shares 无上游接口恒空
+内部保留的 daily/adj_factor 实现仅覆盖 stock，因全局路由还会请求 index/ETF，
+暂不在 manifest 中声明；minute 同样未声明。未声明的数据集 fail-closed，只有用户
+明确选择 TickFlow 才调用 TickFlow。
 
 单位与口径 (CONTRIBUTING §3.1, 不可凭字段名推断):
   - 扶摇 price_change_ratio_pct 为百分数数值 (1.74 = +1.74%), 本项目 realtime
@@ -31,23 +29,27 @@ import contextlib
 import logging
 import math
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
+from uuid import uuid4
 
 import polars as pl
 
 from app.data_providers.normalizer import DAILY_COLS, normalize_daily
 from app.indicators.pipeline import filter_halt_days
+from app.market_time import cn_now, cn_today
 from app.plugins.fuyao import client as fuyao_client
 from app.plugins.fuyao.client import FuyaoClient, FuyaoError
 
 logger = logging.getLogger(__name__)
 
 # 只声明真实提供的数据集; 其余数据集 provider_has_dataset 返回 False → 回退 tickflow
-_DATASETS = ("realtime", "daily", "adj_factor", "financial")
+_DATASETS = ("realtime", "financial")
 
 API_KEY_ENV = "FUYAO_API_KEY"
 SECRETS_FIELD = "fuyao_api_key"  # UI 配置的 Key 存 secrets.json, 优先级高于 .env
@@ -69,6 +71,12 @@ _DAILY10_DUMP_KIND = "daily-k-10d"
 _DAILY_DUMP_KIND = "daily-k"  # 10 年全量日K dump(约 172MB), 深窗口一次下载覆盖全市场
 _RECENT_DUMP_DAYS = 12  # 窗口跨度 ≤ 此天数时优先走 10d dump(覆盖 ≈10 个交易日)
 _PREV_CLOSE_BACKDAYS = 30  # 推导因子时向前找"除权日前收盘"的回看天数(容忍长期停牌)
+_DUMP_CACHE_LOCK = threading.RLock()
+_DUMP_REQUIRED_COLUMNS = {
+    _ADJ_DUMP_KIND: {"thscode", "ex_date_ms"},
+    _DAILY10_DUMP_KIND: {"thscode", "date_ms"},
+    _DAILY_DUMP_KIND: {"thscode", "date_ms"},
+}
 
 
 def get_api_key() -> str:
@@ -250,12 +258,29 @@ def _dump_date_range(path: Path) -> tuple[date | None, date | None]:
     return row["dmin"][0], row["dmax"][0]
 
 
-def _map_snapshot_row(row: dict, fetched_ms: int, *, volume_to_hand: bool = True) -> dict | None:
+def _validate_dump_path(path: Path, dump_kind: str) -> None:
+    """在发布为正式缓存前校验 Parquet 可读性与关键字段。"""
+    try:
+        columns = set(pl.scan_parquet(path).collect_schema().names())
+    except Exception as exc:
+        raise FuyaoError(f"dump {dump_kind} 不是有效 Parquet: {exc}") from exc
+    missing = _DUMP_REQUIRED_COLUMNS.get(dump_kind, set()) - columns
+    if missing:
+        raise FuyaoError(f"dump {dump_kind} 缺少关键字段: {sorted(missing)}")
+
+
+def _map_snapshot_row(
+    row: dict,
+    fetched_ms: int,
+    *,
+    volume_to_hand: bool | None = True,
+) -> dict | None:
     """扶摇快照行 → 内部 realtime record。字段缺失时按依赖推导, 不伪造数据。
 
     实测字段(2026-08): high_price / low_price / prev_price;
     官方文档示例: highest_price / lowest_price / prev_close_price。两者都取。
-    volume_to_hand: A 股快照 volume 为股 → 手; 指数快照无此口径, 直接透传。
+    volume_to_hand: A 股快照 volume 为股 → 手；False 表示已证明为手；None 表示
+    单位未知并将字段置空。
     """
     symbol = row.get("thscode")
     if not symbol:
@@ -284,7 +309,11 @@ def _map_snapshot_row(row: dict, fetched_ms: int, *, volume_to_hand: bool = True
         "open": _to_float(row.get("open_price")),
         "high": _to_float(_first(row, "high_price", "highest_price")),
         "low": _to_float(_first(row, "low_price", "lowest_price")),
-        "volume": math.floor(volume / 100.0) if (volume is not None and volume_to_hand) else volume,
+        "volume": (
+            math.floor(volume / 100.0)
+            if volume is not None and volume_to_hand is True
+            else volume if volume_to_hand is False else None
+        ),
         "amount": _to_float(row.get("turnover")),
         "change_pct": change_pct,
         "change_amount": change_amount,
@@ -300,20 +329,24 @@ class FuyaoProvider:
 
     name = "fuyao"
     builtin = True
+    financial_tables = frozenset({"metrics", "income", "balance_sheet", "cash_flow"})
 
     def __init__(self) -> None:
         self.config = _FuyaoConfig()
         self._client: FuyaoClient | None = None
         self._dump_memo: dict[str, pl.DataFrame] = {}
         self._dump_path_memo: dict[str, Path] = {}
+        self._dump_checked_on: dict[str, date] = {}
 
     def close(self) -> None:  # loader.load_all 重建注册表时会对每个 provider 调 close
         if self._client is not None:
             with contextlib.suppress(Exception):
                 self._client.close()
             self._client = None
-        self._dump_memo.clear()
-        self._dump_path_memo.clear()
+        with _DUMP_CACHE_LOCK:
+            self._dump_memo.clear()
+            self._dump_path_memo.clear()
+            self._dump_checked_on.clear()
 
     def _get_client(self) -> FuyaoClient:
         if self._client is None:
@@ -326,30 +359,66 @@ class FuyaoProvider:
 
         release 号取自预签名 URL 的 releases/<date>/ 路径; 新 release 落盘后清理旧版缓存。
         """
-        memo = self._dump_path_memo.get(dump_kind)
-        if memo is not None and memo.exists():
-            return memo
-        client = self._get_client()
-        info = client.dump_download_url(dump_kind)
-        release = _release_of(str(info.get("presigned_url") or ""))
-        dest = _cache_dir() / f"{cache_prefix}__{release}.parquet"
-        if not dest.exists():
-            client.download_dump(dump_kind, dest)
+        with _DUMP_CACHE_LOCK:
+            today = cn_today()
+            memo = self._dump_path_memo.get(dump_kind)
+            if (
+                memo is not None
+                and memo.exists()
+                and self._dump_checked_on.get(dump_kind) == today
+            ):
+                return memo
+
+            client = self._get_client()
+            try:
+                info = client.dump_download_url(dump_kind)
+                url = str(info.get("presigned_url") or "")
+                if not url:
+                    raise FuyaoError(f"dump {dump_kind} 未返回预签名 URL")
+                release = _release_of(url)
+                dest = _cache_dir() / f"{cache_prefix}__{release}.parquet"
+                if not dest.exists():
+                    candidate = dest.with_name(f".{dest.name}.{uuid4().hex}.candidate")
+                    try:
+                        client.download_dump(dump_kind, candidate, presigned_url=url)
+                        _validate_dump_path(candidate, dump_kind)
+                        candidate.replace(dest)
+                    finally:
+                        candidate.unlink(missing_ok=True)
+                    logger.info(
+                        "扶摇 dump %s(release %s)已下载: %s",
+                        dump_kind,
+                        release,
+                        dest.name,
+                    )
+                else:
+                    _validate_dump_path(dest, dump_kind)
+            except (FuyaoError, OSError) as exc:
+                if memo is None or not memo.exists():
+                    raise
+                self._dump_checked_on[dump_kind] = today
+                logger.warning("扶摇 dump %s 更新失败，继续使用旧缓存: %s", dump_kind, exc)
+                return memo
+
             for old in dest.parent.glob(f"{cache_prefix}__*.parquet"):
                 if old.name != dest.name:
                     old.unlink(missing_ok=True)
-            logger.info("扶摇 dump %s(release %s)已下载: %s", dump_kind, release, dest.name)
-        self._dump_path_memo[dump_kind] = dest
-        return dest
+            if memo != dest:
+                self._dump_memo.pop(dump_kind, None)
+            self._dump_path_memo[dump_kind] = dest
+            self._dump_checked_on[dump_kind] = today
+            return dest
 
     def _ensure_dump(self, dump_kind: str, cache_prefix: str) -> pl.DataFrame:
         """小体量 dump(快照 10d / 因子)整读 + 进程内 memo, 避免重复打接口/读盘。"""
-        memo = self._dump_memo.get(dump_kind)
-        if memo is not None:
-            return memo
-        df = pl.read_parquet(self._ensure_dump_path(dump_kind, cache_prefix))
-        self._dump_memo[dump_kind] = df
-        return df
+        with _DUMP_CACHE_LOCK:
+            memo = self._dump_memo.get(dump_kind)
+            checked = self._dump_checked_on.get(dump_kind)
+            if memo is not None and (checked is None or checked == cn_today()):
+                return memo
+            df = pl.read_parquet(self._ensure_dump_path(dump_kind, cache_prefix))
+            self._dump_memo[dump_kind] = df
+            return df
 
     def _ensure_daily_big_dump(self, start_d: date) -> Path | None:
         """10 年全量日K dump(约 172MB)。只要求覆盖窗口起点; 末端缺口由 10d dump 补。
@@ -383,8 +452,10 @@ class FuyaoProvider:
             logger.warning("扶摇实时行情拉取失败: %s", e)
             return []
 
-        # 优先用服务端时间戳(行情归属); 缺失时退回本地时间
-        fetched_ms = server_ts or int(time.time() * 1000)
+        if not server_ts:
+            logger.warning("扶摇实时行情缺少服务端时间戳，本轮拒绝归属并丢弃")
+            return []
+        fetched_ms = server_ts
 
         records = []
         dropped = 0
@@ -417,10 +488,14 @@ class FuyaoProvider:
             logger.warning("扶摇指数行情拉取失败: %s", e)
             return None
 
-        fetched_ms = server_ts or int(time.time() * 1000)
+        if not server_ts:
+            logger.warning("扶摇指数行情缺少服务端时间戳，本轮拒绝归属并丢弃")
+            return None
+        fetched_ms = server_ts
         records = []
         for row in rows:
-            rec = _map_snapshot_row(row, fetched_ms, volume_to_hand=False)
+            # 指数端点 volume 单位未获官方证明，不能透传进统一“手”口径。
+            rec = _map_snapshot_row(row, fetched_ms, volume_to_hand=None)
             if rec is not None:
                 records.append(rec)
         logger.info("扶摇指数行情拉取完成: %d 条(请求 %d 只)", len(records), len(wanted))
@@ -446,7 +521,7 @@ class FuyaoProvider:
         """
         if not symbols or asset_type != "stock":
             return pl.DataFrame()
-        end_dt = end_time or datetime.now()
+        end_dt = end_time or cn_now().replace(tzinfo=None)
         start_dt = start_time or (end_dt - timedelta(days=365))
         start_d, end_d = start_dt.date(), end_dt.date()
 
@@ -715,7 +790,7 @@ class FuyaoProvider:
         - 同日拆行(如分红/送转各一行)按成分合并后推导, 顺序不可反;
         - 配股但配股价缺失 → 无法推导, 过滤。
         """
-        today = datetime.now().date()
+        today = cn_today()
         df = self._ensure_dump(_ADJ_DUMP_KIND, "adj_factors").rename({"thscode": "symbol"})
         df = (
             df.with_columns(
@@ -754,7 +829,7 @@ class FuyaoProvider:
     # ---- financial ----
     # 字段映射: 扶摇原始字段 → 项目 canonical 列名(TickFlow 口径, 前端财务页与回测
     # FUNDAMENTAL_FACTORS 按此消费)。映射表之外的扶摇独有字段以原名透传为扩展列。
-    _INCOME_FIELD_MAP = {
+    _INCOME_FIELD_MAP: ClassVar[dict[str, str]] = {
         "operating_income": "revenue",
         "operating_costs": "operating_cost",
         "sales_fee": "selling_expense",
@@ -768,7 +843,7 @@ class FuyaoProvider:
         "parent_holder_net_profit": "net_income_attributable",
         "basic_eps": "basic_eps",
     }
-    _BALANCE_FIELD_MAP = {
+    _BALANCE_FIELD_MAP: ClassVar[dict[str, str]] = {
         "assets_total": "total_assets",
         "total_current_assets": "total_current_assets",
         "non_current_nets_total": "total_non_current_assets",
@@ -777,7 +852,7 @@ class FuyaoProvider:
         "total_debt": "total_liabilities",
         "holder_equity_total": "total_equity",
     }
-    _CASHFLOW_FIELD_MAP = {
+    _CASHFLOW_FIELD_MAP: ClassVar[dict[str, str]] = {
         "act_cash_flow_net": "net_operating_cash_flow",
         "invest_cash_flow_net": "net_investing_cash_flow",
         "financing_cash_flow_net": "net_financing_cash_flow",
@@ -786,7 +861,7 @@ class FuyaoProvider:
     }
     # 官方指标 index_id → canonical。归母净利同比近似 tickflow net_income_yoy;
     # 实测 index_id 与文档有出入(calculate_ 前缀等), 以实测为准。
-    _METRICS_FIELD_MAP = {
+    _METRICS_FIELD_MAP: ClassVar[dict[str, str]] = {
         "index_weighted_avg_roe": "roe",
         "total_assets_net_ratio": "roa",
         "sale_gross_margin": "gross_margin",
@@ -810,7 +885,7 @@ class FuyaoProvider:
         - metrics: 指标接口为单股单期, 恒只拉最新一期(bps 由估值快照 pb_mrq 反推,
           eps_basic 顺带取自利润表); 历史各期建议切回 TickFlow 同步补齐 —
           报告期合并写入会让两源数据共存, 互不覆盖;
-        - shares: 扶摇无股本接口, 恒返回空(已有存量靠合并写入保留)。
+        - shares: 扶摇无股本接口，不在 ``financial_tables`` 能力集合中。
         """
         if table == "shares":
             logger.info("扶摇无股本接口, shares 表跳过 (已有数据保留)")
@@ -836,6 +911,7 @@ class FuyaoProvider:
         client = self._get_client()
         limit = 1 if latest_only else _FINANCIAL_HISTORY_PERIODS
         rows_out: list[dict] = []
+        failed: list[str] = []
         for i, sym in enumerate(symbols):
             if i:
                 time.sleep(_HIST_INTERVAL_S)
@@ -843,6 +919,7 @@ class FuyaoProvider:
                 rows = client.financial_statements(stmt, sym, limit=limit)
             except FuyaoError as e:
                 logger.warning("扶摇财务 %s %s 失败: %s", stmt, sym, e)
+                failed.append(sym)
                 continue
             for r in rows:
                 row: dict = {
@@ -857,12 +934,17 @@ class FuyaoProvider:
                     if src not in field_map and src not in row and isinstance(value, (int, float)):
                         row[src] = value
                 rows_out.append(row)
+        if failed:
+            raise FuyaoError(
+                f"扶摇财务 {stmt} 部分失败: {len(failed)}/{len(symbols)} 标的"
+            )
         return pl.DataFrame(rows_out) if rows_out else pl.DataFrame()
 
     def _financial_metrics(self, symbols: list[str]) -> pl.DataFrame:
         client = self._get_client()
         # 指标接口按 report(yyyy-N) 单期查询 → 先用利润表 limit=1 反查每股最新披露期
         latest: dict[str, dict] = {}
+        failed: list[str] = []
         for i, sym in enumerate(symbols):
             if i:
                 time.sleep(_HIST_INTERVAL_S)
@@ -870,12 +952,18 @@ class FuyaoProvider:
                 rows = client.financial_statements("income", sym, limit=1)
             except FuyaoError as e:
                 logger.warning("扶摇财务 income %s 失败: %s", sym, e)
+                failed.append(sym)
                 continue
             if rows:
                 latest[sym] = rows[0]
+        if failed:
+            raise FuyaoError(
+                f"扶摇财务 metrics 报告期探测部分失败: {len(failed)}/{len(symbols)} 标的"
+            )
         if not latest:
             return pl.DataFrame()
         bps_by_sym = self._derive_bps(sorted(latest))
+        observed_on = cn_today().isoformat()
         rows_out: list[dict] = []
         for sym, r in latest.items():
             quarter = _report_quarter(r.get("fiscal_period"))
@@ -885,6 +973,12 @@ class FuyaoProvider:
                 "period_end": _iso_of_ms(r.get("period_end_ms")),
                 "announce_date": _iso_of_ms(r.get("report_date_ms")),
                 "eps_basic": _to_float(r.get("basic_eps")),
+                "bps": None,
+            }
+            observed: dict = {
+                "symbol": sym,
+                "period_end": row["period_end"],
+                "announce_date": observed_on,
                 "bps": bps_by_sym.get(sym),
             }
             if report:
@@ -892,7 +986,8 @@ class FuyaoProvider:
                     abilities = client.financial_indicators(sym, report)
                 except FuyaoError as e:
                     logger.warning("扶摇指标 %s %s 失败: %s", sym, report, e)
-                    abilities = []
+                    failed.append(sym)
+                    continue
                 for ability in abilities:
                     for ind in ability.get("indicators") or []:
                         index_id = ind.get("index_id")
@@ -900,8 +995,18 @@ class FuyaoProvider:
                             continue
                         value = _to_float(ind.get("value"))
                         if value is not None:
-                            row[self._METRICS_FIELD_MAP.get(index_id, index_id)] = value
-            rows_out.append(row)
+                            observed[self._METRICS_FIELD_MAP.get(index_id, index_id)] = value
+            if row["announce_date"] == observed_on:
+                row.update({key: value for key, value in observed.items() if key not in row})
+                row["bps"] = observed["bps"]
+                rows_out.append(row)
+            else:
+                # 指标与 bps 都是同步时的当前快照，只能从观测日起生效。
+                rows_out.extend([row, observed])
+        if failed:
+            raise FuyaoError(
+                f"扶摇财务 metrics 指标部分失败: {len(failed)}/{len(symbols)} 标的"
+            )
         return pl.DataFrame(rows_out) if rows_out else pl.DataFrame()
 
     def trading_days(self) -> set:
@@ -932,8 +1037,8 @@ class FuyaoProvider:
     def _derive_bps(self, symbols: list[str]) -> dict[str, float]:
         """估值快照 pb_mrq 与行情快照最新价同源同刻 → bps = price / pb_mrq。
 
-        与财报口径 bps 可能差几个百分点(上游权益基准不完全透明), 用于补齐
-        metrics.bps 使回测 pb_latest 因子可用。接口失败只影响 bps 列, 不致命。
+        与财报口径 bps 可能差几个百分点(上游权益基准不完全透明)。该值只能以
+        快照观测日作为生效时点, 不得回填报告公告日。接口失败只影响 bps 列。
         """
         client = self._get_client()
         pb: dict[str, float] = {}
@@ -1040,11 +1145,12 @@ class FuyaoProvider:
         if dataset in ("daily", "adj_factor"):
             syms = [s for s in (symbols or [])][:3] or ["000001.SZ"]
             try:
+                now = cn_now().replace(tzinfo=None)
                 if dataset == "daily":
-                    df = self.get_daily(syms, datetime.now() - timedelta(days=30), datetime.now())
+                    df = self.get_daily(syms, now - timedelta(days=30), now)
                 else:
                     df = self.get_adj_factors(
-                        syms, datetime.now() - timedelta(days=365), datetime.now()
+                        syms, now - timedelta(days=365), now
                     )
             except FuyaoError as e:
                 return {"provider": self.name, "dataset": dataset, "rows": 0, "error": str(e)}
@@ -1079,13 +1185,21 @@ class FuyaoProvider:
                 "provider": self.name,
                 "dataset": dataset,
                 "rows": 0,
-                "error": f"扶摇插件未接入 {dataset} 数据集(自动回退 TickFlow)",
+                "error": f"扶摇插件未接入 {dataset} 数据集(所选路由不可用)",
             }
         try:
-            rows, count = self._get_client().snapshot_page(limit=5)
+            client = self._get_client()
+            rows, count = client.snapshot_page(limit=5)
         except FuyaoError as e:
             return {"provider": self.name, "dataset": "realtime", "rows": 0, "error": str(e)}
-        fetched_ms = int(time.time() * 1000)
+        fetched_ms = client.last_server_ts
+        if not fetched_ms:
+            return {
+                "provider": self.name,
+                "dataset": "realtime",
+                "rows": 0,
+                "error": "扶摇实时行情缺少服务端时间戳",
+            }
         head = [r for r in (_map_snapshot_row(row, fetched_ms) for row in rows) if r][:5]
         return {
             "provider": self.name,

@@ -70,9 +70,7 @@ def _prev_trading_day(data_dir: Path, d: date_cls) -> date_cls | None:
 def _provider():
     from app.data_providers import custom as custom_sources
 
-    if not custom_sources.is_custom_provider("fuyao"):
-        return None
-    return custom_sources.get_provider("fuyao")
+    return custom_sources.lease_provider_if_available("fuyao")
 
 
 def _fetch_boards(provider, d: date_cls) -> dict:
@@ -111,6 +109,21 @@ def _store_cache(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
+def _payload_matches_date(payload: dict, expected: date_cls) -> bool:
+    try:
+        return date_cls.fromisoformat(str(payload.get("trade_date"))) == expected
+    except (TypeError, ValueError):
+        return False
+
+
+def _boards_match_date(raw: dict, expected: date_cls) -> bool:
+    """三榜必须各自带有同一请求交易日，缺失或不一致均拒绝。"""
+    return all(
+        isinstance(payload, dict) and _payload_matches_date(payload, expected)
+        for payload in (raw.get(board) for board in _BOARDS)
+    )
+
+
 def get_dragon_tiger(data_dir: Path, target: date_cls | None = None) -> dict:
     """取龙虎榜 (三榜)。返回给前端的统一容器。
 
@@ -127,66 +140,92 @@ def get_dragon_tiger(data_dir: Path, target: date_cls | None = None) -> dict:
     # 历史日缓存优先 (纯本地, 不触发插件注册表加载)
     if trade_date is not None and trade_date < today:
         cached = _load_cache(_cache_path(data_dir, trade_date))
-        if cached is not None:
+        if (
+            cached is not None
+            and _payload_matches_date(cached, trade_date)
+            and _boards_match_date(cached, trade_date)
+        ):
             return cached
 
-    provider = _provider()
-    if provider is None:
-        return {"state": "source_unavailable"}
+    with _provider() as provider:
+        if provider is None:
+            return {"state": "source_unavailable"}
 
-    from app.plugins.fuyao.client import FuyaoError
+        from app.plugins.fuyao.client import FuyaoError
 
-    # 日期未知 (target=None / 本地无分区) → 省略 date 让 fuyao 取最近已发布交易日
-    explicit = trade_date.isoformat() if trade_date is not None else None
-    try:
-        raw = {bt: _boards_of(provider, bt, explicit) for bt in _BOARDS}
+        # 日期未知 (target=None / 本地无分区) → 省略 date 让 fuyao 取最近已发布交易日
+        explicit = trade_date.isoformat() if trade_date is not None else None
         try:
-            actual = date_cls.fromisoformat(str(raw["all"].get("trade_date")))
-        except ValueError:
-            actual = None
-        payload = {
-            "state": "ok",
-            "requested_date": explicit,
-            "trade_date": raw["all"].get("trade_date"),
-            **raw,
-        }
-        # 历史日不可变 → 落缓存; 当日不缓存 (盘中 fallback / 盘后补充都以现拉为准)
-        if actual is not None and actual < today:
-            with contextlib.suppress(OSError):
-                _store_cache(_cache_path(data_dir, actual), payload)
-        return payload
-    except FuyaoError as e:
-        # 显式日期失败 (当日未发布 / 边界日) → 回退上一交易日一次
-        if trade_date is not None:
-            prev = _prev_trading_day(data_dir, trade_date)
-            if prev is not None:
-                try:
-                    cached_prev = _load_cache(_cache_path(data_dir, prev))
-                    if cached_prev is not None:
-                        base = dict(cached_prev)
-                        base.pop("state", None)
-                        return {**base, "state": "fallback_prev",
-                                "requested_date": explicit}
-                    raw_prev = _fetch_boards(provider, prev)
-                    base = {
-                        "requested_date": prev.isoformat(),
-                        "trade_date": prev.isoformat(),
-                        **raw_prev,
-                    }
-                    with contextlib.suppress(OSError):
-                        _store_cache(_cache_path(data_dir, prev), {**base, "state": "ok"})
-                    return {**base, "state": "fallback_prev",
-                            "requested_date": explicit}
-                except FuyaoError:
-                    pass
-        logger.warning("龙虎榜拉取失败: %s", e)
-        return {"state": "no_data", "message": str(e)}
+            raw = {bt: _boards_of(provider, bt, explicit) for bt in _BOARDS}
+            if trade_date is not None and not _boards_match_date(raw, trade_date):
+                return {
+                    "state": "no_data",
+                    "message": f"上游未返回与交易日 {explicit} 一致的完整龙虎榜数据",
+                }
+            try:
+                actual = date_cls.fromisoformat(str(raw["all"].get("trade_date")))
+            except (TypeError, ValueError):
+                actual = None
+            if actual is None:
+                return {"state": "no_data", "message": "上游龙虎榜缺少有效业务日"}
+            payload = {
+                "state": "ok",
+                "requested_date": explicit,
+                "trade_date": raw["all"].get("trade_date"),
+                **raw,
+            }
+            # 历史日不可变 → 落缓存; 当日不缓存 (盘中 fallback / 盘后补充都以现拉为准)
+            if actual is not None and actual < today:
+                with contextlib.suppress(OSError):
+                    _store_cache(_cache_path(data_dir, actual), payload)
+            return payload
+        except FuyaoError as e:
+            # 显式日期失败 (当日未发布 / 边界日) → 回退上一交易日一次
+            if trade_date is not None:
+                prev = _prev_trading_day(data_dir, trade_date)
+                if prev is not None:
+                    try:
+                        cached_prev = _load_cache(_cache_path(data_dir, prev))
+                        if (
+                            cached_prev is not None
+                            and _payload_matches_date(cached_prev, prev)
+                            and _boards_match_date(cached_prev, prev)
+                        ):
+                            base = dict(cached_prev)
+                            base.pop("state", None)
+                            return {
+                                **base,
+                                "state": "fallback_prev",
+                                "requested_date": explicit,
+                            }
+                        raw_prev = _fetch_boards(provider, prev)
+                        if not _boards_match_date(raw_prev, prev):
+                            return {
+                                "state": "no_data",
+                                "message": f"上游未返回与交易日 {prev.isoformat()} 一致的完整龙虎榜数据",
+                            }
+                        base = {
+                            "requested_date": prev.isoformat(),
+                            "trade_date": prev.isoformat(),
+                            **raw_prev,
+                        }
+                        with contextlib.suppress(OSError):
+                            _store_cache(_cache_path(data_dir, prev), {**base, "state": "ok"})
+                        return {
+                            **base,
+                            "state": "fallback_prev",
+                            "requested_date": explicit,
+                        }
+                    except FuyaoError:
+                        pass
+            logger.warning("龙虎榜拉取失败: %s", e)
+            return {"state": "no_data", "message": str(e)}
 
 
-def build_recap_context(data_dir: Path) -> str:
+def build_recap_context(data_dir: Path, target: date_cls | None = None) -> str:
     """AI 复盘的龙虎榜摘要段 (纯文本, 失败返回空串不影响复盘)。"""
     try:
-        payload = get_dragon_tiger(data_dir, None)
+        payload = get_dragon_tiger(data_dir, target)
         if payload.get("state") not in ("ok", "fallback_prev"):
             return ""
         items = payload.get("all", {}).get("stock_items") or []
@@ -222,6 +261,6 @@ def build_recap_context(data_dir: Path) -> str:
                 f"{h.get('name')} 净买{float(h.get('buying') or 0)/1e8:.2f}亿"
                 for h in sorted(hm_items, key=lambda x: x.get('buying') or 0, reverse=True)[:5]))
         return "\n".join(lines)
-    except Exception as e:  # noqa: BLE001 — 摘要失败不影响复盘主流程
+    except Exception as e:
         logger.debug("龙虎榜复盘摘要构建失败: %s", e)
         return ""

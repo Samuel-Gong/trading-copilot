@@ -39,7 +39,12 @@ def _invalidate(table: str | None = None) -> None:
 
 def _resolve_universe(capset: CapabilitySet) -> list[str]:
     """解析标的池 — 与 daily_pipeline 独立的副本。"""
-    if capset.has(Cap.KLINE_DAILY_BATCH):
+    from app.services import preferences
+
+    if (
+        preferences.get_daily_data_provider() == "tickflow"
+        and capset.has(Cap.KLINE_DAILY_BATCH)
+    ):
         try:
             from app.tickflow.pools import get_pool
             all_a = get_pool("CN_Equity_A", refresh=True)
@@ -147,12 +152,18 @@ def run_extend_history(
         emit("extend_history", 10 + int(35 * cur / tot),
              f"日K 批次 {cur}/{tot}", stage_pct=int(100 * cur / tot), skip_log=True)
 
+    daily_failures: list[str] = []
     written_daily = kline_sync.sync_and_persist_daily_batch(
         universe, repo, capset,
         start_date=datetime.combine(new_start, datetime.min.time()),
         end_date=datetime.combine(earliest, datetime.min.time()),
         on_chunk_done=_daily_chunk,
+        failed_out=daily_failures,
     )
+    if daily_failures:
+        raise RuntimeError(
+            f"历史日K扩展不完整: {len(set(daily_failures))} 只标的所在批次失败"
+        )
     emit("extend_history", 45, f"日K 完成,写入 {written_daily} 行")
     logger.info("extend_history: daily K done, %d rows", written_daily)
     _refresh_single_view(repo, "kline_daily")

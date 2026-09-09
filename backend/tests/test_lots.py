@@ -94,6 +94,7 @@ def test_validate_lot_rules_and_errors():
         {"lead_days": -1},
         {"remind_date": "2026/09/01"},
         {"buy_date": "bad"},
+        {"id": "abc"},
         {"target_pct": 0, "stop_pct": 0, "remind_date": None},
     ):
         with pytest.raises(ValueError):
@@ -133,9 +134,6 @@ def test_sync_lot_writes_lot_rules_and_reloads_once(tmp_path, monkeypatch):
     engine = _EngineStub()
     request = _make_request(tmp_path, engine)
     _patch_channels(monkeypatch)
-    reloaded = []
-    monkeypatch.setattr(lots_api, "_reload_engine", lambda r: reloaded.append(1))
-
     lots_api.sync_lot(request, _lot())
     assert _lot_path(tmp_path, "lot_test1").exists()
     price = monitor_rules.load_one(tmp_path, "lot_test1_p")
@@ -143,7 +141,20 @@ def test_sync_lot_writes_lot_rules_and_reloads_once(tmp_path, monkeypatch):
     assert price is not None and price["lot_id"] == "lot_test1"
     assert price["conditions"][0] == {"field": "close", "op": ">=", "value": 1650.0}
     assert date_rule is not None and date_rule["remind_date"] == "2026-09-01"
-    assert len(reloaded) == 1
+    assert engine.set_calls == 1
+    assert {rule["id"] for rule in engine.rules} == {"lot_test1_p", "lot_test1_d"}
+
+
+def test_custom_lot_id_round_trips_through_list(tmp_path, monkeypatch):
+    engine = _EngineStub()
+    request = _make_request(tmp_path, engine)
+    _patch_channels(monkeypatch)
+
+    lots_api.sync_lot(request, _lot(id="lot_custom_name"))
+
+    assert [lot["id"] for lot in lots_domain.load_all(tmp_path)] == [
+        "lot_custom_name"
+    ]
 
 
 def test_sync_lot_removes_rules_when_monitor_point_removed(tmp_path, monkeypatch):
@@ -162,12 +173,13 @@ def test_delete_lot_removes_lot_and_both_rules(tmp_path, monkeypatch):
     engine = _EngineStub()
     request = _make_request(tmp_path, engine)
     _patch_channels(monkeypatch)
-    monkeypatch.setattr(lots_api, "_reload_engine", lambda r: None)
     lots_api.sync_lot(request, _lot())
     lots_api.delete_lot("lot_test1", request)
     assert not _lot_path(tmp_path, "lot_test1").exists()
     assert monitor_rules.load_one(tmp_path, "lot_test1_p") is None
     assert monitor_rules.load_one(tmp_path, "lot_test1_d") is None
+    assert engine.set_calls == 2
+    assert engine.rules == []
 
 
 def test_sync_lot_etf_resolves_asset_type(tmp_path, monkeypatch):
@@ -186,6 +198,124 @@ def test_sync_lot_etf_resolves_asset_type(tmp_path, monkeypatch):
     date_rule = monitor_rules.load_one(tmp_path, "lot_test1_d")
     assert price is not None and price["asset_type"] == "etf"
     assert date_rule is not None and date_rule["asset_type"] == "etf"
+
+
+def test_sync_lot_asset_type_failure_writes_nothing(tmp_path, monkeypatch):
+    engine = _EngineStub()
+
+    def _fail(_symbol):
+        raise RuntimeError("repository unavailable")
+
+    repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path), resolve_asset_type=_fail)
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(repo=repo, monitor_engine=engine))
+    )
+    _patch_channels(monkeypatch)
+
+    with pytest.raises(HTTPException) as exc_info:
+        lots_api.sync_lot(request, _lot(symbol="510300.SH"))
+
+    assert exc_info.value.status_code == 503
+    assert not _lot_path(tmp_path, "lot_test1").exists()
+    assert monitor_rules.load_all(tmp_path) == []
+
+
+def test_sync_lot_rolls_back_all_files_when_second_rule_write_fails(tmp_path, monkeypatch):
+    engine = _EngineStub()
+    request = _make_request(tmp_path, engine)
+    _patch_channels(monkeypatch)
+    monkeypatch.setattr(lots_api, "_reload_engine", lambda _request: None)
+    lots_api.sync_lot(request, _lot())
+    paths = lots_api._bundle_paths(tmp_path, "lot_test1")
+    before = {path: path.read_bytes() for path in paths}
+    original_save = monitor_rules.save_one
+
+    def _fail_date_rule(data_dir, rule):
+        if rule["id"] == "lot_test1_d":
+            raise OSError("injected second rule failure")
+        original_save(data_dir, rule)
+
+    monkeypatch.setattr(monitor_rules, "save_one", _fail_date_rule)
+
+    with pytest.raises(OSError, match="injected second rule failure"):
+        lots_api.sync_lot(request, _lot(cost_price=1600.0))
+
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_delete_lot_rolls_back_all_files_when_rule_delete_fails(tmp_path, monkeypatch):
+    engine = _EngineStub()
+    request = _make_request(tmp_path, engine)
+    _patch_channels(monkeypatch)
+    monkeypatch.setattr(lots_api, "_reload_engine", lambda _request: None)
+    lots_api.sync_lot(request, _lot())
+    paths = lots_api._bundle_paths(tmp_path, "lot_test1")
+    before = {path: path.read_bytes() for path in paths}
+    original_delete = monitor_rules.delete_one
+
+    def _fail_date_rule(data_dir, rule_id):
+        if rule_id == "lot_test1_d":
+            raise OSError("injected delete failure")
+        return original_delete(data_dir, rule_id)
+
+    monkeypatch.setattr(monitor_rules, "delete_one", _fail_date_rule)
+
+    with pytest.raises(OSError, match="injected delete failure"):
+        lots_api.delete_lot("lot_test1", request)
+
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_sync_lot_rolls_back_files_and_engine_when_reload_fails(tmp_path, monkeypatch):
+    engine = _EngineStub()
+    request = _make_request(tmp_path, engine)
+    _patch_channels(monkeypatch)
+    original_reload = lots_api._reload_engine
+    calls = 0
+
+    def _reload_then_fail_once(req):
+        nonlocal calls
+        calls += 1
+        original_reload(req)
+        if calls == 1:
+            raise RuntimeError("injected reload failure")
+
+    monkeypatch.setattr(lots_api, "_reload_engine", _reload_then_fail_once)
+
+    with pytest.raises(RuntimeError, match="injected reload failure"):
+        lots_api.sync_lot(request, _lot())
+
+    assert calls == 2
+    assert not _lot_path(tmp_path, "lot_test1").exists()
+    assert monitor_rules.load_all(tmp_path) == []
+    assert engine.rules == []
+
+
+def test_delete_lot_rolls_back_files_and_engine_when_reload_fails(tmp_path, monkeypatch):
+    engine = _EngineStub()
+    request = _make_request(tmp_path, engine)
+    _patch_channels(monkeypatch)
+    lots_api.sync_lot(request, _lot())
+    paths = lots_api._bundle_paths(tmp_path, "lot_test1")
+    before = {path: path.read_bytes() for path in paths}
+    original_reload = lots_api._reload_engine
+    calls = 0
+
+    def _reload_then_fail_once(req):
+        nonlocal calls
+        calls += 1
+        original_reload(req)
+        if calls == 1:
+            raise RuntimeError("injected reload failure")
+
+    monkeypatch.setattr(lots_api, "_reload_engine", _reload_then_fail_once)
+
+    with pytest.raises(RuntimeError, match="injected reload failure"):
+        lots_api.delete_lot("lot_test1", request)
+
+    assert calls == 2
+    assert {path: path.read_bytes() for path in paths} == before
+    assert {rule["id"] for rule in engine.rules} == {"lot_test1_p", "lot_test1_d"}
 
 
 def test_upsert_lot_invalid_returns_400(tmp_path, monkeypatch):

@@ -6,11 +6,30 @@
 from __future__ import annotations
 
 import os
+import stat
+import tempfile
 from pathlib import Path
 
 
 def atomic_write_text(path: Path, text: str) -> None:
-    """临时文件 + os.replace 原子替换, 避免读侧读到半截 JSON。"""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    """同目录临时文件落盘后原子替换；失败时保留旧文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)

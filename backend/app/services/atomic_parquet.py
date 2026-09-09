@@ -9,9 +9,9 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
-
 
 FileWriter = Callable[[Path], None]
 logger = logging.getLogger(__name__)
@@ -152,24 +152,35 @@ def replace_file_set(
     entries: Iterable[tuple[Path, FileWriter]],
     *,
     journal_path: Path | None = None,
+    commit_guard: Callable[[], AbstractContextManager] | None = None,
 ) -> None:
     """先完整暂存一组文件，再逐个替换；失败时恢复，亦可跨进程恢复。"""
     items = list(entries)
     targets = [target for target, _writer in items]
     if len(targets) != len(set(targets)):
         raise ValueError("原子发布目标不能重复")
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for target, writer in items:
+            staged.append((target, _stage_file(writer, target)))
+        with commit_guard() if commit_guard is not None else nullcontext():
+            _replace_staged_file_set(staged, journal_path=journal_path)
+    finally:
+        for _target, temporary in staged:
+            temporary.unlink(missing_ok=True)
+
+
+def _replace_staged_file_set(
+    staged: list[tuple[Path, Path]], *, journal_path: Path | None,
+) -> None:
+    """只发布已完整暂存的文件；调用方负责最终提交的并发边界。"""
     if journal_path is not None:
         recover_file_set(journal_path)
-
-    staged: list[tuple[Path, Path]] = []
     backups: dict[Path, Path | None] = {}
     published: list[Path] = []
     preserved_backups: set[Path] = set()
     publish_succeeded = False
     try:
-        for target, writer in items:
-            staged.append((target, _stage_file(writer, target)))
-
         for target, _temporary in staged:
             if not target.exists():
                 backups[target] = None
@@ -241,6 +252,7 @@ def replace_parquet_set(
     entries: Iterable[tuple[Path, Any]],
     *,
     journal_path: Path | None = None,
+    commit_guard: Callable[[], AbstractContextManager] | None = None,
 ) -> None:
     """原子发布一组 Parquet 文件。"""
     replace_file_set(
@@ -249,9 +261,13 @@ def replace_parquet_set(
             for target, frame in entries
         ],
         journal_path=journal_path,
+        commit_guard=commit_guard,
     )
 
 
-def write_parquet_atomic(frame: Any, target: Path) -> None:
+def write_parquet_atomic(
+    frame: Any, target: Path, *,
+    commit_guard: Callable[[], AbstractContextManager] | None = None,
+) -> None:
     """完整写入单个临时文件后原子替换目标。"""
-    replace_parquet_set([(target, frame)])
+    replace_parquet_set([(target, frame)], commit_guard=commit_guard)

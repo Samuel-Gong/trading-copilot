@@ -24,7 +24,7 @@ from pathlib import Path
 import polars as pl
 
 from app.indicators.levels import compute_levels, summarize_levels
-from app.services.financial_sync import get_financial_df
+from app.services.financial_sync import get_financial_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +107,9 @@ def _load_financials(
     (那是 financial_analyzer 的职责)。这里取轻量,留给技术面更多 token。
     """
     out: dict[str, list[dict]] = {}
+    snapshot = get_financial_snapshot(data_dir)
     for table in ("metrics", "income"):
-        df = get_financial_df(data_dir, table)
+        df = snapshot[table]
         if df.is_empty():
             out[table] = []
             continue

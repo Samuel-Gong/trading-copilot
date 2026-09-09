@@ -177,24 +177,22 @@ def _simple_segments_overlap(left: str | object, right: str | object) -> bool:
     if isinstance(left, str) and isinstance(right, str):
         return left == right
     if isinstance(left, str):
-        return bool(re.fullmatch(getattr(right, "regex"), left))
+        return bool(re.fullmatch(right.regex, left))
     if isinstance(right, str):
-        return bool(re.fullmatch(getattr(left, "regex"), right))
+        return bool(re.fullmatch(left.regex, right))
 
-    left_regex = getattr(left, "regex")
-    right_regex = getattr(right, "regex")
+    left_regex = left.regex
+    right_regex = right.regex
     if any(
         re.fullmatch(left_regex, witness) and re.fullmatch(right_regex, witness)
         for witness in _CONVERTER_WITNESSES
     ):
         return True
-    if {
+    # 自定义转换器没有可证明的交集算法时 fail-closed，避免注册不可达路由。
+    return not {
         type(left).__name__,
         type(right).__name__,
-    } <= _BUILTIN_CONVERTER_NAMES:
-        return False
-    # 自定义转换器没有可证明的交集算法时 fail-closed，避免注册不可达路由。
-    return True
+    } <= _BUILTIN_CONVERTER_NAMES
 
 
 def _complex_templates_may_overlap(left: str, right: str) -> bool:

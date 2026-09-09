@@ -127,8 +127,7 @@ COPY --from=stocksdk-builder /build/node_modules ./app/plugins/stocksdk/node_mod
 COPY tiers.yaml /app/tiers.yaml
 ENV STATIC_DIR=/app/static \
     TIERS_YAML=/app/tiers.yaml \
-    DATA_DIR=/app/data \
-    TICKFLOW_ENV_FILE=/app/.env
+    DATA_DIR=/app/data
 
 # Frontend 静态产物
 COPY --from=frontend-builder /build/dist ./static

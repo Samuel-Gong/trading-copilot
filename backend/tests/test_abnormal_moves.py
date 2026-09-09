@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 import polars as pl
+import pytest
 
 from app.indicators.pipeline import (
     attach_deviation_columns,
@@ -22,6 +23,8 @@ from app.services.abnormal_moves import (
     is_st_name,
     rule_for,
 )
+from app.strategy import monitor_rules
+from app.strategy.monitor import MonitorRuleEngine
 from app.tickflow.capabilities import Cap, CapabilityLimits, CapabilitySet
 from app.tickflow.repository import DataStore, KlineRepository
 
@@ -44,7 +47,7 @@ def test_attach_deviation_columns_math(tmp_path) -> None:
     # 上证指数 4 天等差 +1: 3日动量 = 13/10-1 = 0.30
     # 个股 close 与指数同序列 → momentum_3d 缺失时按 close 就地补算, 偏离 = 0
     days = [date(2026, 8, 13), date(2026, 8, 14), date(2026, 8, 15), date(2026, 8, 18)]
-    index_rows = [("000001.SH", d, 10.0 + i) for i, d in enumerate(days)]
+    index_rows = [("000002.SH", d, 10.0 + i) for i, d in enumerate(days)]
     _write_index_daily(tmp_path, index_rows)
 
     stock = pl.DataFrame(
@@ -87,13 +90,13 @@ _BENCH_DAYS = [date(2026, 8, 11), date(2026, 8, 12), date(2026, 8, 13),
 
 def _write_sh_bench(tmp_path) -> None:
     # 上证指数 6 日收盘 10..15, 末值 15 为昨收
-    _write_index_daily(tmp_path, [("000001.SH", d, 10.0 + i) for i, d in enumerate(_BENCH_DAYS)])
+    _write_index_daily(tmp_path, [("000002.SH", d, 10.0 + i) for i, d in enumerate(_BENCH_DAYS)])
 
 
 def test_benchmark_momentum_today_math(tmp_path) -> None:
     _write_sh_bench(tmp_path)
     # QuoteService 指数缓存使用百分数值: 1.0 = 1%。
-    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [1.0]})
+    quotes = pl.DataFrame({"symbol": ["000002.SH"], "change_pct": [1.0]})
 
     out = benchmark_momentum_today(tmp_path, quotes)
     row = out.row(0, named=True)
@@ -111,7 +114,7 @@ def test_benchmark_momentum_today_percent_not_treated_as_decimal(tmp_path) -> No
     """#232 回归: 百分数 -1.88 (实际 -1.88%) 不得被当小数 (否则 1+rt=-0.88,
     构造出负的指数点位, 偏离值被放大两个数量级)。"""
     _write_sh_bench(tmp_path)
-    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [-1.88]})
+    quotes = pl.DataFrame({"symbol": ["000002.SH"], "change_pct": [-1.88]})
 
     out = benchmark_momentum_today(tmp_path, quotes)
     row = out.row(0, named=True)
@@ -122,11 +125,11 @@ def test_benchmark_momentum_today_percent_not_treated_as_decimal(tmp_path) -> No
 def test_benchmark_momentum_today_excludes_today_rows(tmp_path) -> None:
     # 指数监控盘写入的今日行不能当昨收 (否则实时涨跌被重复叠加)
     today = cn_today()
-    rows = [("000001.SH", d, 10.0 + i) for i, d in enumerate(_BENCH_DAYS)]
-    rows.append(("000001.SH", today, 99.0))  # 今日脏行
+    rows = [("000002.SH", d, 10.0 + i) for i, d in enumerate(_BENCH_DAYS)]
+    rows.append(("000002.SH", today, 99.0))  # 今日脏行
     _write_index_daily(tmp_path, rows)
 
-    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [0.0]})
+    quotes = pl.DataFrame({"symbol": ["000002.SH"], "change_pct": [0.0]})
     out = benchmark_momentum_today(tmp_path, quotes)
     assert abs(out.row(0, named=True)["bench_mom3d"] - (15.0 / 13 - 1)) < 1e-9
 
@@ -135,7 +138,7 @@ def test_benchmark_momentum_today_prefers_price_ratio(tmp_path) -> None:
     _write_sh_bench(tmp_path)
     quotes = pl.DataFrame(
         {
-            "symbol": ["000001.SH"],
+            "symbol": ["000002.SH"],
             "close": [101.0],
             "prev_close": [100.0],
             "change_pct": [99.0],
@@ -149,7 +152,7 @@ def test_benchmark_momentum_today_prefers_price_ratio(tmp_path) -> None:
 
 def test_attach_deviation_columns_today(tmp_path) -> None:
     _write_sh_bench(tmp_path)
-    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [1.0]})
+    quotes = pl.DataFrame({"symbol": ["000002.SH"], "change_pct": [1.0]})
     # 单日帧: 增量路径产出的 momentum 列 (无 date 历史, 无法 shift 补算)
     today_df = pl.DataFrame(
         {
@@ -170,7 +173,7 @@ def test_attach_deviation_columns_today(tmp_path) -> None:
 def test_attach_deviation_columns_today_missing_momentum(tmp_path) -> None:
     # 全量回退路径可能缺 momentum_3d: 该窗口置 null, 其余窗口正常
     days = [date(2026, 7, 1) + timedelta(days=i) for i in range(35)]
-    _write_index_daily(tmp_path, [("000001.SH", d, 10.0 + i) for i, d in enumerate(days)])
+    _write_index_daily(tmp_path, [("000002.SH", d, 10.0 + i) for i, d in enumerate(days)])
     df = pl.DataFrame(
         {
             "symbol": ["600000.SH"],
@@ -178,7 +181,7 @@ def test_attach_deviation_columns_today_missing_momentum(tmp_path) -> None:
             "momentum_30d": [1.0],
         }
     )
-    quotes = pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [0.0]})
+    quotes = pl.DataFrame({"symbol": ["000002.SH"], "change_pct": [0.0]})
     out = attach_deviation_columns_today(df, tmp_path, quotes)
     assert out["deviate_3d"][0] is None
     assert out["deviate_10d"][0] is not None
@@ -215,7 +218,7 @@ def test_index_sync_invalidates_cached_missing_benchmark(tmp_path, monkeypatch) 
 
     days = [date(2026, 8, 11) + timedelta(days=i) for i in range(6)]
     raw = pl.DataFrame({
-        "symbol": ["000001.SH"] * len(days),
+        "symbol": ["000002.SH"] * len(days),
         "date": days,
         "open": [10.0 + i for i in range(len(days))],
         "high": [10.5 + i for i in range(len(days))],
@@ -237,7 +240,7 @@ def test_index_sync_invalidates_cached_missing_benchmark(tmp_path, monkeypatch) 
         capset,
         start_date=datetime(2026, 8, 11),
         end_date=datetime(2026, 8, 16),
-        symbols_override=["000001.SH"],
+        symbols_override=["000002.SH"],
     )
 
     assert written == len(days)
@@ -267,6 +270,8 @@ def test_board_and_st_rules() -> None:
     assert gem.thresholds[10] == (1.00, 0.50)
     bse = rule_for("920001.BJ", "正常股")
     assert bse.thresholds[3] == (0.40, 0.40)
+    assert bse.thresholds[10] == (1.50, 0.60)
+    assert bse.thresholds[30] == (3.00, 0.75)
 
 
 class _FakeRepo:
@@ -296,7 +301,7 @@ class _FakeQuotes:
     def get_index_quotes(self):
         return pl.DataFrame(
             {
-                "symbol": ["000001.SH", "399001.SZ"],
+                "symbol": ["000002.SH", "399102.SZ"],
                 "close": [3300.0, 1000.0],
                 "prev_close": [3270.0, 1000.0],
             }
@@ -318,7 +323,7 @@ class _PercentQuotes:
     """返回百分数口径的指数缓存 (与 _build_index_quotes 的 x100 输出同形态)。"""
 
     def get_index_quotes(self):
-        return pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [-1.88]})
+        return pl.DataFrame({"symbol": ["000002.SH"], "change_pct": [-1.88]})
 
 
 def test_bench_rt_pct_converts_percent_to_decimal() -> None:
@@ -348,16 +353,18 @@ def test_build_overview_closeness_and_status() -> None:
     by_symbol = {r["symbol"]: r for r in result["rows"]}
     # 主板: 3d阈值0.2 → 0.19/0.2=0.95 边缘; 指数实时 +30/3270≈0.00917 叠加后略增
     a = by_symbol["600000.SH"]
-    assert a["status"] in ("edge", "triggered")
-    # 创业板: 30日 2.10/2.00 ≥ 1 → triggered
+    assert a["status"] in ("edge", "estimate")
+    # 创业板: 30日 2.10/2.00 ≥ 1 → 滚动估算达线
     b = by_symbol["300001.SZ"]
-    assert b["status"] == "triggered"
+    assert b["status"] == "estimate"
+    assert b["determination"] == "rolling_estimate"
     # 000002: 3d 0.05/0.2=0.25, 10d 0.2/1=0.2, 30d 0.6/2=0.3 → 全部 < 0.5 被过滤
     assert "000002.SZ" not in by_symbol
     # 排序按接近度降序
     closeness = [r["max_closeness"] for r in result["rows"]]
     assert closeness == sorted(closeness, reverse=True)
-    assert result["counts"]["triggered"] >= 1
+    assert result["counts"]["estimate"] >= 1
+    assert result["calculation_scope"] == "rolling_estimate"
 
 
 def test_build_overview_joins_name_map_when_enriched_omits_name() -> None:
@@ -490,7 +497,7 @@ def test_build_overview_uses_standardized_today_deviations() -> None:
         def get_index_quotes(self):
             return pl.DataFrame(
                 {
-                    "symbol": ["000001.SH", "399001.SZ"],
+                    "symbol": ["000002.SH", "399107.SZ"],
                     # QuoteService 指数缓存使用百分数值, 1.0 表示 1%。
                     "change_pct": [1.0, -1.0],
                 }
@@ -569,7 +576,7 @@ def test_build_overview_missing_exchange_benchmark_fails_closed() -> None:
 
     class _MissingSzBenchmark:
         def get_index_quotes(self):
-            return pl.DataFrame({"symbol": ["000001.SH"], "change_pct": [1.0]})
+            return pl.DataFrame({"symbol": ["000002.SH"], "change_pct": [1.0]})
 
         def get_enriched_today(self):
             return pl.DataFrame(
@@ -645,11 +652,11 @@ def test_build_overview_negative_side_stricter_threshold() -> None:
     a = by_symbol["600000.SH"]
     assert a["windows"]["10d"]["threshold"] == 0.50
     assert abs(a["windows"]["10d"]["closeness"] - 1.1) < 1e-9
-    assert a["status"] == "triggered"
+    assert a["status"] == "estimate"
     b = by_symbol["600001.SH"]
     assert b["windows"]["30d"]["threshold"] == 0.70
     assert abs(b["windows"]["30d"]["closeness"] - round(0.75 / 0.7, 4)) < 1e-9
-    assert b["status"] == "triggered"
+    assert b["status"] == "estimate"
     # 正向阈值不变: +100%/+200% (在正偏离用例中覆盖, 这里验证规则表)
     main = rule_for("600000.SH", "正常股")
     assert main.thresholds[10] == (1.00, 0.50)
@@ -657,11 +664,6 @@ def test_build_overview_negative_side_stricter_threshold() -> None:
 
 
 # ── 监控规则接入 (type=abnormal) ────────────────────────
-
-import pytest
-
-from app.strategy import monitor_rules
-from app.strategy.monitor import MonitorRuleEngine
 
 
 def _ab_rule(**overrides) -> dict:
@@ -729,7 +731,8 @@ def test_engine_abnormal_edge_trigger_and_cooldown() -> None:
     assert ev["symbol"] == "600000.SH"
     assert ev["abnormal_window"] == "3d"
     assert ev["abnormal_closeness"] == pytest.approx(0.8)
-    assert "接近" in ev["message"] or "已达" in ev["message"]
+    assert "滚动估算接近阈值" in ev["message"]
+    assert "不代表交易所认定或披露义务" in ev["message"]
     # 持续高于阈值: 不重复触发 (边缘语义)
     assert engine.evaluate_abnormal([_row("600000.SH", ("3d", 0.18))], now=1012.0) == []
     # 回落再上穿: cooldown=0 时再次触发
@@ -743,6 +746,20 @@ def test_engine_abnormal_edge_trigger_and_cooldown() -> None:
     engine_cd.evaluate_abnormal([_row("600000.SH", ("3d", 0.16))], now=1006.0)
     engine_cd.evaluate_abnormal([_row("600000.SH", ("3d", 0.10))], now=1012.0)
     assert engine_cd.evaluate_abnormal([_row("600000.SH", ("3d", 0.16))], now=1018.0) == []
+
+
+def test_engine_abnormal_estimate_message_is_not_regulatory_determination() -> None:
+    engine = MonitorRuleEngine()
+    engine.set_rules([_ab_rule(threshold_pct=100)])
+    engine.evaluate_abnormal([_row("600000.SH", ("3d", 0.19))], now=1000.0)
+
+    event = engine.evaluate_abnormal(
+        [_row("600000.SH", ("3d", 0.21))], now=1006.0,
+    )[0]
+
+    assert "滚动估算达线" in event["message"]
+    assert "不代表交易所认定或披露义务" in event["message"]
+    assert "已达异常波动阈值" not in event["message"]
 
 
 def test_engine_abnormal_stale_symbol_state_cleared() -> None:
@@ -817,8 +834,8 @@ def test_attach_deviation_columns_board_routing(tmp_path) -> None:
     assert abs(gem - 0.0) < 1e-9
 
 
-def test_attach_deviation_columns_star_fallback(tmp_path) -> None:
-    """科创50 数据缺失 → 回退上证A指, 偏离列不整体缺失。"""
+def test_attach_deviation_columns_star_missing_official_benchmark_fails_closed(tmp_path) -> None:
+    """科创50 缺失时，即使上证A指存在也不得替代法定基准。"""
     days = [date(2026, 8, 13), date(2026, 8, 14), date(2026, 8, 15), date(2026, 8, 18)]
     _write_index_daily(tmp_path, [("000002.SH", d, 10.0 + i) for i, d in enumerate(days)])
 
@@ -831,8 +848,7 @@ def test_attach_deviation_columns_star_fallback(tmp_path) -> None:
     )
     out = attach_deviation_columns(stock, tmp_path)
     dev = out.sort("date")["deviate_3d"][-1]
-    assert dev is not None
-    assert abs(dev - 0.0) < 1e-9
+    assert dev is None
 
 
 def test_benchmark_momentum_today_gem_key(tmp_path) -> None:

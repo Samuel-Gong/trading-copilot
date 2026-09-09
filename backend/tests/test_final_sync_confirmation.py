@@ -4,13 +4,14 @@
 实时源当时仍返回 14:59:5x 的竞价前快照 (海鸥住工 7.07 而非官方收盘 7.10),
 旧价被永久固化到当日分区; 且重启后的盘后手动刷新会再次写回旧价。修复后:
 
-- _process_full_market_records 收到 final_boundary_ms 时, 快照最大时间戳
-  达到边界 (含容差) 才落盘/评估监控, 否则只更新展示缓存;
+- _process_full_market_records 收到 final_boundary_ms 时, 每个资产族的所有快照
+  都达到边界 (含容差) 才发布该资产族, 混合批次不能互相背书;
 - _final_boundary_ms/_past_final_deadline 提供边界与重试窗口 (收盘 15:00/15:30)。
 """
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time
+from datetime import datetime
+from datetime import time as dt_time
 
 import pytest
 
@@ -33,6 +34,12 @@ def _record(ts_ms: int) -> dict:
     }
 
 
+def _index_record(ts_ms: int) -> dict:
+    record = _record(ts_ms)
+    record["symbol"] = "000001.SH"
+    return record
+
+
 class _StubRepo:
     """记录写盘调用的最小仓库桩。"""
 
@@ -40,7 +47,7 @@ class _StubRepo:
         self.calls: list[str] = []
 
     def get_index_symbol_set(self) -> set:
-        return set()
+        return {"000001.SH"}
 
     def get_etf_instruments(self):
         import polars as pl
@@ -111,6 +118,23 @@ def test_snapshot_without_timestamp_never_confirmed(service) -> None:
 
     assert qs._last_final_confirmed is False
     assert repo.calls == []
+    assert events["enriched"] == 0
+
+
+def test_fresh_index_does_not_confirm_stale_stock_family(service) -> None:
+    """指数已到 15:00 不能替 14:59 的股票快照背书。"""
+    qs, repo, events = service
+    boundary = _beijing_ms(15, 0)
+
+    qs._process_full_market_records(
+        [_record(boundary - 60_000), _index_record(boundary + 10_000)],
+        t0=0.0,
+        now_ts=0.0,
+        final_boundary_ms=boundary,
+    )
+
+    assert qs._last_final_confirmed is False
+    assert "daily" not in repo.calls
     assert events["enriched"] == 0
 
 

@@ -51,9 +51,11 @@ def get_index_daily(
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 
     try:
-        raw = kline_sync.sync_daily_batch([symbol], count=days + 150)
+        raw = kline_sync.fetch_daily_routed(
+            [symbol], capset, count=days + 150, asset_type="index",
+        )
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"TickFlow fetch failed: {e}") from e
+        raise HTTPException(status_code=502, detail=f"指数日 K 拉取失败: {e}") from e
     if raw.is_empty():
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 

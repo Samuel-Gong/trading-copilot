@@ -11,6 +11,7 @@ mock 范式沿用 test_stocksdk_provider.py (monkeypatch 模块属性)。
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import polars as pl
+import pytest
 
 from app.plugins.stocksdk import provider as sp
 from app.plugins.stocksdk.provider import StockSDKProvider
@@ -59,11 +61,11 @@ def test_tickflow_epoch_minute_normalizes_to_beijing_wall_clock():
 
 
 def _setup_custom_provider(monkeypatch, provider: object, has_dataset: bool = True) -> None:
-    """统一 mock 自定义分钟源路由前置: preferences + provider_has_dataset + get_provider。
+    """统一 mock 自定义分钟源路由前置与 Provider 租约。
 
     - preferences.get_minute_data_provider → "mock_src"
     - custom.provider_has_dataset → has_dataset
-    - custom.get_provider → provider
+    - custom.lease_provider → provider
     """
     monkeypatch.setattr(
         kline_sync.preferences,
@@ -75,8 +77,12 @@ def _setup_custom_provider(monkeypatch, provider: object, has_dataset: bool = Tr
         lambda name, ds: has_dataset,
     )
     monkeypatch.setattr(
-        "app.data_providers.custom.get_provider",
-        lambda name: provider,
+        "app.data_providers.custom.lease_provider",
+        lambda _name: nullcontext((provider, 1)),
+    )
+    monkeypatch.setattr(
+        "app.data_providers.custom.registry_generation",
+        lambda: 1,
     )
 
 
@@ -130,21 +136,17 @@ def test_stocksdk_get_minute_receives_freq_1m(monkeypatch):
     assert captured["job"]["period"] == "1"
 
 
-# ---------- 测试 3: 自定义源异常 + TickFlow 也失败 → 返回空 (非 500) ----------
+# ---------- 测试 3: 自定义源异常时 fail-closed → 返回空 (非 500) ----------
 
-def test_custom_provider_exception_no_500(monkeypatch):
-    """§4 测试 3: 自定义源抛异常 + TickFlow 也失败,
-    fetch_minute_single / sync_minute_batch 返回空 df。
-    """
+def test_custom_provider_exception_no_500_or_tickflow_fallback(monkeypatch):
+    """§4 测试 3: 显式自定义源抛异常时返回空帧，且不调用 TickFlow。"""
     # 自定义源抛异常
     mock_provider = MagicMock()
     mock_provider.get_minute.side_effect = httpx.TimeoutException("timeout")
     _setup_custom_provider(monkeypatch, mock_provider, has_dataset=True)
 
-    # mock get_client 返回 mock client, 其 klines.batch raise (TickFlow 也失败)
-    mock_tf = MagicMock()
-    mock_tf.klines.batch.side_effect = Exception("tickflow fail")
-    monkeypatch.setattr(kline_sync, "get_client", lambda: mock_tf)
+    get_client_spy = MagicMock()
+    monkeypatch.setattr(kline_sync, "get_client", get_client_spy)
 
     # fetch_minute_single: 自定义源异常 → fall through → TickFlow 异常 → 返回空
     df_single = kline_sync.fetch_minute_single(
@@ -162,12 +164,13 @@ def test_custom_provider_exception_no_500(monkeypatch):
     )
     assert isinstance(df_batch, pl.DataFrame)
     assert df_batch.is_empty()
+    get_client_spy.assert_not_called()
 
 
-# ---------- 测试 4: 未配 minute dataset → 回退 TickFlow ----------
+# ---------- 测试 4: 未配 minute dataset → fail-closed ----------
 
 def test_provider_without_minute_dataset_fallback(monkeypatch):
-    """§4 测试 4: provider_has_dataset 返回 False → (None, True) 回退 TickFlow。"""
+    """§4 测试 4: 显式源无 minute 数据集时停止，不调用 TickFlow。"""
     mock_provider = MagicMock()
     _setup_custom_provider(monkeypatch, mock_provider, has_dataset=False)
 
@@ -175,9 +178,8 @@ def test_provider_without_minute_dataset_fallback(monkeypatch):
         ["600519.SH"], None, None, asset_type="stock",
     )
 
-    assert fallback is True
-    assert df is None
-    # provider.get_minute 不应被调用 (回退决策在前)
+    assert fallback is False
+    assert df is not None and df.is_empty()
     mock_provider.get_minute.assert_not_called()
 
 
@@ -595,11 +597,56 @@ def test_sync_and_persist_minute_holds_repository_write_lock(monkeypatch, tmp_pa
     assert written == expected_df.height
 
 
-# ---------- 测试 13: get_provider 异常时 fall through TickFlow (Issue 2) ----------
+def test_sync_and_persist_minute_discards_result_after_route_change(
+    monkeypatch,
+    tmp_path,
+):
+    selected = ["mock_src"]
+    expected_df = _mock_minute_df()
+    mock_provider = MagicMock()
 
-def test_get_provider_exception_falls_back_to_tickflow(monkeypatch):
-    """Issue 2: get_provider raise ValueError →
-    _try_custom_minute 返回 (None, True), 无异常穿透。
+    def _fetch(*_args, **_kwargs):
+        selected[0] = "other_src"
+        return expected_df
+
+    mock_provider.get_minute.side_effect = _fetch
+    _setup_custom_provider(monkeypatch, mock_provider, has_dataset=True)
+    monkeypatch.setattr(
+        kline_sync.preferences,
+        "get_minute_data_provider",
+        lambda: selected[0],
+    )
+    monkeypatch.setattr(kline_sync, "_cleanup_null_datetime_minute", lambda _repo: None)
+    monkeypatch.setattr(kline_sync, "_migrate_symbol_to_date_partition", lambda _repo: None)
+    monkeypatch.setattr(kline_sync, "_latest_minute_datetime", lambda _repo: None)
+    monkeypatch.setattr(
+        kline_sync,
+        "resolve_limit",
+        lambda *_args, **_kwargs: MagicMock(batch=100, rpm=30),
+    )
+    monkeypatch.setattr(
+        kline_sync.preferences,
+        "get_minute_sync_segment_days",
+        lambda: 20,
+    )
+    write_spy = MagicMock(return_value=expected_df.height)
+    monkeypatch.setattr(kline_sync, "_write_minute_partition", write_spy)
+    repo = MagicMock()
+    repo.store.data_dir = tmp_path
+    repo._write_lock = Lock()
+
+    with pytest.raises(RuntimeError, match="minute provider changed"):
+        kline_sync.sync_and_persist_minute(
+            ["600519.SH"], repo, MagicMock(),
+        )
+    write_spy.assert_not_called()
+
+
+# ---------- 测试 13: get_provider 异常时 fail-closed (Issue 2) ----------
+
+def test_provider_lease_exception_stops_without_tickflow(monkeypatch):
+    """Provider 租约失败 →
+    _try_custom_minute 返回空帧且不回退，无异常穿透。
     """
     monkeypatch.setattr(
         kline_sync.preferences,
@@ -611,26 +658,26 @@ def test_get_provider_exception_falls_back_to_tickflow(monkeypatch):
         lambda name, ds: True,  # provider 存在, 但 get_provider 会抛
     )
 
-    def _raising_get_provider(name):
+    def _raising_lease(_name):
         raise ValueError("not found")
     monkeypatch.setattr(
-        "app.data_providers.custom.get_provider",
-        _raising_get_provider,
+        "app.data_providers.custom.lease_provider",
+        _raising_lease,
     )
 
     df, fallback = kline_sync._try_custom_minute(
         ["600519.SH"], None, None, asset_type="stock",
     )
 
-    assert fallback is True
-    assert df is None
+    assert fallback is False
+    assert df is not None and df.is_empty()
 
 
-# ---------- 测试 14: provider_has_dataset 异常时 fall through (Issue 2) ----------
+# ---------- 测试 14: provider_has_dataset 异常时 fail-closed (Issue 2) ----------
 
-def test_provider_has_dataset_exception_falls_back(monkeypatch):
+def test_provider_has_dataset_exception_stops(monkeypatch):
     """Issue 2: provider_has_dataset raise →
-    _try_custom_minute 返回 (None, True), 无异常穿透。
+    _try_custom_minute 返回空帧且不回退，无异常穿透。
     """
     monkeypatch.setattr(
         kline_sync.preferences,
@@ -649,8 +696,8 @@ def test_provider_has_dataset_exception_falls_back(monkeypatch):
         ["600519.SH"], None, None, asset_type="stock",
     )
 
-    assert fallback is True
-    assert df is None
+    assert fallback is False
+    assert df is not None and df.is_empty()
 
 
 # ---------- 测试 15-17: GenericHTTPProvider opt-in 参数传递 (Issue 3) ----------
@@ -768,59 +815,50 @@ def test_resolve_minute_provider_tickflow_returns_silent_fallback():
     assert err is None
 
 
-def test_resolve_minute_provider_no_dataset_returns_silent_fallback(monkeypatch):
-    """观察项加固: 配了 custom 但未配 minute dataset → (None, True, None) 静默降级。"""
+def test_resolve_minute_provider_no_dataset_returns_error_without_fallback(monkeypatch):
+    """显式 custom 未配 minute 数据集时返回错误，禁止回退。"""
     monkeypatch.setattr(
         "app.data_providers.custom.provider_has_dataset",
         lambda name, ds: False,  # 已注册但未配 minute
     )
     provider, fallback, err = kline_sync._resolve_minute_provider("mock_src")
     assert provider is None
-    assert fallback is True
-    assert err is None  # 未配 ≠ 异常, 不应触发 warning
+    assert fallback is False
+    assert err == "provider 'mock_src' does not provide minute"
 
 
 def test_resolve_minute_provider_has_dataset_exception_returns_err(monkeypatch):
-    """观察项加固: provider_has_dataset 抛异常 → (None, True, str(e)), 上层据此 warning。"""
+    """provider_has_dataset 抛异常 → (None, False, str(e))，禁止回退。"""
     def _raising(name, ds):
         raise RuntimeError("registry corrupted")
     monkeypatch.setattr("app.data_providers.custom.provider_has_dataset", _raising)
     provider, fallback, err = kline_sync._resolve_minute_provider("mock_src")
     assert provider is None
-    assert fallback is True
+    assert fallback is False
     assert err is not None
     assert "registry corrupted" in err
 
 
-def test_resolve_minute_provider_get_provider_exception_returns_err(monkeypatch):
-    """观察项加固: provider_has_dataset 返回 True 但 get_provider 抛 → (None, True, str(e))。"""
+def test_resolve_minute_provider_does_not_take_naked_provider(monkeypatch):
+    """解析只返可用标记，不在网络调用外取裸 Provider。"""
     monkeypatch.setattr(
         "app.data_providers.custom.provider_has_dataset",
         lambda name, ds: True,
     )
-    def _raising_get(name):
-        raise ValueError("not found")
-    monkeypatch.setattr("app.data_providers.custom.get_provider", _raising_get)
     provider, fallback, err = kline_sync._resolve_minute_provider("mock_src")
-    assert provider is None
-    assert fallback is True
-    assert err is not None
-    assert "not found" in err
+    assert provider is True
+    assert fallback is False
+    assert err is None
 
 
 def test_resolve_minute_provider_success_returns_provider(monkeypatch):
     """观察项加固: 正常路径 → (provider, False, None)。"""
-    mock_provider = object()  # 任意 truthy 对象即可
     monkeypatch.setattr(
         "app.data_providers.custom.provider_has_dataset",
         lambda name, ds: True,
     )
-    monkeypatch.setattr(
-        "app.data_providers.custom.get_provider",
-        lambda name: mock_provider,
-    )
     provider, fallback, err = kline_sync._resolve_minute_provider("mock_src")
-    assert provider is mock_provider
+    assert provider is True
     assert fallback is False
     assert err is None
 
@@ -843,8 +881,8 @@ def test_minute_allowed_resolver_exception_returns_false(monkeypatch):
     assert kline_api._minute_allowed(CapabilitySet()) is False
 
 
-def test_intraday_monitor_support_resolver_exception_falls_back(monkeypatch):
-    """监控入口解析自定义源失败后继续按 TickFlow 能力判断。"""
+def test_intraday_monitor_support_resolver_exception_stops(monkeypatch):
+    """监控入口解析显式自定义源失败后停止，不使用 TickFlow 能力。"""
     from app.tickflow.capabilities import Cap, CapabilitySet
 
     monkeypatch.setattr(
@@ -862,8 +900,8 @@ def test_intraday_monitor_support_resolver_exception_falls_back(monkeypatch):
 
     support = kline_sync.intraday_monitor_support(capset)
 
-    assert support["available"] is True
-    assert support["source"] == "minute_batch"
+    assert support["available"] is False
+    assert support["source"] is None
 
 
 # ---------- 测试 20: sync_minute_single 拒绝指数 symbol (防污染 kline_minute) ----------
@@ -1003,6 +1041,7 @@ def test_get_minute_batch_no_flag_unaffected_even_if_healthy(monkeypatch):
 def test_minute_refresh_is_healthy_requires_recent_round(monkeypatch):
     """is_healthy 三条件: 偏好开 + 线程活 + 最近一轮距现在 ≤ max(2×间隔, 30s)。"""
     import time as time_mod
+
     from app.services import minute_refresh as mr
 
     svc = mr.MinuteRefreshService(MagicMock())  # is_healthy 不触达 repo
@@ -1072,8 +1111,10 @@ def _compress_mock_env(monkeypatch, *, compress_on, accept="gzip, deflate"):
 def test_get_minute_batch_gzip_response_when_enabled(monkeypatch):
     """开关开 + 客户端接受 gzip + 响应超阈值 → 返回 gzip Response, 解压后 JSON 完整。"""
     import gzip as gzip_mod
-    from app.api import kline as kline_api
+
     from fastapi import Response
+
+    from app.api import kline as kline_api
 
     mock_request, _ = _compress_mock_env(monkeypatch, compress_on=True)
     result = kline_api.get_minute_batch(
@@ -1114,7 +1155,6 @@ def test_get_minute_batch_plain_without_accept_encoding(monkeypatch):
 
 def _daily_mock_env(monkeypatch, *, compress_on, accept="gzip, deflate"):
     """构造 get_daily_batch 压缩路径的最小 mock。"""
-    from app.api import kline as kline_api
     from app.services import preferences as prefs
 
     monkeypatch.setattr(prefs, "get_daily_batch_compress", lambda: compress_on)
@@ -1141,8 +1181,10 @@ def test_daily_batch_gzip_when_enabled(monkeypatch):
     """日K压缩开 + 接受 gzip → 压缩 Response, 解压 JSON 完整。"""
     import gzip as gzip_mod
     import json as json_mod
-    from app.api import kline as kline_api
+
     from fastapi import Response
+
+    from app.api import kline as kline_api
 
     req = _daily_mock_env(monkeypatch, compress_on=True)
     result = kline_api.get_daily_batch(req, {"symbols": ["600519.SH"], "days": 20})
@@ -1163,9 +1205,11 @@ def test_daily_batch_plain_when_disabled(monkeypatch):
 def test_daily_batch_independent_from_minute_switch(monkeypatch):
     """日K与分时独立: 分时关、日K开 → 日K仍压缩 (helper 按 pref_key 走各自 getter)。"""
     import gzip as gzip_mod
+
+    from fastapi import Response
+
     from app.api import kline as kline_api
     from app.services import preferences as prefs
-    from fastapi import Response
 
     monkeypatch.setattr(prefs, "get_minute_batch_compress", lambda: False)
     req = _daily_mock_env(monkeypatch, compress_on=True)
@@ -1180,6 +1224,7 @@ def test_preferences_parallel_saves_do_not_lose_each_other(tmp_path, monkeypatch
     后写者会把先写者的更新覆盖掉。
     """
     import threading
+
     from app.services import preferences as prefs
 
     monkeypatch.setattr(prefs, "_path", lambda: tmp_path / "preferences.json")
@@ -1194,7 +1239,10 @@ def test_preferences_parallel_saves_do_not_lose_each_other(tmp_path, monkeypatch
 
     t1 = threading.Thread(target=write_key, args=("minute_batch_compress",))
     t2 = threading.Thread(target=write_key, args=("daily_batch_compress",))
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     final = prefs.load()
     assert final["minute_batch_compress"] is False

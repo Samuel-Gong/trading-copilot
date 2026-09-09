@@ -171,6 +171,60 @@ def test_service_forward_axis_uses_market_partitions_when_selected_universe_has_
     assert first["_forward_return_3d"] is None
 
 
+def test_load_factor_panel_attaches_financials_before_recursive_materialization(
+    tmp_path,
+):
+    from app.factors import store
+    from app.factors.registry import unregister_factor
+
+    custom_id = "uf_nested_roe"
+    composite_id = "cf_nested_roe"
+    metrics = tmp_path / "financials" / "metrics" / "part.parquet"
+    metrics.parent.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["S0", "S1", "S2", "S3"],
+        "period_end": ["2025-12-31"] * 4,
+        "announce_date": ["2026-01-01"] * 4,
+        "bps": [1.0, 2.0, 3.0, 4.0],
+        "roe": [10.0, 20.0, 30.0, 40.0],
+        "gross_margin": [1.0, 2.0, 3.0, 4.0],
+        "net_margin": [1.0, 2.0, 3.0, 4.0],
+        "revenue_yoy": [1.0, 2.0, 3.0, 4.0],
+        "net_income_yoy": [1.0, 2.0, 3.0, 4.0],
+        "debt_to_asset_ratio": [1.0, 2.0, 3.0, 4.0],
+    }).write_parquet(metrics)
+    try:
+        store.persist_definition(tmp_path, {
+            "id": custom_id,
+            "kind": "custom",
+            "version": 1,
+            "label": "嵌套 ROE",
+            "formula": "roe_latest * 2",
+            "status": "draft",
+        })
+        store.persist_definition(tmp_path, {
+            "id": composite_id,
+            "kind": "composite",
+            "version": 1,
+            "label": "嵌套财务组合",
+            "members": {custom_id: 1.0, "turnover_rate": 0.5},
+            "status": "draft",
+        })
+        service = FactorBacktestService(_Engine(_daily_panel(), tmp_path))
+
+        panel = service._load_factor_panel(
+            _config(composite_id),
+            [composite_id],
+        )
+
+        assert {"roe_latest", custom_id, composite_id} <= set(panel.columns)
+        assert panel[custom_id].null_count() == 0
+        assert panel[composite_id].null_count() == 0
+    finally:
+        unregister_factor(composite_id)
+        unregister_factor(custom_id)
+
+
 def test_tie_aware_groups_do_not_split_constant_factor_by_symbol_order():
     panel = pl.DataFrame({
         "symbol": ["C", "A", "D", "B"],

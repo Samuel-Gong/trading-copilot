@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import tempfile
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from app.services.ext_data import (
     ExtConfig,
     ExtConfigChangedError,
     ExtConfigStore,
+    EXT_DATA_GENERATION_FILE,
     ExtField,
     PullConfig,
     apply_config_mapping,
@@ -502,10 +504,47 @@ def dimension_members(
 
 # 点击触发 + 60s 进程内缓存: 分钟分区是滚动底座 (minute_refresh / 盘后分钟同步),
 # 不做后台预计算 — 板块基数大而单次聚合仅几十毫秒。
-_DIMENSION_INTRADAY_CACHE: dict[tuple[str, str, str, str | None], tuple[float, dict]] = {}
+_DIMENSION_INTRADAY_CACHE: dict[
+    tuple[str, str, str, str | None],
+    tuple[float, tuple, dict],
+] = {}
+_DIMENSION_INTRADAY_CACHE_LOCK = threading.Lock()
 _DIMENSION_INTRADAY_CACHE_TTL_S = 60.0
+_DIMENSION_INTRADAY_CACHE_MAX_SIZE = 256
 # 成分股网格化 ffill 上限: 超大板块退化为逐时间戳可得均值 (内存保护)。
 _DIMENSION_INTRADAY_FFILL_CAP = 2000
+
+
+def _prune_dimension_intraday_cache(now: float) -> None:
+    """锁内清理过期项，并把缓存限制在明确的容量内。"""
+    expired = [
+        key
+        for key, (created_at, _fingerprint, _payload) in _DIMENSION_INTRADAY_CACHE.items()
+        if now - created_at >= _DIMENSION_INTRADAY_CACHE_TTL_S
+    ]
+    for key in expired:
+        _DIMENSION_INTRADAY_CACHE.pop(key, None)
+    overflow = len(_DIMENSION_INTRADAY_CACHE) - _DIMENSION_INTRADAY_CACHE_MAX_SIZE
+    if overflow > 0:
+        oldest = sorted(
+            _DIMENSION_INTRADAY_CACHE,
+            key=lambda key: _DIMENSION_INTRADAY_CACHE[key][0],
+        )[:overflow]
+        for key in oldest:
+            _DIMENSION_INTRADAY_CACHE.pop(key, None)
+
+
+def _put_dimension_intraday_cache(
+    cache_key: tuple[str, str, str, str | None],
+    now: float,
+    fingerprint: tuple,
+    payload: dict,
+) -> None:
+    """写入板块分时缓存，先淘汰过期项，再按最早写入时间限制容量。"""
+    with _DIMENSION_INTRADAY_CACHE_LOCK:
+        _prune_dimension_intraday_cache(now)
+        _DIMENSION_INTRADAY_CACHE[cache_key] = (now, fingerprint, payload)
+        _prune_dimension_intraday_cache(now)
 
 
 def _bare_symbol_expr(col: str = "symbol") -> pl.Expr:
@@ -529,6 +568,68 @@ def _dimension_member_bares(matched: pl.DataFrame, config: ExtConfig) -> list[st
     )
     series = matched.select(coalesced.alias("_bare")).to_series()
     return sorted({s for s in series.to_list() if s})
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
+
+def _dimension_intraday_source_fingerprint(
+    config: ExtConfig,
+    data_dir: Path,
+    snapshot_date: str | None,
+) -> tuple:
+    """构成分时结果的配置、成分、分钟 K 与前收版本。"""
+    minute_root = data_dir / "kline_minute"
+    minute_dates = sorted(
+        part.name[5:]
+        for part in minute_root.iterdir()
+        if part.is_dir()
+        and part.name.startswith("date=")
+        and (part / "part.parquet").exists()
+    ) if minute_root.exists() else []
+    target = (
+        snapshot_date if snapshot_date in minute_dates
+        else minute_dates[-1] if not snapshot_date and minute_dates
+        else None
+    )
+
+    daily_root = data_dir / "kline_daily"
+    daily_dates = sorted(
+        part.name[5:]
+        for part in daily_root.iterdir()
+        if part.is_dir()
+        and part.name.startswith("date=")
+        and (part / "part.parquet").exists()
+        and target is not None
+        and part.name[5:] < target
+    ) if daily_root.exists() else []
+    prev_date = daily_dates[-1] if daily_dates else None
+
+    config_dir = data_dir / "ext_data" / config.id
+    generation_path = config_dir / EXT_DATA_GENERATION_FILE
+    try:
+        ext_generation = generation_path.read_text(encoding="ascii").strip()
+    except OSError:
+        ext_generation = ""
+    if config.mode == "timeseries":
+        ext_path = config_dir / "timeseries" / f"date={target}" / "part.parquet"
+    else:
+        ext_path = config_dir / "part.parquet"
+
+    return (
+        config._storage_revision,
+        ext_generation,
+        _file_fingerprint(ext_path),
+        target,
+        _file_fingerprint(minute_root / f"date={target}" / "part.parquet") if target else None,
+        prev_date,
+        _file_fingerprint(daily_root / f"date={prev_date}" / "part.parquet") if prev_date else None,
+    )
 
 
 def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
@@ -584,7 +685,7 @@ def _dimension_intraday_compute(
     if not target:
         return {"status": "no_data", "reason": "minute_missing", "date": snapshot_date, "points": []}
 
-    ext_df, _active = _read_ext_dataframe(config, data_dir)
+    ext_df, _active = _read_ext_dataframe(config, data_dir, target)
     if ext_df.is_empty() or field not in ext_df.columns:
         return {"status": "empty", "reason": "no_members", "date": target, "points": []}
     member_bares = _dimension_member_bares(_filter_dimension_member_rows(ext_df, field, value), config)
@@ -596,7 +697,7 @@ def _dimension_intraday_compute(
             minute_dir / f"date={target}" / "part.parquet",
             columns=["symbol", "datetime", "close"],
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("dimension-intraday read minute partition failed: %s", exc)
         return {"status": "no_data", "reason": "minute_schema", "date": target, "points": []}
     bars = bars.drop_nulls(subset=["datetime", "close"])
@@ -679,12 +780,21 @@ def dimension_intraday(
 
     cache_key = (config_id, field, value.strip(), snapshot_date)
     now = time.monotonic()
-    hit = _DIMENSION_INTRADAY_CACHE.get(cache_key)
-    if hit is not None and now - hit[0] < _DIMENSION_INTRADAY_CACHE_TTL_S:
-        return hit[1]
+    data_dir = _data_dir(request)
+    fingerprint = _dimension_intraday_source_fingerprint(config, data_dir, snapshot_date)
+    with _DIMENSION_INTRADAY_CACHE_LOCK:
+        _prune_dimension_intraday_cache(now)
+        hit = _DIMENSION_INTRADAY_CACHE.get(cache_key)
+        if (
+            hit is not None
+            and hit[1] == fingerprint
+            and now - hit[0] < _DIMENSION_INTRADAY_CACHE_TTL_S
+        ):
+            return hit[2]
 
-    payload = _dimension_intraday_compute(config, _data_dir(request), field, value, snapshot_date)
-    _DIMENSION_INTRADAY_CACHE[cache_key] = (now, payload)
+    payload = _dimension_intraday_compute(config, data_dir, field, value, snapshot_date)
+    if _dimension_intraday_source_fingerprint(config, data_dir, snapshot_date) == fingerprint:
+        _put_dimension_intraday_cache(cache_key, now, fingerprint, payload)
     return payload
 
 

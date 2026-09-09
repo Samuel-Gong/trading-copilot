@@ -814,7 +814,7 @@ class BacktestEngine:
         )
 
     @staticmethod
-    def _resolve_entry_prices(matrix: "MarketMatrix", config: "MatcherConfig") -> np.ndarray:
+    def _resolve_entry_prices(matrix: MarketMatrix, config: MatcherConfig) -> np.ndarray:
         """入场价矩阵: 分钟策略的逐格覆盖有限值处优先, 否则按 open/close 惯例。"""
         base = matrix.open if config.entry_fill == "open_t+1" else matrix.close
         if matrix.entry_price is None:

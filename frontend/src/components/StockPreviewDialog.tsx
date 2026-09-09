@@ -97,7 +97,8 @@ function boardTag(symbol: string): { label: string; color: string } | null {
 // ===== 异动边缘 (与异动页同口径) =====
 
 const AB_STATUS_META: Record<string, { label: string; cls: string; bar: string; icon: string }> = {
-  triggered: { label: '已触发', cls: 'bg-danger/20 text-danger font-semibold', bar: 'border-b border-danger/30 bg-danger/[0.08]', icon: 'text-danger' },
+  estimate: { label: '滚动估算达线', cls: 'bg-danger/20 text-danger font-semibold', bar: 'border-b border-danger/30 bg-danger/[0.08]', icon: 'text-danger' },
+  triggered: { label: '旧版滚动估算达线', cls: 'bg-danger/20 text-danger font-semibold', bar: 'border-b border-danger/30 bg-danger/[0.08]', icon: 'text-danger' },
   edge: { label: '异动边缘', cls: 'bg-warning/20 text-warning font-semibold', bar: 'border-b border-warning/30 bg-warning/[0.07]', icon: 'text-warning' },
   watch: { label: '观察', cls: 'bg-elevated text-secondary font-semibold', bar: 'border-b border-border bg-surface', icon: 'text-secondary' },
 }

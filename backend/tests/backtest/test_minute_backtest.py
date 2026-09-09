@@ -15,13 +15,14 @@ StrategyBacktestService.run() 的 minute_filter 分支:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
 
 from app.backtest.engine import BacktestEngine
+from app.backtest.minute_replay import _trigger_hhmm
 from app.backtest.strategy import StrategyBacktestConfig, StrategyBacktestService
 from app.strategy.engine import StrategyEngine
 
@@ -113,13 +114,13 @@ def _daily_panel(days: list[date], symbols: list[str]) -> pl.DataFrame:
 
 
 def _minute_frame(day: date, bars: list[tuple[str, str, float]]) -> pl.DataFrame:
-    """bars: (symbol, "HH:MM"(北京), close)。分区 datetime 为 naive-UTC 存储 (北京 - 8h)。"""
+    """bars: (symbol, "HH:MM"(北京), close)。分区 datetime 为北京墙钟 naive。"""
     rows = []
     for sym, hm, close in bars:
         local = datetime(day.year, day.month, day.day, int(hm[:2]), int(hm[3:]))
         rows.append({
             "symbol": sym,
-            "datetime": local - timedelta(hours=8),
+            "datetime": local,
             "open": close - 0.01,
             "high": close + 0.01,
             "low": close - 0.02,
@@ -130,6 +131,11 @@ def _minute_frame(day: date, bars: list[tuple[str, str, float]]) -> pl.DataFrame
     return pl.DataFrame(rows).sort(["symbol", "datetime"]).with_columns(
         pl.col("datetime").cast(pl.Datetime("us")),
     )
+
+
+def test_trigger_hhmm_respects_naive_beijing_and_converts_aware_utc() -> None:
+    assert _trigger_hhmm(datetime(2026, 1, 15, 9, 35)) == "09:35"
+    assert _trigger_hhmm(datetime(2026, 1, 15, 1, 35, tzinfo=UTC)) == "09:35"
 
 
 class _FakeMinuteRepo:
@@ -164,10 +170,11 @@ class _FakeMinuteRepo:
 
 def _make_service(
     tmp_path: Path, panel: pl.DataFrame, minute_frames: dict[date, pl.DataFrame],
+    strategy_source: str = TEST_STRATEGY_SOURCE,
 ) -> StrategyBacktestService:
     strat_dir = tmp_path / "strategies"
-    strat_dir.mkdir(exist_ok=True)
-    (strat_dir / "test_minute_ping.py").write_text(TEST_STRATEGY_SOURCE, encoding="utf-8")
+    strat_dir.mkdir(parents=True, exist_ok=True)
+    (strat_dir / "test_minute_ping.py").write_text(strategy_source, encoding="utf-8")
     strategy_engine = StrategyEngine(strategy_dirs=[strat_dir])
 
     repo = _FakeMinuteRepo(minute_frames)
@@ -265,8 +272,124 @@ def test_daily_window_strictly_before_trigger_day(scenario):
     assert result.trades, "日线窗口若含触发日, 测试策略会拒绝命中 — 信号归零"
 
 
+def test_prefix_candidates_and_scores_ignore_later_ranking():
+    """整日 top-1 换人不得抹掉早盘候选，也不得改写早盘评分。"""
+    from types import SimpleNamespace
+
+    from app.backtest.minute_replay import MinuteSignalReplayer
+
+    days = _trading_days(3)
+    target = days[1]
+    symbols = ["000001.SZ", "000002.SZ"]
+    history = _minute_frame(target, [
+        (symbols[0], "09:31", 10.2),
+        (symbols[1], "09:31", 14.1),
+        (symbols[0], "14:00", 10.1),
+        (symbols[1], "14:00", 14.2),
+    ])
+    seen = []
+
+    def run(_strategy_id, context, *_args):
+        cutoff = context.history["datetime"].max()
+        seen.append(cutoff.strftime("%H:%M"))
+        symbol = symbols[0] if cutoff.hour < 14 else symbols[1]
+        return SimpleNamespace(
+            rows=[{"symbol": symbol, "last_datetime": cutoff}],
+            scores={symbol: 7.0 if cutoff.hour < 14 else 99.0},
+        )
+
+    replayer = MinuteSignalReplayer(
+        SimpleNamespace(repo=_FakeMinuteRepo({target: history})),
+        SimpleNamespace(run=run),
+    )
+    result = replayer.replay(
+        SimpleNamespace(meta={"id": "top_one"}, minute_daily_bars=1),
+        panel=_daily_panel(days, symbols), start=target, end=target,
+        params={}, overrides={},
+    )
+    assert seen == ["09:31", "14:00"]
+    assert [(hit.symbol, hit.trigger_time, hit.score) for hit in result.hits] == [
+        (symbols[0], "09:31", 7.0),
+        (symbols[1], "14:00", 99.0),
+    ]
+
+
+def test_afternoon_bars_cannot_be_backdated_to_morning_entry(tmp_path):
+    lookahead_source = '''
+import polars as pl
+
+META = {
+    "id": "test_minute_ping",
+    "name": "lookahead_attempt",
+    "asset_types": ["stock"],
+    "timeframes": ["1m"],
+    "daily_history_bars": 0,
+}
+EXECUTION_BACKEND = "minute_filter"
+
+
+def filter_minute_history(df, params):
+    del params
+    if df.get_column("datetime").max().hour < 15:
+        return pl.DataFrame()
+    return (
+        df.sort("datetime").group_by("symbol").first()
+        .select(
+            "symbol",
+            pl.col("datetime").alias("last_datetime"),
+            "close",
+        )
+    )
+'''
+    days = _trading_days(30)
+    trade_day = days[-2]
+    symbol = "000001.SZ"
+    panel = _daily_panel(days, [symbol])
+    morning = _minute_frame(trade_day, [(symbol, "09:35", 10.1)])
+    full_day = _minute_frame(trade_day, [
+        (symbol, "09:35", 10.1),
+        (symbol, "15:00", 10.6),
+    ])
+
+    morning_service = _make_service(
+        tmp_path / "morning", panel, {trade_day: morning}, lookahead_source,
+    )
+    full_service = _make_service(
+        tmp_path / "full", panel, {trade_day: full_day}, lookahead_source,
+    )
+    morning_result = morning_service.run(_config(trade_day, trade_day))
+    full_result = full_service.run(_config(trade_day, trade_day))
+
+    assert morning_result.trades == []
+    assert full_result.trades == []
+
+
+def test_more_than_64_unique_trigger_times_are_all_causally_validated(tmp_path):
+    days = _trading_days(30)
+    trade_day = days[-2]
+    symbols = [f"{index + 1:06d}.SZ" for index in range(65)]
+    panel = _daily_panel(days, symbols)
+    bars = []
+    for index, symbol in enumerate(symbols):
+        minute = 31 + index
+        hour, minute = 9 + minute // 60, minute % 60
+        prev_close = panel.filter(
+            (pl.col("symbol") == symbol) & (pl.col("date") < trade_day)
+        ).sort("date").get_column("close")[-1]
+        bars.append((symbol, f"{hour:02d}:{minute:02d}", round(prev_close * 1.06, 3)))
+    frame = _minute_frame(trade_day, bars)
+    service = _make_service(tmp_path, panel, {trade_day: frame})
+
+    result = service.run(
+        _config(trade_day, trade_day, max_positions=100)
+    )
+
+    assert not result.error, result.error
+    assert result.stats["selection"]["strategy_matches"] == 65
+
+
 def test_limit_up_entry_rejected(scenario):
-    service, panel, days, _ = scenario
+    service, _panel, days, _ = scenario
     result = service.run(_config(days["t1"], days["t3"]))
     assert not result.error, result.error
     # T2 的 600000.SH 触发分钟收盘 = 涨停价 → 拒买; T3 才有它的成交

@@ -6,7 +6,7 @@
 - 引擎加载校验: 只能声明 filter_minute_history、timeframes 必须且只能是 ["1m"]
 - 引擎 1m 运行: enriched 联表基础过滤 (剔除ST / 股价区间)、entry hits、
   日线 context 拒绝
-- ScreenerService 1m context: 当日分区优先、缺失回退最近分区、空库报错、
+- ScreenerService 1m context: 只读当日分区、缺失失败闭合、空库报错、
   非股票资产拒绝
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from app.services.screener import ScreenerService
 from app.strategy.engine import StrategyDataContext, StrategyEngine
@@ -462,17 +463,17 @@ def test_minute_context_prefers_as_of_partition():
     assert ctx.timeframe == "1m"
 
 
-def test_minute_context_falls_back_to_latest_partition():
+def test_historical_minute_context_never_falls_forward_to_future_partition():
     d1, d2 = date(2026, 8, 24), date(2026, 8, 25)
     svc = _svc({
         d1: _bars("600001.SH", [(10.0, 10.2, 10.3)] * 3),
         d2: _bars("600001.SH", [(10.0, 10.2, 10.3)] * 4),
     })
-    ctx = svc.build_strategy_context(
-        None, date(2026, 8, 20), [], timeframe="1m",
-        current=pl.DataFrame({"symbol": ["600001.SH"]}),
-    )
-    assert ctx.history.height == 4  # 回退到最近分区 d2
+    with pytest.raises(ValueError, match="2026-08-20 无分钟K数据"):
+        svc.build_strategy_context(
+            None, date(2026, 8, 20), [], timeframe="1m",
+            current=pl.DataFrame({"symbol": ["600001.SH"]}),
+        )
 
 
 def test_minute_context_empty_store_raises_with_guidance():

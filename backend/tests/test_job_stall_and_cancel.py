@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -19,7 +19,7 @@ def _iso(dt: datetime) -> str:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 @pytest.fixture(autouse=True)
@@ -128,7 +128,7 @@ def test_cancelled_error_survives_chunk_isolation():
             try:
                 if i == cancel_at:
                     raise JobCancelledError("j1")
-            except Exception:  # noqa: BLE001  — 分块隔离的典型写法
+            except Exception:
                 continue
         return "completed"
 

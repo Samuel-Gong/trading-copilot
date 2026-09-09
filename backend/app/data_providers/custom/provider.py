@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -22,6 +23,7 @@ from app.data_providers.custom.mapper import (
     map_rows,
 )
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
+from app.market_time import cn_now
 from app.tickflow.rate_limits import chunked, sleep_between_batches
 
 logger = logging.getLogger(__name__)
@@ -29,38 +31,48 @@ logger = logging.getLogger(__name__)
 _REQUIRED = {
     "daily": {"symbol", "date", "open", "high", "low", "close", "volume", "amount"},
     "adj_factor": {"symbol", "trade_date", "ex_factor"},
-    "realtime": {"symbol", "last_price", "prev_close", "open", "high", "low", "volume"},
+    "realtime": {
+        "symbol",
+        "last_price",
+        "prev_close",
+        "open",
+        "high",
+        "low",
+        "volume",
+        "timestamp",
+    },
     "minute": {"symbol", "datetime", "open", "high", "low", "close", "volume", "amount"},
     # full_minute (全量分钟) 与 minute 同形: 当日窗口批量拉取, 字段映射一致
     "full_minute": {"symbol", "datetime", "open", "high", "low", "close", "volume", "amount"},
-    # financial 字段由数据源决定, 只要求能映射出 symbol
-    "financial": {"symbol"},
+    # 财务历史必须带报告期与公告日，才能满足 point-in-time 契约。
+    "financial": {"symbol", "period_end", "announce_date"},
+    "instruments": {"symbol"},
 }
 
-# 小数制下 change_pct 的物理上限: A股最大涨跌停 30% (+容差)。
-# 中位数口径下小数制批次不可能超过该值, 百分制批次(典型中位数 0.5~3)必然超过。
-# 仅对 change_pct 有效——amplitude/turnover_rate 的两种单位在数值区间上重叠
-# (百分制 0.05 = 0.05% 与小数制 0.05 = 5%), 无物理依据可判。
-_PCT_FRACTION_MAX = 0.31
-
 _PCT_COLUMNS = ("change_pct", "amplitude", "turnover_rate")
+_FINANCIAL_PCT_COLUMNS = (
+    "roe",
+    "gross_margin",
+    "net_margin",
+    "revenue_yoy",
+    "net_income_yoy",
+    "debt_to_asset_ratio",
+)
+_AUTH_TYPES = {"none", "bearer", "header", "query"}
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _normalize_pct_units(
     df: pl.DataFrame,
     pct_unit: str | None = None,
-    transformed_cols: frozenset[str] = frozenset(),
 ) -> pl.DataFrame:
     """比例字段单位归一为契约小数制 (change_pct/amplitude/turnover_rate,
     0.0366 = 3.66%, CONTRIBUTING §3.1)。单位只认显式声明, 不靠数值猜:
 
       - pct_unit="percent"  → 三列无条件 /100 (声明即契约, 即使数值看着像小数制);
       - pct_unit="decimal"  → 原样透传 (即使数值看着像百分制也不动);
-      - 未声明 → change_pct 保留截面中位数判定(涨跌停 30% 上限使其物理可判:
-        样本 >= 5 用 |值| 中位数, 小样本退用最大值, 整批同除 100);
-        amplitude/turnover_rate 置 None 交下游重算(enriched 管道按
-        high/low/prev_close 与股本口径重算), 除非该列已被 transforms 显式
-        处理过(视为用户已接管单位, 原样透传)。
+      - 未声明 → 所有比例列置 None。低波动百分数与小数制在数值上重叠,
+        禁止根据批次分布猜测单位。
     """
     dropped_undeclared = False
     for col in _PCT_COLUMNS:
@@ -69,25 +81,35 @@ def _normalize_pct_units(
         df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False).alias(col))
         if pct_unit == "percent":
             df = df.with_columns((pl.col(col) / 100).alias(col))
-        elif pct_unit == "decimal" or col in transformed_cols:
+        elif pct_unit == "decimal":
             continue
-        elif col == "change_pct":
-            vals = df[col].drop_nulls().abs()
-            if vals.is_empty():
-                continue
-            stat = vals.median() if vals.len() >= 5 else vals.max()
-            if stat > _PCT_FRACTION_MAX:
-                df = df.with_columns((pl.col(col) / 100).alias(col))
         else:
             df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
             dropped_undeclared = True
     if dropped_undeclared:
         logger.warning(
-            "自定义源 realtime 未声明 pct_unit: amplitude/turnover_rate 的单位"
-            "无法从数值判定, 已置 None 交由下游按股本/价格口径重算;"
+            "自定义源 realtime 未声明 pct_unit: 比例字段单位无法安全判定,"
+            "已全部置 None;"
             "请在 realtime 数据集配置中显式声明 pct_unit: percent 或 decimal"
         )
     return df
+
+
+def _normalize_volume_units(
+    df: pl.DataFrame,
+    volume_unit: str | None,
+    dataset: str,
+) -> pl.DataFrame:
+    """把 Provider 成交量统一为手；未声明单位时 fail-closed。"""
+    if df.is_empty() or "volume" not in df.columns:
+        return df
+    if volume_unit not in {"lots", "shares"}:
+        logger.error("custom %s volume_unit is required", dataset)
+        return pl.DataFrame()
+    volume = pl.col("volume").cast(pl.Float64, strict=False)
+    if volume_unit == "shares":
+        volume /= 100.0
+    return df.with_columns(volume.alias("volume"))
 
 
 class GenericHTTPProvider:
@@ -103,6 +125,14 @@ class GenericHTTPProvider:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
+        auth = self.config.auth
+        if auth.type not in _AUTH_TYPES:
+            errors.append(f"auth: unsupported type: {auth.type}")
+        elif auth.type != "none":
+            if not auth.token_env:
+                errors.append(f"auth: token_env is required for {auth.type}")
+            elif not _ENV_NAME_RE.fullmatch(auth.token_env):
+                errors.append("auth: token_env must be a valid environment variable name")
         for dataset, cfg in self.config.datasets.items():
             if not cfg.url:
                 errors.append(f"{dataset}: url is required")
@@ -113,11 +143,41 @@ class GenericHTTPProvider:
                 if missing:
                     errors.append(f"{dataset}: missing mapped fields: {', '.join(missing)}")
             if cfg.pct_unit is not None:
-                if dataset != "realtime":
-                    errors.append(f"{dataset}: pct_unit 仅用于 realtime 数据集")
+                if dataset not in {"realtime", "financial"}:
+                    errors.append(f"{dataset}: pct_unit 仅用于 realtime/financial 数据集")
                 elif cfg.pct_unit not in ("percent", "decimal"):
                     errors.append(f"{dataset}: pct_unit 必须是 percent 或 decimal")
-            if dataset != "realtime":
+            if (
+                dataset == "realtime"
+                and set(cfg.field_map.values()).intersection(_PCT_COLUMNS)
+                and cfg.pct_unit is None
+            ):
+                errors.append(
+                    "realtime: 映射比例字段时必须声明 pct_unit: percent 或 decimal"
+                )
+            if (
+                dataset == "financial"
+                and set(cfg.field_map.values()).intersection(_FINANCIAL_PCT_COLUMNS)
+                and cfg.pct_unit is None
+            ):
+                errors.append(
+                    "financial: 映射比例字段时必须声明 pct_unit: percent 或 decimal"
+                )
+            if "volume" in set(cfg.field_map.values()):
+                if cfg.volume_unit not in {"lots", "shares"}:
+                    errors.append(
+                        f"{dataset}: 映射 volume 时必须声明 volume_unit: lots 或 shares"
+                    )
+            elif cfg.volume_unit is not None:
+                errors.append(f"{dataset}: volume_unit 仅在映射 volume 时使用")
+            if dataset == "adj_factor":
+                if cfg.adj_factor_kind not in {"event_ratio", "cumulative"}:
+                    errors.append(
+                        "adj_factor: 必须声明 adj_factor_kind: event_ratio 或 cumulative"
+                    )
+            elif cfg.adj_factor_kind is not None:
+                errors.append(f"{dataset}: adj_factor_kind 仅用于 adj_factor 数据集")
+            if dataset not in {"realtime", "instruments"}:
                 request_params = [cfg.symbols_param, cfg.start_param, cfg.end_param]
                 if dataset in {"minute", "full_minute"}:
                     request_params.extend(
@@ -143,7 +203,7 @@ class GenericHTTPProvider:
                 return self._request_rows(
                     cfg, symbols=symbols, start_time=start_time, end_time=end_time
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 last = e
                 if attempt < retries:
                     time.sleep(1.0 * (attempt + 1))
@@ -157,6 +217,7 @@ class GenericHTTPProvider:
         end_time: datetime | None,
         asset_type: str = "stock",  # noqa: ARG002
         on_chunk_done=None,
+        failed_out: list[str] | None = None,
     ) -> pl.DataFrame:
         cfg = self._dataset("daily")
         frames: list[pl.DataFrame] = []
@@ -168,7 +229,7 @@ class GenericHTTPProvider:
                 rows = self._request_rows_retry(
                     cfg, chunk, start_time=start_time, end_time=end_time
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 # 单批失败只隔离该批 (#226): 之前任一批 502 会让整个 stage
                 # 抛异常, 已成功批次的结果留在内存里全部丢弃
                 failed.extend(chunk)
@@ -180,8 +241,11 @@ class GenericHTTPProvider:
                     on_chunk_done(i + 1, len(chunks))
                 continue
             df = self._mapped_frame(cfg, rows)
+            df = _normalize_volume_units(df, cfg.volume_unit, "daily")
             df = normalize_daily(df, source=self.name)
-            if not df.is_empty():
+            if df.is_empty():
+                failed.extend(chunk)
+            else:
                 frames.append(df)
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
@@ -190,6 +254,8 @@ class GenericHTTPProvider:
                 "custom daily: %d/%d symbols missing due to batch failures: %s",
                 len(failed), len(symbols), ", ".join(failed[:20]),
             )
+            if failed_out is not None:
+                failed_out.extend(failed)
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     def get_adj_factors(
@@ -199,6 +265,7 @@ class GenericHTTPProvider:
         end_time: datetime | None,
         asset_type: str = "stock",  # noqa: ARG002
         on_chunk_done=None,
+        failed_out: list[str] | None = None,
     ) -> pl.DataFrame:
         cfg = self._dataset("adj_factor")
         frames: list[pl.DataFrame] = []
@@ -208,9 +275,14 @@ class GenericHTTPProvider:
             sleep_between_batches(i, cfg.rpm)
             try:
                 rows = self._request_rows_retry(
-                    cfg, chunk, start_time=start_time, end_time=end_time
+                    cfg,
+                    chunk,
+                    # 累计因子的区间首行需要前一条基线才能求事件比。
+                    # 因此增量同步从源头拉全历史，换算后再截回请求区间。
+                    start_time=None if cfg.adj_factor_kind == "cumulative" else start_time,
+                    end_time=end_time,
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 failed.extend(chunk)
                 logger.warning(
                     "custom adj_factor: batch %d/%d failed (%d symbols), skipped: %s",
@@ -221,29 +293,64 @@ class GenericHTTPProvider:
                 continue
             df = self._mapped_frame(cfg, rows)
             df = normalize_adj_factors(df, source=self.name)
+            if not df.is_empty() and cfg.adj_factor_kind == "cumulative":
+                if start_time is not None:
+                    start_day = start_time.date()
+                    in_range_symbols = set(
+                        df.filter(pl.col("trade_date") >= start_day)["symbol"].to_list()
+                    )
+                    baseline_symbols = set(
+                        df.filter(pl.col("trade_date") < start_day)["symbol"].to_list()
+                    )
+                    missing_baseline = in_range_symbols - baseline_symbols
+                    if missing_baseline:
+                        logger.error(
+                            "custom adj_factor cumulative baseline missing for %s",
+                            sorted(missing_baseline)[:20],
+                        )
+                        failed.extend(sorted(missing_baseline))
+                        df = df.filter(~pl.col("symbol").is_in(list(missing_baseline)))
+                df = self._cumulative_to_event_ratios(df)
+                if start_time is not None:
+                    df = df.filter(pl.col("trade_date") >= start_time.date())
+                if end_time is not None:
+                    df = df.filter(pl.col("trade_date") <= end_time.date())
+            elif not df.is_empty() and cfg.adj_factor_kind != "event_ratio":
+                df = pl.DataFrame()
             if not df.is_empty():
                 frames.append(df)
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
         if failed:
+            failed = list(dict.fromkeys(failed))
             logger.warning(
                 "custom adj_factor: %d/%d symbols missing due to batch failures: %s",
                 len(failed), len(symbols), ", ".join(failed[:20]),
             )
+            if failed_out is not None:
+                failed_out.extend(failed)
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     def get_realtime(self) -> list[dict]:
         cfg = self._dataset("realtime")
         rows = self._request_rows(cfg)
         df = self._mapped_frame(cfg, rows)
-        # 单位归一: 显式 pct_unit 声明优先; 未声明时 amplitude/turnover_rate
-        # fail-closed 置 None(交下游重算), change_pct 保留截面判定
+        df = _normalize_volume_units(df, cfg.volume_unit, "realtime")
+        # 单位归一: 仅接受显式 pct_unit; 未声明时所有比例列 fail-closed 置 None。
         df = _normalize_pct_units(
             df,
             pct_unit=cfg.pct_unit,
-            transformed_cols=frozenset(cfg.transforms) & set(_PCT_COLUMNS),
         )
-        if df.is_empty():
+        if df.is_empty() or "timestamp" not in df.columns:
+            logger.warning("custom realtime missing timestamp; snapshot discarded")
+            return []
+        input_rows = df.height
+        df = df.with_columns(pl.col("timestamp").cast(pl.Int64, strict=False))
+        valid_rows = df.filter(
+            pl.col("timestamp").is_not_null() & (pl.col("timestamp") > 0)
+        ).height
+        if valid_rows != input_rows:
+            logger.warning("custom realtime contains invalid timestamp; snapshot discarded")
             return []
         return df.to_dicts()
 
@@ -270,7 +377,7 @@ class GenericHTTPProvider:
     def get_intraday_batch(
         self,
         symbols: list[str],
-        count: int = 300,  # noqa: ARG002 — 与插件契约对齐, YAML 源按时间窗口取全天
+        count: int = 300,
         asset_type: AssetType = "stock",
     ) -> pl.DataFrame:
         """全量分钟修复轮: 按当日窗口批量拉取 full_minute 数据集 (chunked + rpm 限速)。
@@ -279,9 +386,10 @@ class GenericHTTPProvider:
         传当日值。稳态增量 (get_intraday_latest) YAML 声明式源不提供 — 服务自动
         降级为仅修复轮模式并放慢节奏。
         """
-        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        now = cn_now()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         return self._fetch_minute_dataset(
-            "full_minute", symbols, start, datetime.now(), asset_type, "1m", None,
+            "full_minute", symbols, start, now, asset_type, "1m", None,
         )
 
     def _fetch_minute_dataset(
@@ -309,12 +417,27 @@ class GenericHTTPProvider:
                 override_params=override or None, override_body=override or None,
             )
             df = self._mapped_frame(cfg, rows)
+            df = _normalize_volume_units(df, cfg.volume_unit, ds_name)
             df = self._normalize_minute(df)
             if not df.is_empty():
                 frames.append(df)
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+    @staticmethod
+    def _cumulative_to_event_ratios(df: pl.DataFrame) -> pl.DataFrame:
+        """把按日期递增的累计因子转换为单次事件比值。"""
+        ordered = df.sort(["symbol", "trade_date"])
+        previous = pl.col("ex_factor").shift(1).over("symbol")
+        return ordered.with_columns(
+            pl.when(previous.is_null())
+            .then(1.0)
+            .when(previous > 0)
+            .then(pl.col("ex_factor") / previous)
+            .otherwise(None)
+            .alias("ex_factor")
+        ).drop_nulls(["symbol", "trade_date", "ex_factor"])
 
     def get_financials(
         self,
@@ -325,7 +448,8 @@ class GenericHTTPProvider:
         """拉取财务数据。table 包含四张财务报表及 shares 股本表。
 
         custom 源用一个 'financial' dataset 配置覆盖全部财务表; 请求时把 table 作为参数传给上游,
-        上游根据 table 返回对应数据。字段由数据源决定, 这里只确保有 symbol 列。
+        上游根据 table 返回对应数据。统一校验报告期、公告日和百分比单位，
+        不满足 point-in-time 契约的数据 fail-closed。
         """
         cfg = self._dataset("financial")
         frames: list[pl.DataFrame] = []
@@ -343,11 +467,87 @@ class GenericHTTPProvider:
                 override_params=extra_params, override_body=extra_body,
             )
             df = self._mapped_frame(cfg, rows)
+            df = self._normalize_financial(df, table, cfg.pct_unit)
             if not df.is_empty():
                 frames.append(df)
         if not frames:
             return pl.DataFrame()
         return pl.concat(frames, how="diagonal_relaxed")
+
+    def get_instruments(self, asset_type: str = "stock") -> list[dict]:
+        """拉取标的维表，供日 K 自定义源在无 TickFlow 时建立股票池。"""
+        cfg = self._dataset("instruments")
+        override: dict[str, Any] = {}
+        if cfg.asset_type_param:
+            override[cfg.asset_type_param] = asset_type
+        rows = self._request_rows(
+            cfg,
+            override_params=override or None,
+            override_body=override or None,
+        )
+        frame = self._mapped_frame(cfg, rows)
+        if frame.is_empty() or "symbol" not in frame.columns:
+            return []
+        keep = [
+            column
+            for column in (
+                "symbol", "name", "code", "exchange", "region", "type",
+                "listing_date", "total_shares", "float_shares", "tick_size",
+                "limit_up", "limit_down",
+            )
+            if column in frame.columns
+        ]
+        return frame.select(keep).drop_nulls(["symbol"]).to_dicts()
+
+    @staticmethod
+    def _normalize_financial(
+        df: pl.DataFrame,
+        table: str,
+        pct_unit: str | None,
+    ) -> pl.DataFrame:
+        if df.is_empty():
+            return df
+        required = {"symbol", "period_end", "announce_date"}
+        if not required.issubset(df.columns):
+            logger.error(
+                "custom financial %s missing PIT columns: %s",
+                table,
+                sorted(required - set(df.columns)),
+            )
+            return pl.DataFrame()
+        frame = df.with_columns(
+            pl.col("symbol").cast(pl.Utf8, strict=False),
+            pl.col("period_end")
+            .cast(pl.Utf8, strict=False)
+            .str.slice(0, 10)
+            .str.to_date(strict=False),
+            pl.col("announce_date")
+            .cast(pl.Utf8, strict=False)
+            .str.slice(0, 10)
+            .str.to_date(strict=False),
+        ).drop_nulls(["symbol", "period_end", "announce_date"])
+        pct_columns = [
+            column for column in _FINANCIAL_PCT_COLUMNS if column in frame.columns
+        ]
+        if pct_columns and pct_unit is None:
+            logger.error(
+                "custom financial %s has percentage columns without pct_unit", table
+            )
+            return pl.DataFrame()
+        expressions = []
+        for column in pct_columns:
+            value = pl.col(column).cast(pl.Float64, strict=False)
+            if pct_unit == "decimal":
+                value *= 100.0
+            expressions.append(value.alias(column))
+        for column in ("bps",):
+            if column in frame.columns:
+                expressions.append(
+                    pl.col(column).cast(pl.Float64, strict=False).alias(column)
+                )
+        if expressions:
+            frame = frame.with_columns(expressions)
+        return frame
 
     @classmethod
     def _normalize_minute(cls, df: pl.DataFrame) -> pl.DataFrame:
@@ -385,28 +585,28 @@ class GenericHTTPProvider:
                     s.str.to_datetime(strict=False, format=fmt)
                     if fmt else s.str.to_datetime(strict=False)
                 )
-            except Exception:  # noqa: BLE001 — 该格式不适用, 换下一个
+            except Exception:
                 continue
         return pl.Series("datetime", [None] * s.len(), dtype=pl.Datetime("us"))
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         cfg = self._dataset(dataset)
         test_symbols = symbols or ["000001.SZ"]
-        end_time = datetime.now()
+        end_time = cn_now()
         start_time = end_time - timedelta(days=7)
         if dataset == "realtime":
             rows = self._request_rows(cfg)
-        elif dataset in {"minute", "full_minute"}:
+        elif dataset in {"minute", "full_minute", "instruments"}:
             override: dict[str, Any] = {}
             if cfg.asset_type_param:
                 override[cfg.asset_type_param] = "stock"
-            if cfg.freq_param:
+            if dataset in {"minute", "full_minute"} and cfg.freq_param:
                 override[cfg.freq_param] = "1m"
             rows = self._request_rows(
                 cfg,
-                symbols=test_symbols,
-                start_time=start_time,
-                end_time=end_time,
+                symbols=test_symbols if dataset != "instruments" else None,
+                start_time=start_time if dataset != "instruments" else None,
+                end_time=end_time if dataset != "instruments" else None,
                 override_params=override or None,
                 override_body=override or None,
             )
@@ -475,25 +675,38 @@ class GenericHTTPProvider:
         else:
             request_kwargs["params"] = auth_params
             request_kwargs["json"] = body
-        resp = self._client.request(method, cfg.url, **request_kwargs)
-        resp.raise_for_status()
+        try:
+            resp = self._client.request(method, cfg.url, **request_kwargs)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            raise RuntimeError(
+                f"custom data source request failed: HTTP {status}"
+            ) from None
+        except httpx.HTTPError:
+            # httpx 异常常带完整 request URL；query auth 会把 token 放在 URL 中，
+            # 因此跨日志/API 边界只传固定脱敏说明。
+            raise RuntimeError("custom data source request failed: network error") from None
         return extract_rows(resp.json(), cfg.response_path)
 
     def _auth_parts(self) -> tuple[dict[str, str], dict[str, str]]:
         auth = self.config.auth
         if auth.type == "none":
             return {}, {}
-        token = _token_from_env(auth.token_env) if auth.token_env else None
+        if auth.type not in _AUTH_TYPES:
+            raise RuntimeError(f"custom data source {self.name} has unsupported auth type")
+        if not auth.token_env or not _ENV_NAME_RE.fullmatch(auth.token_env):
+            raise RuntimeError(f"custom data source {self.name} auth token_env is invalid")
+        token = _token_from_env(auth.token_env)
         if not token:
-            logger.warning("custom data source %s auth token is not set", self.name)
-            return {}, {}
+            raise RuntimeError(f"custom data source {self.name} auth token is not set")
         if auth.type == "bearer":
             return {auth.header: f"Bearer {token}"}, {}
         if auth.type == "header":
             return {auth.header: token}, {}
         if auth.type == "query":
             return {}, {auth.param: token}
-        return {}, {}
+        raise RuntimeError(f"custom data source {self.name} has unsupported auth type")
 
 
 def _token_from_env(name: str | None) -> str | None:

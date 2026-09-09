@@ -127,6 +127,81 @@ def test_scoring_bridge_custom_materializes(cleanup_registry) -> None:
     assert day["uf_rank_close"].is_not_null().all()
 
 
+def test_composite_recursively_materializes_custom_and_nested_members(
+    cleanup_registry,
+) -> None:
+    """复合因子必须按拓扑顺序先算 custom 与内层 composite。"""
+    definitions = [
+        {
+            "id": "uf_nested_close",
+            "kind": "custom",
+            "version": 1,
+            "label": "自定义价格",
+            "formula": "rank(close)",
+            "status": "draft",
+        },
+        {
+            "id": "cf_nested_inner",
+            "kind": "composite",
+            "version": 1,
+            "label": "内层组合",
+            "members": {"uf_nested_close": 1.0, "volume": 1.0},
+            "status": "draft",
+        },
+        {
+            "id": "cf_nested_outer",
+            "kind": "composite",
+            "version": 1,
+            "label": "外层组合",
+            "members": {"cf_nested_inner": 1.0, "amount": 1.0},
+            "status": "draft",
+        },
+    ]
+    for definition in definitions:
+        store.register_definition(definition)
+        cleanup_registry.add(definition["id"])
+
+    frame = scoring.materialize_scoring_columns(_panel(), {"cf_nested_outer"})
+
+    assert {
+        "uf_nested_close",
+        "cf_nested_inner",
+        "cf_nested_outer",
+    }.issubset(frame.columns)
+    assert frame["cf_nested_outer"].is_not_null().any()
+
+
+def test_custom_and_composite_propagate_financial_asset_and_pit_scope(
+    cleanup_registry,
+) -> None:
+    custom = store.register_definition({
+        "id": "uf_financial_scope",
+        "kind": "custom",
+        "version": 1,
+        "label": "财务派生",
+        "formula": "roe_latest + pb_latest",
+        "status": "draft",
+    })
+    cleanup_registry.add(custom.id)
+    composite = store.register_definition({
+        "id": "cf_financial_scope",
+        "kind": "composite",
+        "version": 1,
+        "label": "财务组合",
+        "members": {"uf_financial_scope": 1.0, "close": 1.0},
+        "status": "draft",
+    })
+    cleanup_registry.add(composite.id)
+
+    for spec in (custom, composite):
+        assert spec.asset_types == frozenset({"stock"})
+        assert spec.pit is True
+        assert spec.pit_source == "financial_announce"
+    etf_ids = {spec.id for spec in all_factors(asset_type="etf")}
+    assert custom.id not in etf_ids
+    assert composite.id not in etf_ids
+
+
 def test_load_into_registry_isolated_failure(tmp_path, cleanup_registry) -> None:
     good = {
         "id": "uf_good", "kind": "custom", "version": 1, "label": "好因子",
@@ -139,6 +214,38 @@ def test_load_into_registry_isolated_failure(tmp_path, cleanup_registry) -> None
     loaded = store.load_into_registry(tmp_path)
     assert loaded == ["uf_good"]
     cleanup_registry.add("uf_good")
+
+
+def test_load_into_registry_restores_composite_chain_deeper_than_three_rounds(
+    tmp_path, cleanup_registry,
+) -> None:
+    """合法深层组合链重启后应持续重试到全部注册。"""
+    definitions = [{
+        "id": "uf_deep_leaf",
+        "kind": "custom",
+        "version": 1,
+        "label": "深层叶子",
+        "formula": "close",
+        "status": "draft",
+    }]
+    for depth in reversed(range(5)):
+        child = "uf_deep_leaf" if depth == 4 else f"cf_deep_{depth + 1}"
+        definitions.append({
+            "id": f"cf_deep_{depth}",
+            "kind": "composite",
+            "version": 1,
+            "label": f"深层组合 {depth}",
+            "members": {child: 1.0, "volume": 1.0},
+            "status": "draft",
+        })
+    for definition in definitions:
+        store.save_one(tmp_path, definition)
+        cleanup_registry.add(definition["id"])
+
+    loaded = store.load_into_registry(tmp_path)
+
+    assert set(loaded) == {definition["id"] for definition in definitions}
+    assert get_factor("cf_deep_0") is not None
 
 
 def test_unregister_builtin_rejected() -> None:

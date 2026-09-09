@@ -4,7 +4,7 @@
 - 连续竞价时段判定 (含边界)
 - 门控链: 开关关闭 / 能力缺失 / 时段外 / 放行 (自定义源与 TickFlow 统一口径)
 - 数据源路由: full_minute 偏好 → 自定义源 (get_intraday_batch / get_intraday_latest /
-  get_minute 回退) 或降级 TickFlow; 仅修复轮源 60s 节奏下限
+  get_minute 回退)；显式源不可用时停止，不越界调用 TickFlow；仅修复轮源 60s 节奏下限
 - 单轮: mock 边界层脉冲 + 落盘, 校验状态字段与 universe 来源
 - 偏好读写: 默认关闭、间隔 clamp [3, 120]
 - API: /minute-refresh/status 无服务时 available=false
@@ -14,7 +14,11 @@ monkeypatch 替换; 自定义源侧用内存 fake provider 走真实边界包装
 """
 from __future__ import annotations
 
+import asyncio
+from contextlib import nullcontext
 from datetime import datetime
+from threading import Event, Lock, Thread
+from types import SimpleNamespace
 
 import polars as pl
 
@@ -50,9 +54,14 @@ class _FakeRepo:
         from pathlib import Path
         self._inst = pl.DataFrame({"symbol": symbols})
         self.store = type("S", (), {"data_dir": Path(".")})()
+        self._write_lock = Lock()
+        self._minute_generation = 0
 
     def get_instruments(self) -> pl.DataFrame:
         return self._inst
+
+    def execute_one(self, query: str):
+        return (0,)
 
 
 # ── 时段判定 ────────────────────────────────────────────────────────
@@ -82,9 +91,14 @@ def _svc(tmp_path, monkeypatch, *, enabled=True, capability=True, in_hours=True,
         preferences, "get_full_minute_data_provider", lambda: full_minute_provider,
     )
     if custom is not None:
+        monkeypatch.setattr("app.data_providers.custom.registry_generation", lambda: 1)
         monkeypatch.setattr(
             "app.services.kline_sync._resolve_full_minute_provider",
-            lambda name: (custom, False, None),
+            lambda name: (True, False, None),
+        )
+        monkeypatch.setattr(
+            "app.data_providers.custom.lease_provider",
+            lambda name: nullcontext((custom, 1)),
         )
     svc = MinuteRefreshService(_FakeRepo(["600000.SH"]))
     svc.set_app_state(_FakeAppState(capability))
@@ -102,7 +116,7 @@ def test_gate_disabled(tmp_path, monkeypatch):
 
 def test_gate_full_minute_custom_provider_runs(tmp_path, monkeypatch):
     """全量分钟路由到自定义源: 不再让位 — 能力口径统一 (capset 增广后放行)。"""
-    class _P:  # noqa: D401 — fake provider
+    class _P:
         def get_intraday_batch(self, symbols, count=300, asset_type="stock"):
             return pl.DataFrame()
     svc = _svc(tmp_path, monkeypatch, full_minute_provider="myfm", custom=_P())
@@ -369,9 +383,8 @@ def test_custom_provider_latest_missing_forces_full_with_minute_fallback(tmp_pat
     assert svc._effective_interval() == 60
 
 
-def test_custom_provider_unresolved_degrades_to_tickflow(tmp_path, monkeypatch):
-    """路由指向未声明 full_minute 数据集的源 (真实 resolver 判定) → 降级
-    TickFlow 路径, 门控口径不变。"""
+def test_custom_provider_unresolved_is_gated_without_tickflow(tmp_path, monkeypatch):
+    """显式 full_minute 源不可用时停止，禁止越界调用 TickFlow。"""
     svc = _svc(tmp_path, monkeypatch, full_minute_provider="not-registered")
     monkeypatch.setattr(
         minute_refresh.MinuteRefreshService, "_today_coverage_lag_minutes",
@@ -387,11 +400,111 @@ def test_custom_provider_unresolved_degrades_to_tickflow(tmp_path, monkeypatch):
         "app.services.kline_sync.fetch_intraday_full_market_burst",
         lambda symbols, capset, *, count=300: (modes.append("tf-full"), (_full_df(), 28))[1],
     )
+    assert svc._gate_reason() == "provider_error"
     svc._run_round()
-    assert modes == ["tf-inc"]
+    assert modes == []
     st = svc.status()
-    assert st["provider_effective"] == "tickflow"
-    assert st["last_mode"] == "increment"
+    assert st["provider_effective"] == "not-registered"
+    assert st["last_error"] == "full_minute provider unavailable: not-registered"
+    assert svc.trigger_manual_round() == {"ok": False, "reason": "provider_error"}
+
+
+def test_refresh_and_manual_minute_writes_share_repository_lock(tmp_path, monkeypatch):
+    """后台刷新与手动分钟写并发时，分区 RMW 不得互相覆盖丢行。"""
+    svc = _svc(tmp_path, monkeypatch)
+    repo = _FakeRepo(["600000.SH"])
+    repo.store.data_dir = tmp_path
+    svc.set_repo(repo)
+    started = Event()
+    release = Event()
+    background = _bars_for_concurrency("600000.SH", 9, 31)
+    manual = _bars_for_concurrency("000001.SZ", 9, 32)
+
+    def fake_burst(symbols, capset, *, count=300):
+        started.set()
+        assert release.wait(2)
+        return background, 1
+
+    monkeypatch.setattr(
+        minute_refresh.MinuteRefreshService,
+        "_today_coverage_lag_minutes",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "app.services.kline_sync.fetch_intraday_full_market_burst", fake_burst,
+    )
+    worker = Thread(target=svc._run_round)
+    worker.start()
+    assert started.wait(2)
+    from app.services import kline_sync
+    with repo._write_lock:
+        kline_sync._write_minute_partition(manual, tmp_path / "kline_minute")
+    release.set()
+    worker.join(2)
+
+    saved = pl.read_parquet(
+        tmp_path / "kline_minute" / "date=2026-08-25" / "part.parquet"
+    )
+    assert set(saved["symbol"].to_list()) == {"600000.SH", "000001.SZ"}
+
+
+def test_clear_minute_invalidates_inflight_refresh(tmp_path, monkeypatch):
+    """清空完成后，清空前已开始的后台取数不得复活分钟分区。"""
+    from app.api import data as data_api
+    from app.api import kline as kline_api
+
+    svc = _svc(tmp_path, monkeypatch)
+    repo = _FakeRepo(["600000.SH"])
+    repo.store.data_dir = tmp_path
+    svc.set_repo(repo)
+    started = Event()
+    release = Event()
+
+    def fake_burst(symbols, capset, *, count=300):
+        started.set()
+        assert release.wait(2)
+        return _bars_for_concurrency("600000.SH", 9, 31), 1
+
+    monkeypatch.setattr(
+        minute_refresh.MinuteRefreshService,
+        "_today_coverage_lag_minutes",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        "app.services.kline_sync.fetch_intraday_full_market_burst", fake_burst,
+    )
+    monkeypatch.setattr("app.jobs.daily_pipeline._refresh_single_view", lambda *a: None)
+    monkeypatch.setattr(data_api, "invalidate_storage_cache", lambda: None)
+
+    worker = Thread(target=svc._run_round)
+    worker.start()
+    assert started.wait(2)
+
+    request = SimpleNamespace(
+        method="POST",
+        json=lambda: None,
+        app=SimpleNamespace(state=SimpleNamespace(repo=repo)),
+    )
+
+    async def payload():
+        return {"confirm": True}
+
+    request.json = payload
+    assert asyncio.run(kline_api.clear_minute(request))["status"] == "ok"
+    release.set()
+    worker.join(2)
+
+    assert not (tmp_path / "kline_minute").exists()
+    assert svc.status()["last_error"] == "minute data cleared while refresh was in flight"
+
+
+def _bars_for_concurrency(symbol: str, hour: int, minute: int) -> pl.DataFrame:
+    return pl.DataFrame({
+        "symbol": [symbol],
+        "datetime": [datetime(2026, 8, 25, hour, minute)],
+        "open": [10.0], "high": [10.1], "low": [9.9], "close": [10.0],
+        "volume": [100.0], "amount": [1000.0],
+    })
 
 
 def test_status_reports_gate_reason_when_stopped(tmp_path, monkeypatch):

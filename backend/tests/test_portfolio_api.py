@@ -351,6 +351,63 @@ def test_price_monitor_save_and_position_cleanup_share_rule_lock(
     assert client.app.state.monitor_engine.rules == []
 
 
+def test_price_monitor_rejects_client_asset_type_mismatch(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+
+    response = client.put(
+        "/api/portfolio/positions/510300.SH/price-monitor",
+        json={
+            "name": "沪深300ETF",
+            "asset_type": "stock",
+            "stop_loss_price": 3.8,
+        },
+    )
+
+    assert response.status_code == 422
+    assert monitor_rules.load_all(tmp_path) == []
+
+
+def test_price_monitor_second_rule_failure_restores_previous_pair(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    path_root = tmp_path / "user_data" / "monitor_rules"
+    payload = {
+        "name": "贵州茅台",
+        "asset_type": "stock",
+        "stop_loss_price": 1450,
+        "add_position_price": 1500,
+    }
+    assert client.put(
+        "/api/portfolio/positions/600519.SH/price-monitor", json=payload,
+    ).status_code == 200
+    paths = (
+        path_root / "pf_stop_600519_sh.json",
+        path_root / "pf_add_600519_sh.json",
+    )
+    before = {path: path.read_bytes() for path in paths}
+    original_save = monitor_rules.save_one
+
+    def _fail_add(data_dir, rule):
+        if rule["id"] == "pf_add_600519_sh":
+            raise OSError("injected second rule failure")
+        original_save(data_dir, rule)
+
+    monkeypatch.setattr(monitor_rules, "save_one", _fail_add)
+    response = client.put(
+        "/api/portfolio/positions/600519.SH/price-monitor",
+        json={**payload, "stop_loss_price": 1400, "add_position_price": 1480},
+    )
+
+    assert response.status_code == 500
+    assert {path: path.read_bytes() for path in paths} == before
+    assert {
+        rule["id"]: rule["conditions"][0]["value"]
+        for rule in client.app.state.monitor_engine.rules
+    } == {
+        "pf_stop_600519_sh": 1450.0,
+        "pf_add_600519_sh": 1500.0,
+    }
+
+
 def test_engine_snapshot_reload_and_position_cleanup_share_rule_lock(
     tmp_path, monkeypatch
 ):
@@ -784,7 +841,7 @@ def test_trade_mutation_guard_prevents_buy_during_closed_rule_cleanup(
     assert monitor_rules.load_one(tmp_path, "concurrent_reentry") is None
 
 
-def test_partial_rule_cleanup_failure_still_syncs_successful_changes(
+def test_partial_rule_cleanup_failure_rolls_back_all_rule_changes(
     tmp_path, monkeypatch
 ):
     client = make_client(tmp_path, monkeypatch)
@@ -820,9 +877,13 @@ def test_partial_rule_cleanup_failure_still_syncs_successful_changes(
     )
 
     assert response.status_code == 201
-    assert [rule["id"] for rule in monitor_rules.load_all(tmp_path)] == ["cleanup_b"]
+    assert [rule["id"] for rule in monitor_rules.load_all(tmp_path)] == [
+        "cleanup_a",
+        "cleanup_b",
+    ]
     assert [rule["id"] for rule in client.app.state.monitor_engine.rules] == [
-        "cleanup_b"
+        "cleanup_a",
+        "cleanup_b",
     ]
 
 
@@ -927,15 +988,30 @@ def test_statement_closing_position_removes_symbol_rules(tmp_path, monkeypatch):
 def test_statement_cleanup_failure_does_not_report_persisted_trade_as_failed(
     tmp_path, monkeypatch
 ):
+    from app.api import portfolio as portfolio_api
+
     client = make_client(tmp_path, monkeypatch)
     account = create_account(client, "主账户")
     upsert_position(client, account["id"], "600519.SH", quantity=100, average_cost=1500)
     save_symbol_rule(tmp_path, rule_id="statement_target", symbols=["600519.SH"])
 
-    def fail_cleanup(_data_dir, _symbols):
-        raise OSError("simulated cleanup failure")
+    original_cleanup = monitor_rules.delete_for_symbols
+    cleanup_recovered = threading.Event()
+    attempts = 0
 
-    monkeypatch.setattr(monitor_rules, "delete_for_symbols", fail_cleanup)
+    def fail_cleanup_once(data_dir, symbols):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("simulated cleanup failure")
+        result = original_cleanup(data_dir, symbols)
+        cleanup_recovered.set()
+        return result
+
+    monkeypatch.setattr(monitor_rules, "delete_for_symbols", fail_cleanup_once)
+    monkeypatch.setattr(
+        portfolio_api, "_MONITOR_ENGINE_SYNC_RETRY_INITIAL_SECONDS", 0.01
+    )
     response = client.post(
         "/api/portfolio/statement-commit",
         json={
@@ -961,6 +1037,11 @@ def test_statement_cleanup_failure_does_not_report_persisted_trade_as_failed(
     ).json()["items"]
     assert len(trades) == 2
     assert [trade["side"] for trade in trades] == ["sell", "buy"]
+    assert cleanup_recovered.wait(timeout=1)
+    assert monitor_rules.load_all(tmp_path) == []
+    assert client.app.state.monitor_engine.rules == []
+    assert attempts == 2
+    portfolio_api.stop_monitor_engine_sync_retry(client.app)
 
 
 def test_statement_engine_sync_failure_returns_success_and_recovers_runtime_rules(
@@ -1076,6 +1157,62 @@ def test_monitor_engine_sync_retry_hands_off_new_generation_atomically(
         assert sync_attempts == 2
     finally:
         release_first_worker.set()
+        portfolio_api.stop_monitor_engine_sync_retry(client.app)
+
+
+def test_monitor_cleanup_retry_preserves_rule_after_position_reentry(
+    tmp_path, monkeypatch
+):
+    """重试复检与交易共用锁；重买先提交时必须保留证券规则。"""
+    from app.api import portfolio as portfolio_api
+
+    client = make_client(tmp_path, monkeypatch)
+    account = create_account(client, "主账户")
+    rule = save_symbol_rule(
+        tmp_path,
+        rule_id="retry_reentry",
+        symbols=["600519.SH"],
+    )
+    client.app.state.monitor_engine.set_rules([rule])
+    request = SimpleNamespace(app=client.app)
+    sync_completed = threading.Event()
+    original_sync = portfolio_api.sync_engine
+
+    def capture_sync(req):
+        original_sync(req)
+        sync_completed.set()
+
+    monkeypatch.setattr(portfolio_api, "sync_engine", capture_sync)
+    monkeypatch.setattr(
+        portfolio_api,
+        "_MONITOR_ENGINE_SYNC_RETRY_INITIAL_SECONDS",
+        0.001,
+    )
+    try:
+        # 先占住交易锁启动重试，再在同一线程重入锁提交买入；重试只能在
+        # 买入提交后复检持仓，不能使用更早的“未持有”判断删除规则。
+        with portfolio_service.mutation_guard():
+            portfolio_api._schedule_monitor_engine_sync_retry(
+                request,
+                {"600519.SH"},
+            )
+            portfolio_service.record_trade(
+                client.app.state.repo,
+                account_id=account["id"],
+                symbol="600519.SH",
+                trade_date=date(2026, 8, 1),
+                side="buy",
+                quantity=100,
+                price=1590,
+                fee=0,
+                tax=0,
+            )
+
+        assert sync_completed.wait(timeout=1)
+        assert portfolio_service.held_symbols() == {"600519.SH"}
+        assert monitor_rules.load_one(tmp_path, "retry_reentry") is not None
+        assert client.app.state.monitor_engine.rules[0]["id"] == "retry_reentry"
+    finally:
         portfolio_api.stop_monitor_engine_sync_retry(client.app)
 
 

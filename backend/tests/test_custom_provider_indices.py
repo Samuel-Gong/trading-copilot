@@ -9,8 +9,11 @@ get_realtime_indices(symbols) 补拉指数 — A 股快照普遍不含指数
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
+from datetime import date
 from types import SimpleNamespace
 from typing import ClassVar
+from unittest.mock import MagicMock
 
 import polars as pl
 
@@ -64,7 +67,12 @@ def _service_with_provider(
     import app.data_providers.custom as custom_mod
 
     monkeypatch.setattr(custom_mod, "provider_has_dataset", lambda name, dataset: dataset == "realtime")
-    monkeypatch.setattr(custom_mod, "get_provider", lambda name: provider)
+    monkeypatch.setattr(custom_mod, "registry_generation", lambda: 1)
+    monkeypatch.setattr(
+        custom_mod,
+        "lease_provider",
+        lambda _name: nullcontext((provider, 1)),
+    )
     monkeypatch.setattr(
         service, "_process_full_market_records",
         lambda records, *, t0, now_ts, replace_index_cache=True, final_boundary_ms=None: (
@@ -156,6 +164,34 @@ def test_custom_provider_successful_empty_index_fetch_replaces_cache(monkeypatch
     assert replacements == [True]
 
 
+def test_empty_custom_snapshot_never_writes_authoritative_daily(monkeypatch):
+    """provider 因时间戳校验拒绝整批后，不得覆盖任何当日分区。"""
+    import app.data_providers.custom as custom_mod
+    from app.services import preferences as prefs_mod
+
+    class _RejectedSnapshot:
+        def get_realtime(self) -> list[dict]:
+            return []
+
+    service = qs.QuoteService()
+    service._repo = MagicMock()
+    service._repo.get_index_symbol_set.return_value = set()
+    service._repo.get_etf_instruments.return_value = pl.DataFrame()
+    monkeypatch.setattr(prefs_mod, "get_realtime_data_provider", lambda: "custom")
+    monkeypatch.setattr(custom_mod, "provider_has_dataset", lambda *_args: True)
+    monkeypatch.setattr(
+        custom_mod,
+        "lease_provider",
+        lambda _name: nullcontext((_RejectedSnapshot(), 1)),
+    )
+
+    service._fetch_full_market_quotes()
+
+    service._repo.flush_live_daily.assert_not_called()
+    service._repo.flush_live_daily_asset.assert_not_called()
+    service._repo.merge_live_daily_asset.assert_not_called()
+
+
 def _disable_record_processing_side_effects(monkeypatch, service: qs.QuoteService) -> None:
     monkeypatch.setattr(qs, "_persist_last_fetch", lambda fetched_at: None)
     monkeypatch.setattr(service, "_update_volume_delta", lambda records, fetched_at: None)
@@ -168,6 +204,7 @@ def test_failed_index_refresh_keeps_last_known_good_cache(monkeypatch):
     _disable_record_processing_side_effects(monkeypatch, service)
     cached = service._build_index_quotes([_index_rec("000001.SH")])
     service._index_quotes_cache = cached
+    service._index_quotes_date = qs.cn_today()
     service._index_symbol_count = cached.height
 
     service._process_full_market_records(
@@ -185,6 +222,7 @@ def test_successful_empty_index_refresh_clears_cache(monkeypatch):
     service = qs.QuoteService()
     _disable_record_processing_side_effects(monkeypatch, service)
     service._index_quotes_cache = service._build_index_quotes([_index_rec("000001.SH")])
+    service._index_quotes_date = qs.cn_today()
     service._index_symbol_count = 1
 
     service._process_full_market_records(
@@ -195,6 +233,43 @@ def test_successful_empty_index_refresh_clears_cache(monkeypatch):
 
     assert service._index_symbol_count == 0
     assert service.get_index_quotes().is_empty()
+
+
+def test_failed_index_refresh_drops_previous_day_cache(monkeypatch):
+    """指数端点失败时只允许沿用同一交易日缓存，禁止跨日展示旧快照。"""
+    service = qs.QuoteService()
+    _disable_record_processing_side_effects(monkeypatch, service)
+    today = date(2026, 9, 7)
+    monkeypatch.setattr(qs, "cn_today", lambda: today)
+    service._index_quotes_cache = service._build_index_quotes([_index_rec("000001.SH")])
+    service._index_quotes_date = date(2026, 9, 4)
+    service._index_symbol_count = 1
+
+    service._process_full_market_records(
+        [_stock_rec()],
+        t0=time.perf_counter(),
+        now_ts=time.perf_counter(),
+        replace_index_cache=False,
+    )
+
+    assert service._index_symbol_count == 0
+    assert service.get_index_quotes().is_empty()
+
+
+def test_explicit_invalid_custom_realtime_never_calls_tickflow(monkeypatch):
+    """显式自定义实时源失效时 fail-closed，不越界使用 TickFlow Key。"""
+    import app.data_providers.custom as custom_mod
+    from app.services import preferences as prefs_mod
+
+    service = qs.QuoteService()
+    monkeypatch.setattr(prefs_mod, "get_realtime_data_provider", lambda: "broken")
+    monkeypatch.setattr(custom_mod, "provider_has_dataset", lambda name, dataset: False)
+    paid_client = MagicMock()
+    monkeypatch.setattr("app.tickflow.client.get_paid_realtime_client", paid_client)
+
+    service._fetch_full_market_quotes()
+
+    paid_client.assert_not_called()
 
 
 # ---- 监控分时注入: 全量分钟健康时股票读本地分区 ----
@@ -217,7 +292,6 @@ def _injection_env(monkeypatch, *, healthy, local_df, asset_type="stock", symbol
     api_calls: list[list[str]] = []
     monkeypatch.setattr(
         qsm, "_noop", qsm.__dict__.get("_noop", None), raising=False)  # 占位无操作
-    from app.services.kline_sync import intraday_monitor_support
     monkeypatch.setattr(
         "app.services.quote_service.logger", qsm.logger, raising=False)
     # 打桩 API 拉取路径 (健康时不应被调)
@@ -255,7 +329,7 @@ def test_intraday_signals_read_local_when_healthy(monkeypatch):
 
 def test_intraday_signals_fall_back_to_api_when_unhealthy(monkeypatch):
     """不健康 (服务关/挂) 时回落原 API 拉取路径。"""
-    service, engine, api_calls, captured = _injection_env(monkeypatch, healthy=False, local_df=pl.DataFrame())
+    service, engine, api_calls, _captured = _injection_env(monkeypatch, healthy=False, local_df=pl.DataFrame())
     enriched = pl.DataFrame({"symbol": ["600519.SH"], "close": [100.5]})
     service._inject_intraday_signals(enriched, engine, asset_type="stock")
     assert api_calls == [["600519.SH"]]  # 走了 API
@@ -263,7 +337,7 @@ def test_intraday_signals_fall_back_to_api_when_unhealthy(monkeypatch):
 
 def test_intraday_signals_etf_never_reads_local(monkeypatch):
     """ETF 不在全量分钟 universe: 即使健康也走 API 路径。"""
-    service, engine, api_calls, captured = _injection_env(
+    service, engine, api_calls, _captured = _injection_env(
         monkeypatch, healthy=True, local_df=pl.DataFrame(), asset_type="etf", symbols={"510300.SH"})
     enriched = pl.DataFrame({"symbol": ["510300.SH"], "close": [4.0]})
     service._inject_intraday_signals(enriched, engine, asset_type="etf")

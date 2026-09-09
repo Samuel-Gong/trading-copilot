@@ -875,6 +875,11 @@ class StrategyEngine:
                 "update_count": int(entry.buffer.update_count),
             }
 
+    def invalidate_realtime_matrices(self) -> None:
+        """因子或其他外部计算定义变更后丢弃已准备的实时矩阵。"""
+        with self._realtime_matrix_lock:
+            self._realtime_matrices.clear()
+
     # ================================================================
     # 执行
     # ================================================================
@@ -962,6 +967,12 @@ class StrategyEngine:
                 df = s.filter_minute_history_fn(history, params, daily=context.daily_history)
             else:
                 df = s.filter_minute_history_fn(history, params)
+            if df.is_empty():
+                return StrategyResult(
+                    as_of=as_of,
+                    strategy_id=strategy_id,
+                    exit_signal_hits=exit_signal_hits,
+                )
             # 基础过滤/展示列 (name/total_shares/change_pct 等) 来自 enriched 快照,
             # 在命中结果上事后联表, 避免把 enriched 列铺到全市场分钟行上。
             if current is not None and not current.is_empty():
@@ -989,7 +1000,10 @@ class StrategyEngine:
                     + ", ".join(sorted(missing_csg))
                     + " — 请先在「自定义信号」管理中创建对应信号后再运行"
                 )
-            df = s.filter_history_fn(df, params)
+            from app.strategy._market_data_runtime import execution_as_of
+
+            with execution_as_of(as_of):
+                df = s.filter_history_fn(df, params)
             if "date" in df.columns:
                 df = df.filter(pl.col("date") == as_of)
         else:

@@ -3,14 +3,18 @@
 与实盘选股 (ScreenerService 1m context) 走同一条 StrategyEngine.run 执行路径,
 消除回测/实盘偏差。语义铁律:
 
-- 分钟侧: 传入当日全量分钟分区, 策略函数自身因果 (第 m 根只用 <=m 的K线);
+- 分钟侧: 先以整日数据向量化产生候选，再对每个候选时点用 <=m 的 K 线前缀复验；
+  首次命中后锁定，返回行不得把午后判定回填成早盘成交;
 - 日线侧: T 日的日线条件窗口只含 T-1 及更早的完成态日K — 与实盘盘中行为一致
   (当日成形K不进窗口), 杜绝未来函数;
+- 分钟分区 datetime 遵循仓库契约: 北京墙钟 naive; 仅外部传入 tz-aware 值时
+  才转换为北京时间;
 - 按交易日精确对日: 缺分钟分区的日子显式跳过, 不做"回退最近分区" (那是实盘语义)。
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -20,6 +24,8 @@ import polars as pl
 
 from app.price_limits import is_risk_warning_name, price_limit_pct
 from app.strategy.engine import StrategyDataContext, StrategyDef, StrategyEngine
+
+logger = logging.getLogger(__name__)
 
 # 日线面板列: 基础行情 + 涨停/炸板信号 (策略日线窗口契约) + 基础过滤/展示列。
 # raw_close 用于涨停价计算 (分钟价是未复权真实价, 涨停规则定义在原始价上)。
@@ -69,16 +75,14 @@ def minute_panel_start(start: date, daily_bars: int) -> date:
 def _trigger_hhmm(value) -> str:
     """从 last_datetime 提取北京时间 "HH:MM" 触发分钟。
 
-    分区 datetime 为 UTC 存储 (tz-aware 或 naive-UTC), 统一折算到北京时区。
+    分区 datetime 为北京墙钟 naive; tz-aware 输入才按时区折算。
     """
     from app.market_time import CN_TZ
 
     if hasattr(value, "astimezone"):
-        if value.tzinfo is None:
-            from datetime import timezone
-
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(CN_TZ).strftime("%H:%M")
+        if value.tzinfo is not None:
+            value = value.astimezone(CN_TZ)
+        return value.strftime("%H:%M")
     text = str(value or "")
     if len(text) >= 16 and text[13] == ":":
         return text[11:16]
@@ -201,54 +205,88 @@ class MinuteSignalReplayer:
                 adj_factor.clear()
                 adj_factor.update(_adj_factors(day_rows))
 
-            context = StrategyDataContext(
-                asset_type="stock",
-                timeframe="1m",
-                as_of=day,
-                current=current if not current.is_empty() else None,
-                history=history,
-                daily_history=daily_history if not daily_history.is_empty() else None,
-            )
-            try:
-                run_result = self.strategy_engine.run(
+            def run_with_history(
+                minute_history: pl.DataFrame,
+                replay_day=day,
+                replay_current=current,
+                replay_daily_history=daily_history,
+            ):
+                context = StrategyDataContext(
+                    asset_type="stock",
+                    timeframe="1m",
+                    as_of=replay_day,
+                    current=replay_current if not replay_current.is_empty() else None,
+                    history=minute_history,
+                    daily_history=(
+                        replay_daily_history
+                        if not replay_daily_history.is_empty()
+                        else None
+                    ),
+                )
+                return self.strategy_engine.run(
                     strategy.meta.get("id", ""),
                     context,
                     pool,
                     params,
                     overrides,
                 )
-            except ValueError:
-                # 单日执行失败 (如窗口缺列) 记为跳过, 不中断整个回放。
-                result.skipped_days.append(day)
-                continue
 
+            # 用户策略可以内部排序或截断候选，整日结果不保证包含早盘候选。
+            # 必须按市场分钟逐步回放；候选和评分均只来自该分钟前缀。
             result.replayed_days += 1
-            result.strategy_matches += len(run_result.rows)
-            for row in run_result.rows:
-                symbol = row.get("symbol")
-                close = row.get("close")
-                if not symbol or close is None or float(close) <= 0:
-                    continue
-                raw_close = float(close)
-                name = prev_name.get(str(symbol), "")
-                prev = prev_raw_close.get(str(symbol))
-                # 涨停拒买: 触发分钟收盘已达当日涨停价 (按 T-1 原始收盘 + 板块规则)。
-                if prev is not None and prev > 0:
-                    limit_up = _scalar_limit_up_price(
-                        prev, price_limit_pct(str(symbol), day, is_risk_warning=is_risk_warning_name(name)),
+
+            bars_by_key = {
+                (str(row["symbol"]), row["datetime"]): row
+                for row in history.unique(
+                    subset=["symbol", "datetime"], keep="last",
+                ).to_dicts()
+                if row.get("symbol") and row.get("datetime") is not None
+            }
+            cutoffs = sorted({timestamp for _, timestamp in bars_by_key})
+            matched_symbols: set[str] = set()
+            for cutoff in cutoffs:
+                try:
+                    verified = run_with_history(
+                        history.filter(pl.col("datetime") <= cutoff)
                     )
-                    if raw_close >= limit_up - 1e-9:
-                        result.buy_limit_up += 1
+                except ValueError:
+                    continue
+                for row in verified.rows:
+                    symbol = str(row.get("symbol") or "")
+                    if (
+                        symbol in matched_symbols
+                        or row.get("last_datetime") != cutoff
+                        or (symbol, cutoff) not in bars_by_key
+                    ):
                         continue
-                trigger = row.get("last_datetime")
-                trigger_time = _trigger_hhmm(trigger)
-                result.hits.append(MinuteReplayHit(
-                    trade_date=day,
-                    symbol=str(symbol),
-                    entry_price=raw_close * adj_factor.get(str(symbol), 1.0),
-                    trigger_time=trigger_time,
-                    score=float(run_result.scores.get(str(symbol), 0.0) or 0.0),
-                ))
+                    bar = bars_by_key[(symbol, cutoff)]
+                    close = bar.get("close")
+                    if close is None or float(close) <= 0:
+                        continue
+                    matched_symbols.add(symbol)
+                    result.strategy_matches += 1
+                    raw_close = float(close)
+                    name = prev_name.get(symbol, "")
+                    prev = prev_raw_close.get(symbol)
+                    if prev is not None and prev > 0:
+                        limit_up = _scalar_limit_up_price(
+                            prev,
+                            price_limit_pct(
+                                symbol,
+                                day,
+                                is_risk_warning=is_risk_warning_name(name),
+                            ),
+                        )
+                        if raw_close >= limit_up - 1e-9:
+                            result.buy_limit_up += 1
+                            continue
+                    result.hits.append(MinuteReplayHit(
+                        trade_date=day,
+                        symbol=symbol,
+                        entry_price=raw_close * adj_factor.get(symbol, 1.0),
+                        trigger_time=_trigger_hhmm(cutoff),
+                        score=float(verified.scores.get(symbol, 0.0) or 0.0),
+                    ))
 
         result.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
         return result

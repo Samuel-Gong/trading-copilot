@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import calendar
 import itertools
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
@@ -28,7 +31,7 @@ class _FakeClient:
         pages: list[list[dict]],
         count: int,
         error: Exception | None = None,
-        server_ts: int = 0,
+        server_ts: int = 1787542612000,
     ):
         self.pages = pages
         self.count = count
@@ -232,9 +235,9 @@ def test_realtime_uses_server_timestamp(monkeypatch):
     assert provider.get_realtime()[0]["timestamp"] == 1787542612000
 
 
-def test_realtime_falls_back_to_local_time_without_server_ts(monkeypatch):
+def test_realtime_without_server_timestamp_is_discarded(monkeypatch):
     provider, _ = _provider_with(monkeypatch, [[_row()]], server_ts=0)
-    assert provider.get_realtime()[0]["timestamp"] > 0
+    assert provider.get_realtime() == []
 
 
 # ---- 分页 ----
@@ -270,7 +273,7 @@ def test_realtime_error_returns_empty_list(monkeypatch):
 
 
 class _FakeIndexClient:
-    def __init__(self, rows=None, server_ts=0, error=None):
+    def __init__(self, rows=None, server_ts=1787542612000, error=None):
         self.rows = rows or []
         self.server_ts = server_ts
         self.error = error
@@ -293,8 +296,8 @@ def _index_provider_with(monkeypatch, **kwargs):
     return FuyaoProvider(), fake
 
 
-def test_realtime_indices_maps_and_keeps_volume_unit(monkeypatch):
-    """指数快照 → realtime record; volume 无股→手口径, 直接透传。"""
+def test_realtime_indices_maps_and_rejects_unproven_volume_unit(monkeypatch):
+    """指数快照 volume 单位未证明时置空，不污染统一“手”口径。"""
     provider, fake = _index_provider_with(
         monkeypatch,
         rows=[_row("000001.SH", volume=576656606, price_change_ratio_pct=0.86)],
@@ -307,7 +310,7 @@ def test_realtime_indices_maps_and_keeps_volume_unit(monkeypatch):
     assert r["symbol"] == "000001.SH"
     assert r["change_pct"] == pytest.approx(0.0086)
     assert r["timestamp"] == 1787542612000
-    assert r["volume"] == 576656606  # 不做 /100
+    assert r["volume"] is None
 
 
 def test_realtime_indices_skips_bj_symbols(monkeypatch):
@@ -335,13 +338,53 @@ def test_client_requires_api_key():
 
 
 def test_datasets_declaration():
-    """声明 realtime/daily/adj_factor/financial; minute 未声明 (回退 tickflow)。"""
+    """只声明能覆盖全局资产范围的 realtime/financial 数据集。"""
     config = FuyaoProvider().config
     assert "realtime" in config.datasets
-    assert "daily" in config.datasets
-    assert "adj_factor" in config.datasets
     assert "financial" in config.datasets
+    assert "daily" not in config.datasets
+    assert "adj_factor" not in config.datasets
     assert "minute" not in config.datasets
+
+
+def test_snapshot_derived_bps_only_becomes_effective_after_observation_day(
+    monkeypatch,
+) -> None:
+    """同步日估值反推值不得回填到历史报告公告日。"""
+    from app.backtest.fundamentals import attach_fundamental_factors
+
+    report_day = date(2026, 8, 20)
+    observation_day = date(2026, 9, 7)
+
+    class FinancialClient:
+        def financial_statements(self, _table, _symbol, limit=1):
+            return [{
+                "fiscal_period": "Q2",
+                "fiscal_year": 2026,
+                "period_end_ms": _sh_ms(date(2026, 6, 30)),
+                "report_date_ms": _sh_ms(report_day),
+                "basic_eps": 0.5,
+            }]
+
+        def financial_indicators(self, _symbol, _report):
+            return []
+
+    provider = FuyaoProvider()
+    provider._client = FinancialClient()  # type: ignore[assignment]
+    monkeypatch.setattr(provider, "_derive_bps", lambda _symbols: {"600000.SH": 5.0})
+    monkeypatch.setattr(fp, "cn_today", lambda: observation_day)
+
+    snapshot = provider.get_financials("metrics", ["600000.SH"])
+
+    assert snapshot.height == 2
+    assert snapshot.sort("announce_date")["bps"].to_list() == [None, 5.0]
+    panel = pl.DataFrame({
+        "symbol": ["600000.SH"] * 3,
+        "date": [date(2026, 8, 21), observation_day, date(2026, 9, 8)],
+        "raw_close": [10.0, 10.0, 10.0],
+    })
+    attached = attach_fundamental_factors(panel, snapshot, {"pb_latest"})
+    assert attached["pb_latest"].to_list() == [None, None, pytest.approx(2.0)]
 
 
 # ---- API Key 解析 (secrets.json > .env, 对齐 tickflow 语义) ----
@@ -435,7 +478,10 @@ def test_save_plugin_key_invalid_key_not_persisted(monkeypatch):
     monkeypatch.setattr(
         settings_api.secrets_store, "save", lambda updates: saved.update(updates) or updates
     )
-    out = settings_api.save_plugin_key(settings_api.PluginKeyIn(plugin="fuyao", api_key="bad"))
+    out = settings_api.save_plugin_key(
+        settings_api.PluginKeyIn(plugin="fuyao", api_key="bad"),
+        SimpleNamespace(),
+    )
     assert out["ok"] is False and out["reason"] == "invalid"
     assert saved == {}  # 无效 Key 不落盘
 
@@ -457,11 +503,18 @@ def test_save_plugin_key_valid_persists_and_rescans(monkeypatch):
     monkeypatch.setattr(
         custom_sources, "list_plugins", lambda: [{"name": "fuyao", "available": True}]
     )
-    out = settings_api.save_plugin_key(settings_api.PluginKeyIn(plugin="fuyao", api_key="good-key"))
+    refreshed = []
+    monkeypatch.setattr(settings_api, "_refresh_provider_runtime", lambda request: refreshed.append(request))
+    request = SimpleNamespace()
+    out = settings_api.save_plugin_key(
+        settings_api.PluginKeyIn(plugin="fuyao", api_key="good-key"),
+        request,
+    )
     assert out["ok"] is True
     assert saved == {"fuyao_api_key": "good-key"}  # 字段名与 provider.SECRETS_FIELD 一致
     assert out["plugin_available"] is True
     assert reloaded == [1]  # 保存后重扫, 插件即刻可用
+    assert refreshed == [request]
 
 
 def test_clear_plugin_key(monkeypatch):
@@ -475,7 +528,8 @@ def test_clear_plugin_key(monkeypatch):
     monkeypatch.setattr(
         custom_sources, "list_plugins", lambda: [{"name": "fuyao", "available": False}]
     )
-    out = settings_api.clear_plugin_key("fuyao")
+    monkeypatch.setattr(settings_api, "_refresh_provider_runtime", lambda request: None)
+    out = settings_api.clear_plugin_key("fuyao", SimpleNamespace())
     assert out["ok"] is True and out["plugin_available"] is False
     assert cleared == ["fuyao_api_key"]
 
@@ -486,7 +540,7 @@ def test_manifest_declares_datasets():
     manifest = loader.plugin_manifest("fuyao")
     assert manifest is not None
     assert manifest["entry"] == "app.plugins.fuyao.provider:FuyaoProvider"
-    assert {"realtime", "daily", "adj_factor"} <= set(manifest.get("datasets") or [])
+    assert set(manifest.get("datasets") or []) == {"realtime", "financial"}
     assert manifest.get("runtime") == "none"
     assert manifest.get("api_key_env") == fp.API_KEY_ENV
 
@@ -554,10 +608,10 @@ def test_test_dataset_realtime_preview(monkeypatch):
     assert out["preview"][0]["change_pct"] == pytest.approx(0.0172)
 
 
-def test_test_dataset_unsupported_dataset_reports_fallback(monkeypatch):
+def test_test_dataset_unsupported_dataset_reports_unavailable(monkeypatch):
     provider, _ = _provider_with(monkeypatch, [[]])
     out = provider.test_dataset("minute")
-    assert "error" in out and "回退" in out["error"]
+    assert "error" in out and "不可用" in out["error"]
 
 
 def test_close_is_idempotent(monkeypatch):
@@ -650,6 +704,100 @@ def _daily10_dump(rows: list[dict]) -> pl.DataFrame:
             "turnover": pl.Float64,
         },
     )
+
+
+class _FakeDumpClient:
+    def __init__(self, release: str = "20260828", close: float = 10.0) -> None:
+        self.release = release
+        self.close = close
+        self.url_calls = 0
+        self.download_calls = 0
+
+    def dump_download_url(self, dump_kind: str) -> dict:
+        self.url_calls += 1
+        return {
+            "presigned_url": (
+                f"https://o.thsi.cn/fuyao/{dump_kind}/releases/"
+                f"{self.release}/dump.parquet?sig=1"
+            )
+        }
+
+    def download_dump(
+        self,
+        dump_kind: str,
+        dest,
+        *,
+        presigned_url: str | None = None,
+    ) -> None:
+        del dump_kind, presigned_url
+        self.download_calls += 1
+        _daily10_dump([
+            _dump_bar("000001.SZ", date(2026, 8, 28), self.close),
+        ]).write_parquet(dest)
+
+
+def test_dump_cache_concurrent_cold_load_downloads_once(monkeypatch, tmp_path):
+    client = _FakeDumpClient()
+    provider = FuyaoProvider()
+    provider._client = client
+    monkeypatch.setattr(fp, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(fp, "cn_today", lambda: date(2026, 8, 28))
+    barrier = threading.Barrier(3)
+
+    def load() -> pl.DataFrame:
+        barrier.wait()
+        return provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(load) for _ in range(2)]
+        barrier.wait()
+        frames = [future.result() for future in futures]
+
+    assert all(frame.height == 1 for frame in frames)
+    assert client.url_calls == 1
+    assert client.download_calls == 1
+
+
+def test_dump_cache_refreshes_new_release_on_next_day(monkeypatch, tmp_path):
+    client = _FakeDumpClient(release="20260828", close=10.0)
+    provider = FuyaoProvider()
+    provider._client = client
+    current_day = [date(2026, 8, 28)]
+    monkeypatch.setattr(fp, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(fp, "cn_today", lambda: current_day[0])
+
+    first = provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+    current_day[0] = date(2026, 8, 29)
+    client.release = "20260829"
+    client.close = 11.0
+    second = provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+
+    assert first["close_price"].item() == 10.0
+    assert second["close_price"].item() == 11.0
+    assert client.url_calls == 2
+    assert client.download_calls == 2
+    assert [path.name for path in tmp_path.glob("daily_k_10d__*.parquet")] == [
+        "daily_k_10d__20260829.parquet"
+    ]
+
+
+def test_dump_cache_keeps_previous_release_when_refresh_is_invalid(monkeypatch, tmp_path):
+    client = _FakeDumpClient(release="20260828", close=10.0)
+    provider = FuyaoProvider()
+    provider._client = client
+    current_day = [date(2026, 8, 28)]
+    monkeypatch.setattr(fp, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(fp, "cn_today", lambda: current_day[0])
+    first = provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+
+    current_day[0] = date(2026, 8, 29)
+    client.release = "20260829"
+    client.download_dump = lambda *_args, **_kwargs: _args[1].write_bytes(b"broken")
+    second = provider._ensure_dump(fp._DAILY10_DUMP_KIND, "daily_k_10d")
+
+    assert second.equals(first)
+    assert (tmp_path / "daily_k_10d__20260828.parquet").exists()
+    assert not (tmp_path / "daily_k_10d__20260829.parquet").exists()
 
 
 def _adj_dump(events: list[tuple]) -> pl.DataFrame:

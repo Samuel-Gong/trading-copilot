@@ -18,6 +18,7 @@ from typing import Any
 
 import polars as pl
 
+from app.market_time import cn_today
 from app.services.ext_data import ExtConfig, ExtConfigStore
 from app.services.index_const import CORE_INDEX_NAMES, CORE_INDEX_SYMBOLS
 from app.services.screener import ScreenerService
@@ -388,12 +389,17 @@ def build_market_overview(
         as_of: 指定日期,None 则取最新有数据日。
     """
     svc = ScreenerService(repo)
-    # 调用方未指定日期时视为"最新"请求: 指数行情走实时缓存 (quote_service),
-    # 其余装配仍以解析出的真实日期为准。显式指定日期(历史复盘)时才回退数据库。
+    # 未指定日期时仍先解析实际业务日；只有该业务日确为北京时间今天，才允许
+    # 使用实时指数与无生效日期的 snapshot 维表。日线滞后时必须保持同一时点。
     explicit_as_of = as_of is not None
     as_of = as_of or svc.latest_date()
+    allow_current_snapshot = not explicit_as_of and as_of == cn_today()
     status = _quote_status(quote_service)
-    indices = _index_quotes(repo, quote_service, None if not explicit_as_of else as_of)
+    indices = _index_quotes(
+        repo,
+        quote_service,
+        None if allow_current_snapshot else as_of,
+    )
 
     if not as_of:
         return {
@@ -536,7 +542,7 @@ def build_market_overview(
     avg_vol_ratio = sum(vol_ratios) / len(vol_ratios) if vol_ratios else 1
     high_vol_ratio = sum(1 for v in vol_ratios if v >= 1.5)
 
-    dimension_as_of = as_of if explicit_as_of else None
+    dimension_as_of = None if allow_current_snapshot else as_of
     concept_rank = _dimension_rank(rows, repo, "concept", as_of=dimension_as_of)
     industry_rank = _dimension_rank(
         rows, repo, "industry", level=2, as_of=dimension_as_of

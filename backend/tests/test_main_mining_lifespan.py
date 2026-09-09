@@ -9,6 +9,30 @@ import pytest
 import app.main as main_module
 
 
+def test_cold_start_loads_custom_sources_before_capability_detection(monkeypatch) -> None:
+    from app.data_providers import custom as custom_sources
+    from app.tickflow.capabilities import CapabilitySet
+
+    loaded = False
+    sentinel = CapabilitySet()
+
+    def _load_all() -> None:
+        nonlocal loaded
+        loaded = True
+
+    def _detect():
+        assert loaded
+        return sentinel
+
+    monkeypatch.setattr(custom_sources, "load_all", _load_all)
+    monkeypatch.setattr(custom_sources, "list_sources", lambda: [])
+    monkeypatch.setattr(main_module, "detect_capabilities", _detect)
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    assert main_module._load_data_sources_and_capabilities(app) is sentinel
+    assert app.state.capabilities is sentinel
+
+
 def test_lifespan_holds_mining_process_lock_around_application(monkeypatch) -> None:
     events: list[str] = []
 

@@ -1,19 +1,22 @@
 """异动边缘统计 — 按交易所异动规则口径实时计算个股接近度。
 
-规则 (近似口径, 与交易所《交易规则》的异常波动/严重异常波动披露阈值对齐;
+规则 (滚动估算口径, 与交易所《交易规则》的异常波动/严重异常波动披露阈值对齐;
 主板/科创板条款号指上交所《交易规则(2026年修订)》, 2026-07-06 施行):
 - 主板:     连续3日收盘价涨跌幅偏离值累计 ±20% (5.4.2)
 - 创业板/科创板: 3日 ±30% (科创板 6.10)
-- 北交所:   3日 ±40%
-- 严重异常波动 (5.4.3/6.11): 10日累计偏离 +100%(-50%), 30日 +200%(-70%) —
-  负向阈值显著严于正向 (跌方向更早触发), 各板块相同。
-  「10日内4次同向异常波动」情形 (科创板3次) 需事件计数, 暂未实现。
+- 北交所:   3日 ±40%; 10日 +150%(-60%); 30日 +300%(-75%)
+- 沪深严重异常波动 (5.4.3/6.11): 10日累计偏离 +100%(-50%),
+  30日 +200%(-70%)。北交所使用上述独立阈值。
+  「10日内多次同向异常波动」情形需事件计数, 当前尚未实现;
+  北交所现行规则为 10 日内 3 次同向。
 - 风险警示 (ST/*ST): 2026-07-06 起主板风险警示股票涨跌幅限制调整为 10%,
   异常波动特别规定 (原 3日±15% / 10日+50% / 30日+100%) 同步废止,
   与主板普通股票适用同一套标准 (见 price_limits.MAIN_BOARD_ST_LIMIT_CHANGE_DATE)。
 
 偏离值 = 个股 N 日累计涨跌幅 - 对应指数同期涨跌幅 (enriched 运行时列 deviate_Nd)。
-「接近度」= |实时偏离| / 该方向阈值: ≥1 已触发, ≥0.7 边缘, ≥0.5 观察。
+「接近度」= |实时偏离| / 该方向阈值: ≥1 滚动估算达线, ≥0.7 边缘, ≥0.5 观察。
+本模块没有异常公告后的重置事件、无涨跌幅限制期等完整监管事件数据，因此
+任何数值都不表示交易所已经认定或必须披露；达线结果统一标为 estimate。
 盘中实时叠加: 历史偏离 (已完成交易日) + 今日实时涨跌 - 基准指数今日涨跌。
 """
 
@@ -39,10 +42,10 @@ class AbnormalRule:
     thresholds: dict[int, tuple[float, float]]
 
 
-# 3日异常波动阈值各板块对称; 10/30日严重异动各板块一致且不对称 (+100%/-50%, +200%/-70%)
+# 3 日异常波动阈值各板块对称; 10/30 日严重异动按交易所独立口径。
 _MAIN = {3: (0.20, 0.20), 10: (1.00, 0.50), 30: (2.00, 0.70)}
 _GEM_STAR = {3: (0.30, 0.30), 10: (1.00, 0.50), 30: (2.00, 0.70)}
-_BSE = {3: (0.40, 0.40), 10: (1.00, 0.50), 30: (2.00, 0.70)}
+_BSE = {3: (0.40, 0.40), 10: (1.50, 0.60), 30: (3.00, 0.75)}
 
 RULES_META: list[dict[str, Any]] = [
     {"board": "主板", "st": False, "thresholds": {f"{k}d": {"up": u, "down": d} for k, (u, d) in _MAIN.items()},
@@ -51,7 +54,8 @@ RULES_META: list[dict[str, Any]] = [
     {"board": "创业板/科创板", "st": False, "thresholds": {f"{k}d": {"up": u, "down": d} for k, (u, d) in _GEM_STAR.items()},
      "note": "20%涨跌幅板块, 3日±30%"},
     {"board": "北交所", "st": False, "thresholds": {f"{k}d": {"up": u, "down": d} for k, (u, d) in _BSE.items()},
-     "note": "30%涨跌幅板块, 3日±40%"},
+     "note": "30%涨跌幅板块, 3日±40%; 10日+150%(-60%) / 30日+300%(-75%); "
+             "10日内3次同向异常波动的事件计数口径尚未实现"},
 ]
 
 def board_of(symbol: str) -> str:
@@ -86,22 +90,25 @@ def rule_for(symbol: str, name: str | None) -> AbnormalRule:
 
 _hist_cache_lock = threading.Lock()
 _hist_cache: dict[str, Any] = {}
+_hist_cache_generation = 0
 _HIST_CACHE_TTL = 60.0
 
-_STATUS_TRIGGERED = "triggered"
+_STATUS_ESTIMATE = "estimate"
 _STATUS_EDGE = "edge"
 _STATUS_WATCH = "watch"
 
 
 def invalidate_abnormal_moves_cache() -> None:
     """清除异动历史快照缓存。"""
+    global _hist_cache_generation
     with _hist_cache_lock:
+        _hist_cache_generation += 1
         _hist_cache.clear()
 
 
 def _status_of(closeness: float) -> str:
     if closeness >= 1.0:
-        return _STATUS_TRIGGERED
+        return _STATUS_ESTIMATE
     if closeness >= 0.7:
         return _STATUS_EDGE
     return _STATUS_WATCH
@@ -109,47 +116,51 @@ def _status_of(closeness: float) -> str:
 
 def _hist_snapshot(repo: Any) -> dict[str, Any]:
     """enriched 最新日偏离快照；仅缓存已经完成的历史交易日。"""
-    now = time.monotonic()
-    today_iso = cn_today().isoformat()
-    with _hist_cache_lock:
-        cached = _hist_cache.get("data")
-        if (
-            cached is not None
-            and cached.get("cache_date") is not None
-            and cached["cache_date"] < today_iso
-            and now - cached["_ts"] < _HIST_CACHE_TTL
-        ):
-            return cached
+    while True:
+        now = time.monotonic()
+        today_iso = cn_today().isoformat()
+        with _hist_cache_lock:
+            generation = _hist_cache_generation
+            cached = _hist_cache.get("data")
+            if (
+                cached is not None
+                and cached.get("cache_date") is not None
+                and cached["cache_date"] < today_iso
+                and now - cached["_ts"] < _HIST_CACHE_TTL
+            ):
+                return cached
 
-    df, cache_date = repo.get_enriched_latest()
-    rows: dict[str, dict[str, Any]] = {}
-    if not df.is_empty() and "symbol" in df.columns:
-        symbols = [str(symbol) for symbol in df["symbol"].to_list()]
-        try:
-            name_map = repo.get_name_map(symbols)
-        except Exception:
-            name_map = {}
-        cols = ["symbol", *[c for c in ("name", "close", "change_pct",
-                                        "deviate_3d", "deviate_10d", "deviate_30d") if c in df.columns]]
-        df = df.select(cols)
-        for r in df.iter_rows(named=True):
-            symbol = str(r["symbol"])
-            rows[symbol] = {
-                "name": r.get("name") or name_map.get(symbol),
-                "close": r.get("close"),
-                "rt_pct": r.get("change_pct"),
-                "deviate_3d": r.get("deviate_3d"),
-                "deviate_10d": r.get("deviate_10d"),
-                "deviate_30d": r.get("deviate_30d"),
-            }
-    cache_date_iso = cache_date.isoformat() if cache_date else None
-    payload = {"_ts": now, "rows": rows, "cache_date": cache_date_iso}
-    with _hist_cache_lock:
-        if cache_date_iso is not None and cache_date_iso < today_iso:
-            _hist_cache["data"] = payload
-        else:
-            _hist_cache.pop("data", None)
-    return payload
+        df, cache_date = repo.get_enriched_latest()
+        rows: dict[str, dict[str, Any]] = {}
+        if not df.is_empty() and "symbol" in df.columns:
+            symbols = [str(symbol) for symbol in df["symbol"].to_list()]
+            try:
+                name_map = repo.get_name_map(symbols)
+            except Exception:
+                name_map = {}
+            cols = ["symbol", *[c for c in ("name", "close", "change_pct",
+                                            "deviate_3d", "deviate_10d", "deviate_30d") if c in df.columns]]
+            df = df.select(cols)
+            for r in df.iter_rows(named=True):
+                symbol = str(r["symbol"])
+                rows[symbol] = {
+                    "name": r.get("name") or name_map.get(symbol),
+                    "close": r.get("close"),
+                    "rt_pct": r.get("change_pct"),
+                    "deviate_3d": r.get("deviate_3d"),
+                    "deviate_10d": r.get("deviate_10d"),
+                    "deviate_30d": r.get("deviate_30d"),
+                }
+        cache_date_iso = cache_date.isoformat() if cache_date else None
+        payload = {"_ts": now, "rows": rows, "cache_date": cache_date_iso}
+        with _hist_cache_lock:
+            if generation != _hist_cache_generation:
+                continue
+            if cache_date_iso is not None and cache_date_iso < today_iso:
+                _hist_cache["data"] = payload
+            else:
+                _hist_cache.pop("data", None)
+            return payload
 
 
 def _row_change_pct(row: dict[str, Any], *, percent_value: bool) -> float | None:
@@ -287,11 +298,12 @@ def build_overview(
             "windows": windows,
             "max_closeness": round(max_closeness, 4),
             "status": _status_of(max_closeness),
+            "determination": "rolling_estimate",
         })
 
     out_rows.sort(key=lambda r: r["max_closeness"], reverse=True)
     counts = {
-        _STATUS_TRIGGERED: sum(1 for r in out_rows if r["status"] == _STATUS_TRIGGERED),
+        _STATUS_ESTIMATE: sum(1 for r in out_rows if r["status"] == _STATUS_ESTIMATE),
         _STATUS_EDGE: sum(1 for r in out_rows if r["status"] == _STATUS_EDGE),
         _STATUS_WATCH: sum(1 for r in out_rows if r["status"] == _STATUS_WATCH),
     }
@@ -308,6 +320,7 @@ def build_overview(
             else None
         ),
         "includes_today": includes_today,
+        "calculation_scope": "rolling_estimate",
         "rules": RULES_META,
         "counts": counts,
         "rows": out_rows[:limit],

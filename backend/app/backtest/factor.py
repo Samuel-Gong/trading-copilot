@@ -64,6 +64,37 @@ def validate_factor_asset_types(
             f"因子 {', '.join(unsupported)} 不支持资产类型 {asset_type}"
         )
 
+
+def fundamental_dependencies(factor_names: Sequence[str]) -> frozenset[str]:
+    """递归解析自定义/复合因子所需的点时财务基础因子。"""
+    from app.factors.dsl import compile_formula_cached
+    from app.factors.registry import get_factor
+
+    found: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        visited.add(name)
+        if name in FUNDAMENTAL_FACTOR_NAMES:
+            found.add(name)
+            return
+        spec = get_factor(name)
+        if spec is None:
+            return
+        if spec.kind == "custom":
+            compiled = compile_formula_cached(spec.formula_text)
+            for referenced in compiled.referenced_factors:
+                visit(str(referenced))
+        elif spec.kind == "composite":
+            for member_id, _weight in spec.components:
+                visit(str(member_id))
+
+    for factor_name in factor_names:
+        visit(str(factor_name))
+    return frozenset(found)
+
 FACTOR_WARMUP_DAYS = 120
 FACTOR_METHODOLOGY_VERSION = "factor_v2"
 _DAILY_FORWARD_HORIZONS = (1, 3, 5)
@@ -205,7 +236,7 @@ class FactorBacktestService:
         if panel.is_empty():
             return self._error_result(config, run_id, t0, "无数据, 请检查日期范围或先运行盘后管道")
 
-        if config.factor_name in FUNDAMENTAL_FACTOR_NAMES and self._fundamentals_missing():
+        if fundamental_dependencies([config.factor_name]) and self._fundamentals_missing():
             return self._error_result(
                 config, run_id, t0,
                 "本地没有财务数据: 请先在数据页同步财务数据后再使用财务因子",
@@ -275,10 +306,7 @@ class FactorBacktestService:
         )
 
         metadata = {item["id"]: item for item in FACTOR_COLUMNS}
-        fundamentals_missing = (
-            any(name in FUNDAMENTAL_FACTOR_NAMES for name in factor_names)
-            and self._fundamentals_missing()
-        )
+        fundamentals_missing = bool(fundamental_dependencies(factor_names)) and self._fundamentals_missing()
         items: list[FactorBatchItem] = []
         for factor_name in factor_names:
             item_t0 = time.perf_counter()
@@ -297,7 +325,7 @@ class FactorBacktestService:
                 asset_type=config.asset_type,
             )
             meta = metadata.get(factor_name, {})
-            if factor_name in FUNDAMENTAL_FACTOR_NAMES and fundamentals_missing:
+            if fundamental_dependencies([factor_name]) and fundamentals_missing:
                 items.append(FactorBatchItem(
                     factor_name=factor_name,
                     label=str(meta.get("label", factor_name)),
@@ -410,16 +438,15 @@ class FactorBacktestService:
             "symbol", "date", "open", "high", "low", "close", "volume", "amount",
             "turnover_rate",
         ]
-        if "pb_latest" in factor_names:
+        fundamental_names = sorted(fundamental_dependencies(factor_names))
+        if "pb_latest" in fundamental_names:
             panel_columns.append("raw_close")
         if any(
             name in ("limit_up_count_20d", "limit_up_count_60d")
             for name in factor_names
         ):
             panel_columns.append("consecutive_limit_ups")
-        load_start = config.start
-        if any(name != "turnover_rate" for name in factor_names):
-            load_start = config.start - timedelta(days=FACTOR_WARMUP_DAYS)
+        load_start = self._factor_load_start(config, factor_names)
 
         load_kwargs = {
             "columns": panel_columns,
@@ -436,10 +463,6 @@ class FactorBacktestService:
         if panel.is_empty():
             return panel
 
-        missing = set(factor_names) - set(panel.columns)
-        if missing:
-            panel = self._compute_missing_factors(panel, missing)
-        fundamental_names = [name for name in factor_names if name in FUNDAMENTAL_FACTOR_NAMES]
         if fundamental_names:
             # 点时财务因子: 公告日门控, 无数据标的保持 null (不参与该日截面)。
             panel = attach_fundamental_factors(
@@ -447,7 +470,59 @@ class FactorBacktestService:
                 load_fundamental_snapshot(self._fundamentals_data_dir()),
                 fundamental_names,
             )
+        missing = set(factor_names) - set(panel.columns)
+        if missing:
+            panel = self._compute_missing_factors(panel, missing)
         return panel
+
+    def _factor_load_start(
+        self,
+        config: FactorConfig | FactorBatchConfig,
+        factor_names: Sequence[str],
+    ) -> date:
+        """按注册表声明的交易日预热条数推导实际加载起点。"""
+        from app.factors.registry import get_factor
+
+        warmup_bars = max(
+            (
+                spec.warmup_bars
+                for name in factor_names
+                if (spec := get_factor(str(name))) is not None
+            ),
+            default=1,
+        )
+        needed = max(0, warmup_bars - 1)
+        if needed == 0:
+            return config.start
+
+        repo = getattr(self.engine, "repo", None)
+        data_dir = getattr(getattr(repo, "store", None), "data_dir", None)
+        if data_dir is not None:
+            from app.tickflow.repository import enriched_dirname
+
+            root = data_dir / enriched_dirname(config.asset_type)
+            prior_dates: list[date] = []
+            for partition in root.glob("date=*"):
+                try:
+                    value = date.fromisoformat(partition.name.removeprefix("date="))
+                except ValueError:
+                    continue
+                if value < config.start and (partition / "part.parquet").is_file():
+                    prior_dates.append(value)
+            prior_dates = sorted(set(prior_dates))
+            if len(prior_dates) >= needed:
+                return prior_dates[-needed]
+            if prior_dates:
+                return prior_dates[0]
+
+        # 无可枚举分区时按 5/7 交易日比例换算，并保留节假日余量。
+        calendar_days = max(
+            FACTOR_WARMUP_DAYS,
+            (needed * 7 + 4) // 5 + 30,
+        )
+        return config.start - timedelta(
+            days=min(calendar_days, (config.start - date.min).days)
+        )
 
     def _global_trading_dates(
         self,

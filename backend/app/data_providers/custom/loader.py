@@ -7,6 +7,8 @@ import math
 import re
 import shutil
 import subprocess
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import yaml
@@ -21,11 +23,19 @@ from app.data_providers.custom.config import (
     load_config,
 )
 from app.data_providers.custom.provider import GenericHTTPProvider
+from app.services.fs_utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
-_PROVIDERS: dict[str, GenericHTTPProvider] = {}
+_PROVIDERS: dict[str, object] = {}
 _LOAD_ERRORS: list[dict] = []
+_REGISTRY_LOCK = threading.RLock()
+# Provider 配置文件与注册表属于同一事务域。writer 锁只串行化 reload/save/delete/
+# install 等变更，不参与租约读取，因此网络试拉和正常行情读取不会被阻塞。
+_MUTATION_LOCK = threading.RLock()
+_ACTIVE_LEASES: dict[int, int] = {}
+_RETIRED_PROVIDERS: dict[int, object] = {}
+_REGISTRY_GENERATION = 0
 
 # 内置插件状态: {name: {available, status, runtime, ...}} 供设置页独立分类展示。
 # available=False 的插件不注册进 _PROVIDERS (不可切换), 但记录状态供 UI 显示安装提示。
@@ -44,35 +54,122 @@ def data_sources_dir() -> Path:
 
 
 def load_all(path: Path | None = None) -> None:
-    """Load all custom provider YAML files into process memory."""
-    global _PROVIDERS, _LOAD_ERRORS
-    for provider in _PROVIDERS.values():
-        provider.close()
-    _PROVIDERS = {}
-    _LOAD_ERRORS = []
+    """构建完整新注册表后原子替换；旧实例在活动租约结束后关闭。"""
+    global _PROVIDERS, _LOAD_ERRORS, _PLUGIN_STATUS, _REGISTRY_GENERATION
+    with _MUTATION_LOCK:
+        providers: dict[str, object] = {}
+        load_errors: list[dict] = []
+        plugin_status: dict[str, dict] = {}
 
-    base = path or data_sources_dir()
-    base.mkdir(parents=True, exist_ok=True)
-    for file in sorted([*base.glob("*.yaml"), *base.glob("*.yml")]):
+        base = path or data_sources_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        for file in sorted([*base.glob("*.yaml"), *base.glob("*.yml")]):
+            try:
+                config = load_config(file)
+                provider = GenericHTTPProvider(config)
+                errors = provider.validate()
+                if errors:
+                    load_errors.append({"path": str(file), "name": config.name, "errors": errors})
+                    provider.close()
+                    continue
+                providers[config.name] = provider
+            except Exception as e:  # noqa: BLE001
+                logger.warning("custom data source load failed %s: %s", file, e)
+                load_errors.append({"path": str(file), "errors": [str(e)]})
+
+        # 内置可选插件 (plugins/ 目录)。与用户 YAML 源独立, 缺依赖只记状态不报错。
+        _load_builtin_plugins(providers, plugin_status)
+        with _REGISTRY_LOCK:
+            old_providers = _PROVIDERS
+            _PROVIDERS = providers
+            _LOAD_ERRORS = load_errors
+            _PLUGIN_STATUS = plugin_status
+            _REGISTRY_GENERATION += 1
+            for provider in old_providers.values():
+                if provider not in providers.values():
+                    _retire_provider_locked(provider)
+
+
+@contextmanager
+def mutation_lock():
+    """串行化一轮数据源配置与注册表提交。"""
+    with _MUTATION_LOCK:
+        yield
+
+
+def _close_provider(provider: object) -> None:
+    close = getattr(provider, "close", None)
+    if callable(close):
         try:
-            config = load_config(file)
-            provider = GenericHTTPProvider(config)
-            errors = provider.validate()
-            if errors:
-                _LOAD_ERRORS.append({"path": str(file), "name": config.name, "errors": errors})
-                provider.close()
-                continue
-            _PROVIDERS[config.name] = provider
-        except Exception as e:  # noqa: BLE001
-            logger.warning("custom data source load failed %s: %s", file, e)
-            _LOAD_ERRORS.append({"path": str(file), "errors": [str(e)]})
+            close()
+        except Exception:
+            logger.exception("custom provider close failed")
 
-    # 内置可选插件 (plugins/ 目录)。与用户 YAML 源独立, 缺依赖只记状态不报错。
-    _load_builtin_plugins()
+
+def _retire_provider_locked(provider: object) -> None:
+    key = id(provider)
+    if _ACTIVE_LEASES.get(key, 0):
+        _RETIRED_PROVIDERS[key] = provider
+    else:
+        _close_provider(provider)
+
+
+@contextmanager
+def lease_provider(name: str):
+    """在一次 Provider 调用期间固定实例，reload 不会提前关闭其客户端。"""
+    normalized = (name or "").lower()
+    with _REGISTRY_LOCK:
+        provider = _PROVIDERS.get(normalized)
+        if provider is None:
+            raise ValueError(f"Custom data source not found or invalid: {name}")
+        key = id(provider)
+        _ACTIVE_LEASES[key] = _ACTIVE_LEASES.get(key, 0) + 1
+        generation = _REGISTRY_GENERATION
+    try:
+        yield provider, generation
+    finally:
+        with _REGISTRY_LOCK:
+            remaining = _ACTIVE_LEASES.get(key, 1) - 1
+            if remaining > 0:
+                _ACTIVE_LEASES[key] = remaining
+            else:
+                _ACTIVE_LEASES.pop(key, None)
+                retired = _RETIRED_PROVIDERS.pop(key, None)
+                if retired is not None:
+                    _close_provider(retired)
+
+
+@contextmanager
+def registry_read_lock():
+    """让调用方在校验代际并提交期间阻止注册表换代。"""
+    with _REGISTRY_LOCK:
+        yield
+
+
+@contextmanager
+def lease_provider_if_available(name: str):
+    """可选租约；源不存在时 yield None，业务异常仍原样上抛。"""
+    context = lease_provider(name)
+    try:
+        provider, _generation = context.__enter__()
+    except ValueError:
+        yield None
+        return
+    try:
+        yield provider
+    finally:
+        context.__exit__(None, None, None)
+
+
+def registry_generation() -> int:
+    with _REGISTRY_LOCK:
+        return _REGISTRY_GENERATION
 
 
 def list_sources() -> list[dict]:
     """只列出用户自定义 (YAML) 源。内置插件 (builtin=True) 由 list_plugins 独立呈现。"""
+    with _REGISTRY_LOCK:
+        providers = list(_PROVIDERS.values())
     return [
         {
             "name": provider.name,
@@ -80,14 +177,15 @@ def list_sources() -> list[dict]:
             "datasets": sorted(provider.config.datasets.keys()),
             "path": str(provider.config.path) if provider.config.path else None,
         }
-        for provider in _PROVIDERS.values()
+        for provider in providers
         if not getattr(provider, "builtin", False)
     ]
 
 
 def list_plugins() -> list[dict]:
     """返回所有内置插件的状态 (含已装/未装), 供设置页独立分类显示。"""
-    return list(_PLUGIN_STATUS.values())
+    with _REGISTRY_LOCK:
+        return list(_PLUGIN_STATUS.values())
 
 
 def _plugin_key_masked(name: str, api_key_env: str) -> str:
@@ -283,22 +381,26 @@ def uninstall_plugin(name: str) -> tuple[bool, str]:
 
 def is_builtin(name: str) -> bool:
     """判断 name 是否为内置插件 (不可被用户编辑/删除)。"""
-    return (name or "").lower() in _PLUGIN_STATUS
+    with _REGISTRY_LOCK:
+        return (name or "").lower() in _PLUGIN_STATUS
 
 
 def names() -> set[str]:
-    return set(_PROVIDERS)
+    with _REGISTRY_LOCK:
+        return set(_PROVIDERS)
 
 
 def errors() -> list[dict]:
-    return list(_LOAD_ERRORS)
+    with _REGISTRY_LOCK:
+        return list(_LOAD_ERRORS)
 
 
 def get_provider(name: str) -> GenericHTTPProvider:
-    provider = _PROVIDERS.get((name or "").lower())
-    if provider is None:
-        raise ValueError(f"Custom data source not found or invalid: {name}")
-    return provider
+    with _REGISTRY_LOCK:
+        provider = _PROVIDERS.get((name or "").lower())
+        if provider is None:
+            raise ValueError(f"Custom data source not found or invalid: {name}")
+        return provider
 
 
 def create_provider(config: dict) -> GenericHTTPProvider:
@@ -313,28 +415,31 @@ def create_provider(config: dict) -> GenericHTTPProvider:
 
 
 def is_custom_provider(name: str) -> bool:
-    return (name or "").lower() in _PROVIDERS
+    with _REGISTRY_LOCK:
+        return (name or "").lower() in _PROVIDERS
 
 
 def provider_has_dataset(name: str, dataset: str) -> bool:
     """判断某个 custom 源是否配置了指定数据集。
 
-    用于主流程分流: 总开关选了 custom, 但某个数据集未启用时, 该数据集回退 TickFlow。
+    用于主流程分流；显式选择的 custom 源失效时由调用方 fail-closed。
     """
-    provider = _PROVIDERS.get((name or "").lower())
-    if provider is None:
-        return False
-    return dataset in provider.config.datasets
+    with _REGISTRY_LOCK:
+        provider = _PROVIDERS.get((name or "").lower())
+        if provider is None:
+            return False
+        return dataset in provider.config.datasets
 
 
 def get_config_dict(name: str) -> dict | None:
     """读取一个已加载 custom 源的原始配置 dict(用于前端编辑回填)。内置插件不可编辑。"""
     if is_builtin(name):
         return None
-    provider = _PROVIDERS.get((name or "").lower())
-    if provider is None:
-        return None
-    return _config_to_dict(provider.config)
+    with _REGISTRY_LOCK:
+        provider = _PROVIDERS.get((name or "").lower())
+        if provider is None:
+            return None
+        return _config_to_dict(provider.config)
 
 
 def _config_to_dict(config: CustomSourceConfig) -> dict:
@@ -364,10 +469,16 @@ def _config_to_dict(config: CustomSourceConfig) -> dict:
                 "symbols_param": ds.symbols_param,
                 "start_param": ds.start_param,
                 "end_param": ds.end_param,
-            } if ds_name != "realtime" else {}),
-            **({"asset_type_param": ds.asset_type_param} if ds_name == "minute" and ds.asset_type_param else {}),
-            **({"freq_param": ds.freq_param} if ds_name == "minute" and ds.freq_param else {}),
-            **({"pct_unit": ds.pct_unit} if ds_name == "realtime" and ds.pct_unit else {}),
+            } if ds_name not in {"realtime", "instruments"} else {}),
+            **({
+                "asset_type_param": ds.asset_type_param,
+            } if ds_name in {"minute", "full_minute", "instruments"} and ds.asset_type_param else {}),
+            **({
+                "freq_param": ds.freq_param,
+            } if ds_name in {"minute", "full_minute"} and ds.freq_param else {}),
+            **({"pct_unit": ds.pct_unit} if ds_name in {"realtime", "financial"} and ds.pct_unit else {}),
+            **({"volume_unit": ds.volume_unit} if ds.volume_unit else {}),
+            **({"adj_factor_kind": ds.adj_factor_kind} if ds.adj_factor_kind else {}),
         }
     return out
 
@@ -384,7 +495,10 @@ def save_config(name: str, config: dict) -> Path:
     if not path.is_relative_to(base.resolve()):
         raise ValueError("invalid data source name: path escape detected")
     cleaned = _sanitize_for_yaml(config)
-    path.write_text(yaml.safe_dump(cleaned, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    atomic_write_text(
+        path,
+        yaml.safe_dump(cleaned, allow_unicode=True, sort_keys=False),
+    )
     return path
 
 
@@ -423,7 +537,10 @@ def _sanitize_for_yaml(config: dict) -> dict:
 
     datasets_out: dict = {}
     for ds_name, ds_cfg in (config.get("datasets") or {}).items():
-        if ds_name not in {"daily", "adj_factor", "realtime", "minute", "full_minute", "financial"}:
+        if ds_name not in {
+            "daily", "adj_factor", "realtime", "minute", "full_minute",
+            "financial", "instruments",
+        }:
             continue
         if not isinstance(ds_cfg, dict):
             continue
@@ -481,7 +598,7 @@ def _sanitize_dataset(ds_name: str, ds_cfg: dict) -> dict:
     }
     if transforms:
         out["transforms"] = transforms
-    if ds_name != "realtime":
+    if ds_name not in {"realtime", "instruments"}:
         symbols_param = str(ds_cfg.get("symbols_param") or "").strip()
         start_param = str(ds_cfg.get("start_param") or "").strip()
         end_param = str(ds_cfg.get("end_param") or "").strip()
@@ -493,31 +610,46 @@ def _sanitize_dataset(ds_name: str, ds_cfg: dict) -> dict:
             out["end_param"] = end_param
     pct_unit = str(ds_cfg.get("pct_unit") or "").strip().lower()
     if pct_unit:
-        if ds_name != "realtime":
-            raise ValueError(f"{ds_name}: pct_unit 仅用于 realtime 数据集")
+        if ds_name not in {"realtime", "financial"}:
+            raise ValueError(f"{ds_name}: pct_unit 仅用于 realtime/financial 数据集")
         if pct_unit not in ("percent", "decimal"):
             raise ValueError(f"{ds_name}: pct_unit 必须是 percent 或 decimal")
         out["pct_unit"] = pct_unit
-    if ds_name == "minute":
+    volume_unit = str(ds_cfg.get("volume_unit") or "").strip().lower()
+    if volume_unit:
+        if volume_unit not in {"lots", "shares"}:
+            raise ValueError(f"{ds_name}: volume_unit 必须是 lots 或 shares")
+        out["volume_unit"] = volume_unit
+    adj_factor_kind = str(ds_cfg.get("adj_factor_kind") or "").strip().lower()
+    if adj_factor_kind:
+        if ds_name != "adj_factor":
+            raise ValueError(f"{ds_name}: adj_factor_kind 仅用于 adj_factor 数据集")
+        if adj_factor_kind not in {"event_ratio", "cumulative"}:
+            raise ValueError(
+                f"{ds_name}: adj_factor_kind 必须是 event_ratio 或 cumulative"
+            )
+        out["adj_factor_kind"] = adj_factor_kind
+    if ds_name in {"minute", "full_minute", "instruments"}:
         asset_type_param = str(ds_cfg.get("asset_type_param") or "").strip()
-        freq_param = str(ds_cfg.get("freq_param") or "").strip()
         if asset_type_param:
             out["asset_type_param"] = asset_type_param
-        if freq_param:
-            out["freq_param"] = freq_param
-    request_params = [
+        if ds_name in {"minute", "full_minute"}:
+            freq_param = str(ds_cfg.get("freq_param") or "").strip()
+            if freq_param:
+                out["freq_param"] = freq_param
+    request_params = [] if ds_name == "instruments" else [
         out.get("symbols_param", "symbols"),
         out.get("start_param", "start_time"),
         out.get("end_param", "end_time"),
     ]
-    if ds_name == "minute":
+    if ds_name in {"minute", "full_minute"}:
         request_params.extend(
             name for name in (out.get("asset_type_param"), out.get("freq_param")) if name
         )
     duplicates = sorted({
         name for name in request_params if request_params.count(name) > 1
     })
-    if ds_name != "realtime" and duplicates:
+    if ds_name not in {"realtime", "instruments"} and duplicates:
         raise ValueError(
             f"{ds_name}: duplicate request parameter names: {', '.join(duplicates)}"
         )
@@ -528,14 +660,22 @@ def _sanitize_dataset(ds_name: str, ds_cfg: dict) -> dict:
 # 内置可选插件 (plugins/ 目录) 的发现与注册
 # ================================================================
 
-def _load_builtin_plugins() -> None:
+def _load_builtin_plugins(
+    providers: dict[str, object] | None = None,
+    plugin_status: dict[str, dict] | None = None,
+) -> None:
     """扫描 plugins/ 目录下每个含 plugin.yaml 的子目录, 动态加载。
 
     缺依赖时记录 "不可用" 状态, 不抛异常, 不影响主流程。
     每次调用重建 _PLUGIN_STATUS, 并把可用的插件注册进 _PROVIDERS。
     """
     global _PLUGIN_STATUS
-    _PLUGIN_STATUS = {}
+    target_providers = _PROVIDERS if providers is None else providers
+    if plugin_status is None:
+        _PLUGIN_STATUS = {}
+        target_status = _PLUGIN_STATUS
+    else:
+        target_status = plugin_status
     pdir = plugins_dir()
     if not pdir.exists():
         return
@@ -547,13 +687,19 @@ def _load_builtin_plugins() -> None:
             continue
         try:
             manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-            _register_one_plugin(manifest)
+            _register_one_plugin(manifest, target_providers, target_status)
         except Exception as e:  # noqa: BLE001
             logger.warning("插件 %s 清单解析失败: %s", plugin_dir.name, e)
 
 
-def _register_one_plugin(manifest: dict) -> None:
+def _register_one_plugin(
+    manifest: dict,
+    providers: dict[str, object] | None = None,
+    plugin_status: dict[str, dict] | None = None,
+) -> None:
     """注册单个插件: 委托自检 → 可用则动态 import entry 注册进 _PROVIDERS。"""
+    target_providers = _PROVIDERS if providers is None else providers
+    target_status = _PLUGIN_STATUS if plugin_status is None else plugin_status
     name = manifest.get("name")
     if not name or not _NAME_RE.match(name):
         logger.warning("插件清单缺少合法 name: %r", name)
@@ -565,7 +711,7 @@ def _register_one_plugin(manifest: dict) -> None:
     runtime = str(manifest.get("runtime", "none")).lower()
     # 委托检测: 调用插件自己的 check 函数 (node 型/python 型各自实现)
     available, reason = _call_check(manifest.get("check"))
-    _PLUGIN_STATUS[name] = {
+    target_status[name] = {
         "name": name,
         "display_name": manifest.get("display_name", name),
         "datasets": list(manifest.get("datasets", []) or []),
@@ -585,12 +731,12 @@ def _register_one_plugin(manifest: dict) -> None:
         provider_cls = _load_entry(manifest["entry"])
         provider = provider_cls() if isinstance(provider_cls, type) else provider_cls
         provider.builtin = True  # 标记为内置 (list_sources 过滤, 不可被用户编辑/删除)
-        _PROVIDERS[name] = provider
+        target_providers[name] = provider
         logger.info("内置插件 %s 已注册 (runtime=%s)", name, runtime)
     except Exception as e:  # noqa: BLE001
         # 声称可用但 import 失败 → 标记不可用, 避免启动崩溃
-        _PLUGIN_STATUS[name]["available"] = False
-        _PLUGIN_STATUS[name]["status"] = f"加载失败: {e}"
+        target_status[name]["available"] = False
+        target_status[name]["status"] = f"加载失败: {e}"
         logger.warning("插件 %s provider 加载失败: %s", name, e)
 
 

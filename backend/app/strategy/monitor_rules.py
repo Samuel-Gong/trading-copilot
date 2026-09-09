@@ -26,6 +26,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from app.services.definition_transactions import definitions_transaction
+from app.services.fs_utils import atomic_write_text
 from app.strategy.custom_signals import ALLOWED_FIELDS
 from app.strategy.intraday_signals import uses_intraday_signals, uses_price_cross_signals
 
@@ -116,7 +118,7 @@ def load_one(data_dir: Path, rule_id: str) -> dict | None:
 
 
 def save_one(data_dir: Path, rule: dict) -> None:
-    with _LOCK:
+    with definitions_transaction(data_dir), _LOCK:
         p = _path(data_dir, rule["id"])
         p.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary_name = tempfile.mkstemp(
@@ -141,7 +143,7 @@ def save_one(data_dir: Path, rule: dict) -> None:
 
 
 def delete_one(data_dir: Path, rule_id: str) -> bool:
-    with _LOCK:
+    with definitions_transaction(data_dir), _LOCK:
         p = _path(data_dir, rule_id)
         if p.exists():
             p.unlink()
@@ -151,11 +153,18 @@ def delete_one(data_dir: Path, rule_id: str) -> bool:
 
 def delete_for_symbols(data_dir: Path, symbols: set[str]) -> list[str]:
     """从规则移除指定标的,无剩余目标时删除规则,返回变更的规则 ID。"""
+    with definitions_transaction(data_dir):
+        return _delete_for_symbols_locked(data_dir, symbols)
+
+
+def _delete_for_symbols_locked(data_dir: Path, symbols: set[str]) -> list[str]:
+    """在定义图事务中更新指定标的的规则。"""
     targets = {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
     if not targets:
         return []
     with _LOCK:
-        changed: list[str] = []
+        operations: list[tuple[Path, dict | None, str]] = []
+        snapshot: dict[Path, bytes] = {}
         for path in sorted(_dir(data_dir).glob("*.json")):
             try:
                 rule = normalize(json.loads(path.read_text(encoding="utf-8")))
@@ -186,24 +195,31 @@ def delete_for_symbols(data_dir: Path, symbols: set[str]) -> list[str]:
                 for symbol in symbols_value
                 if str(symbol).strip().upper() not in targets
             ]
-            try:
-                if not remaining_symbols:
+            if remaining_symbols:
+                rule["symbols"] = remaining_symbols
+                levels = rule.get("intraday_price_levels")
+                if isinstance(levels, dict):
+                    rule["intraday_price_levels"] = {
+                        symbol: price
+                        for symbol, price in levels.items()
+                        if str(symbol).strip().upper() not in targets
+                    }
+                operations.append((path, rule, rule_id))
+            else:
+                operations.append((path, None, rule_id))
+            snapshot[path] = path.read_bytes()
+
+        try:
+            for path, rule, _rule_id in operations:
+                if rule is None:
                     path.unlink()
                 else:
-                    rule["symbols"] = remaining_symbols
-                    levels = rule.get("intraday_price_levels")
-                    if isinstance(levels, dict):
-                        rule["intraday_price_levels"] = {
-                            symbol: price
-                            for symbol, price in levels.items()
-                            if str(symbol).strip().upper() not in targets
-                        }
                     save_one(data_dir, rule)
-            except OSError as exc:
-                logger.warning("monitor rule update failed %s: %s", path.name, exc)
-                continue
-            changed.append(rule_id)
-        return changed
+        except OSError:
+            for path, content in snapshot.items():
+                atomic_write_text(path, content.decode("utf-8"))
+            raise
+        return [rule_id for _path, _rule, rule_id in operations]
 
 
 # ── 校验 ────────────────────────────────────────────────
@@ -536,6 +552,16 @@ def migrate_strategy_monitors(data_dir: Path, strategy_ids: list[str], strategy_
     Returns:
         本次生成/更新的规则列表
     """
+    with definitions_transaction(data_dir):
+        return _migrate_strategy_monitors_locked(data_dir, strategy_ids, strategy_names)
+
+
+def _migrate_strategy_monitors_locked(
+    data_dir: Path,
+    strategy_ids: list[str],
+    strategy_names: dict[str, str],
+) -> list[dict]:
+    """在定义图事务中迁移策略监控规则。"""
     desired = set(strategy_ids)
     existing = load_all(data_dir)
     # 已存在的策略规则 {strategy_id: rule}

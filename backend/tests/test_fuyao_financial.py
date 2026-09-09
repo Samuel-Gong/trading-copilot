@@ -2,7 +2,7 @@
 
 覆盖: 三大报表字段映射 (canonical 列名 + 扩展列透传 + ISO 日期口径)、
 latest_only 分档 (limit 1 vs 8)、metrics 组装 (eps_basic 顺带 / bps 估值反推 /
-指标 index_id 映射与未知 id 透传 / 单股指标失败不弃行)、shares 恒空、
+指标 index_id 映射与未知 id 透传 / 单股指标失败 fail-closed)、shares 恒空、
 报告期合并写入的逐列填空语义 (并集共存, 新行缺列不覆盖旧值)。
 """
 
@@ -165,21 +165,27 @@ def test_metrics_assembly(monkeypatch):
         prices=[{"thscode": "600519.SH", "last_price": 1297.4}],
     )
     provider = _provider_with(monkeypatch, fake)
-    df = provider.get_financials("metrics", ["600519.SH"], latest_only=True)
-    row = df.to_dicts()[0]
+    monkeypatch.setattr(fp, "cn_today", lambda: fp.date(2026, 9, 7))
+    df = provider.get_financials("metrics", ["600519.SH"], latest_only=True).sort(
+        "announce_date"
+    )
+    row, observed = df.to_dicts()
     assert row["period_end"] == "2026-06-30"
     assert row["announce_date"] == "2026-08-15"
     assert row["eps_basic"] == 35.57  # 顺带取自利润表
-    assert row["bps"] == pytest.approx(1297.4 / 6.455055)  # 估值反推
-    assert row["roe"] == pytest.approx(16.75)  # 字符串 → float
-    assert row["gross_margin"] == pytest.approx(89.5552)
-    assert row["fixed_asset_invest_expansion_ratio"] == pytest.approx(2.125873)
+    assert row["bps"] is None
+    assert observed["announce_date"] == "2026-09-07"
+    assert observed["bps"] == pytest.approx(1297.4 / 6.455055)  # 估值反推
+    assert row["roe"] is None
+    assert observed["roe"] == pytest.approx(16.75)  # 字符串 → float
+    assert observed["gross_margin"] == pytest.approx(89.5552)
+    assert observed["fixed_asset_invest_expansion_ratio"] == pytest.approx(2.125873)
     assert "earned_interest_multiple" not in df.columns  # 全空指标不成列
     assert fake.ind_calls == ["600519.SH@2026-2"]  # report 由利润表最新期反推
 
 
-def test_metrics_indicator_failure_keeps_row(monkeypatch):
-    """指标端点单股失败 (如未披露期 code=5003) → 行仍写入 (eps/bps 保留)。"""
+def test_metrics_indicator_failure_fails_closed(monkeypatch):
+    """指标端点部分失败时整批失败，避免发布不完整的财务快照。"""
     fake = _FakeFinClient(
         statements={"income": [_INCOME_ROW]},
         indicator_error=fc.FuyaoError("code=5003"),
@@ -187,11 +193,9 @@ def test_metrics_indicator_failure_keeps_row(monkeypatch):
         prices=[{"thscode": "600519.SH", "last_price": 1297.4}],
     )
     provider = _provider_with(monkeypatch, fake)
-    df = provider.get_financials("metrics", ["600519.SH"], latest_only=True)
-    row = df.to_dicts()[0]
-    assert row["symbol"] == "600519.SH"
-    assert row["eps_basic"] == 35.57
-    assert "roe" not in df.columns
+    monkeypatch.setattr(fp, "cn_today", lambda: fp.date(2026, 9, 7))
+    with pytest.raises(fc.FuyaoError, match="指标部分失败"):
+        provider.get_financials("metrics", ["600519.SH"], latest_only=True)
 
 
 def test_metrics_skips_symbol_without_income(monkeypatch):

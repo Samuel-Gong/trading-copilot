@@ -696,11 +696,13 @@ def test_regime_range_recompute_publishes_mainline_coverage_in_one_transaction(
     ) == {"concept", "industry"}
 
 
-def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
+def test_manual_mainline_recompute_rejects_busy_pipeline_without_blocking_readers(
     tmp_path,
     monkeypatch,
 ):
-    """后台 regime 计算与手动主线重算必须共享完整计算区间锁。"""
+    """并发更新立即拒绝，计算期间读者仍可读取上一份快照。"""
+    from app.services.market_environment_lock import market_environment_snapshot
+    from app.services.update_slots import UpdateBusyError
     target = date(2026, 8, 25)
     regime_entered = threading.Event()
     release_regime = threading.Event()
@@ -774,16 +776,21 @@ def test_manual_mainline_recompute_waits_for_pipeline_regime_update(
     pipeline_thread.start()
     assert regime_entered.wait(1)
     manual_thread.start()
-    blocked = not mainline_entered.wait(0.2)
-    release_regime.set()
+    manual_thread.join(0.5)
+    try:
+        assert not manual_thread.is_alive()
+        assert not mainline_entered.is_set()
+        assert len(errors) == 1
+        assert isinstance(errors[0], UpdateBusyError)
+        with market_environment_snapshot(tmp_path):
+            assert not release_regime.is_set()
+    finally:
+        release_regime.set()
     pipeline_thread.join(2)
     manual_thread.join(2)
 
-    assert blocked
-    assert mainline_entered.is_set()
     assert not pipeline_thread.is_alive()
     assert not manual_thread.is_alive()
-    assert errors == []
 
 
 def test_regime_phases_waits_for_market_environment_snapshot(tmp_path, monkeypatch):

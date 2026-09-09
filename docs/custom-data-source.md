@@ -4,18 +4,21 @@
 
 ## 支持范围
 
-当前自定义源支持六类数据:
+当前自定义源支持七类数据:
 
 | 数据集 | 配置名 | 说明 |
 | --- | --- | --- |
 | 日K | `daily` | 批量返回一组股票在指定区间内的日K |
+| 标的维表 | `instruments` | 返回股票池及名称、上市日期、当前股本等字段；至少提供 `symbol` |
 | 除权因子 | `adj_factor` | 批量返回一组股票的复权因子 |
 | 实时行情 | `realtime` | 返回全市场快照,用于盘中 enriched 增量计算 |
 | 分钟K | `minute` | 返回 1m 分钟K(需映射出 symbol / datetime / OHLC / 量额) |
 | 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s) |
-| 财务数据 | `financial` | 一个配置覆盖全部财务表,请求时把表名作为参数传给上游;字段由数据源决定,仅需映射出 symbol |
+| 财务数据 | `financial` | 一个配置覆盖全部财务表，请求时把表名作为参数传给上游；必须映射 `symbol`、`period_end`、`announce_date`，比例指标还要声明单位 |
 
 深度盘口(depth5)暂无数据集契约,仍由 TickFlow 提供。
+
+选择自定义日K源时，必须同时声明 `daily` 和 `instruments`，避免行情源与股票池不一致。旧配置若缺少维表能力会显示为不可用，不会静默切换到 TickFlow；补齐后重新加载并选择即可。维表中的当前股本不用于填充历史回测，历史股本必须通过财务公告日期确定可用时点。
 
 `full_minute` 声明式源只提供修复轮(当日窗口批量);廉价增量端点
 (`get_intraday_latest`)是 Python 插件契约,见
@@ -46,11 +49,20 @@ auth:
   type: none
 
 datasets:
+  instruments:
+    url: http://127.0.0.1:3021/instruments
+    method: GET
+    response_path: data
+    field_map:
+      ts_code: symbol
+      name: name
+
   daily:
     url: http://127.0.0.1:3021/daily
     method: POST
     batch: 100
     rpm: 200
+    volume_unit: lots
     response_path: data
     field_map:
       ts_code: symbol
@@ -69,6 +81,7 @@ datasets:
     method: POST
     batch: 100
     rpm: 200
+    adj_factor_kind: event_ratio
     response_path: data
     field_map:
       ts_code: symbol
@@ -81,6 +94,8 @@ datasets:
     url: http://127.0.0.1:3021/realtime
     method: GET
     rpm: 60
+    pct_unit: decimal
+    volume_unit: lots
     response_path: data
     field_map:
       ts_code: symbol
@@ -96,6 +111,7 @@ datasets:
       amount_change: change_amount
       amplitude: amplitude
       turnover: turnover_rate
+      timestamp: timestamp
 ```
 
 ## 字段契约
@@ -107,7 +123,7 @@ datasets:
 | `symbol` | 标准代码,如 `000001.SZ` |
 | `date` | 交易日 |
 | `open` / `high` / `low` / `close` | 不复权 OHLC |
-| `volume` | 成交量 |
+| `volume` | 成交量；内部单位为手，配置必须声明 `volume_unit` |
 | `amount` | 成交额 |
 
 ### adj_factor 必填
@@ -116,17 +132,33 @@ datasets:
 | --- | --- |
 | `symbol` | 标准代码 |
 | `trade_date` | 除权日期 |
-| `ex_factor` | 复权因子 |
+| `ex_factor` | 单次除权事件的 pre/post 比值 |
+
+`adj_factor` 必须声明 `adj_factor_kind`。`event_ratio` 表示接口已返回单次事件比值；
+`cumulative` 表示接口返回按日期递增的累计因子，Provider 会转换为相邻累计值之比，
+避免把累计序列再次连乘。
 
 ### realtime 必填
 
 | 内部字段 | 含义 |
 | --- | --- |
 | `symbol` | 标准代码 |
+| `timestamp` | 服务端正整数 Unix epoch 毫秒；用于换算北京交易日归属，缺失或无效时整份快照 fail-closed |
 | `last_price` | 最新价 |
 | `prev_close` | 昨收 |
 | `open` / `high` / `low` | 当日 OHLC |
-| `volume` | 成交量 |
+| `volume` | 成交量；内部单位为手，配置必须声明 `volume_unit` |
+
+### financial 必填与单位
+
+所有财务表都必须映射 `symbol`、`period_end`（报告期）和 `announce_date`（公告日）。
+缺少公告时间的数据无法满足 point-in-time 契约，会被拒绝而不会进入策略或回测。
+
+当 `field_map` 映射 `roe`、`gross_margin`、`net_margin`、`revenue_yoy`、
+`net_income_yoy` 或 `debt_to_asset_ratio` 时，必须声明 `pct_unit`：
+
+- `percent`：上游 `20` 表示 `20%`，内部保持为 `20`；
+- `decimal`：上游 `0.2` 表示 `20%`，写入前乘以 `100`。
 
 建议实时接口额外提供 `amount`、`change_pct`、`change_amount`、`amplitude`、`turnover_rate`、`name`。缺失时部分字段会由 pipeline 回算,但精度取决于可用输入。
 
@@ -136,7 +168,7 @@ datasets:
 datasets:
   realtime:
     url: https://api.example.com/snapshot
-    pct_unit: percent   # 接口返回 3.66 表示 3.66%;小数制源声明 decimal 或省略
+    pct_unit: percent   # 接口返回 3.66 表示 3.66%;小数制源必须声明 decimal
 ```
 
 处理规则:
@@ -145,8 +177,14 @@ datasets:
 | --- | --- |
 | `pct_unit: percent` | `change_pct` / `amplitude` / `turnover_rate` 无条件 `/100` |
 | `pct_unit: decimal` | 三列原样透传 |
-| 未声明 | `change_pct` 按截面中位数归一(A 股涨跌停 30% 上限使两种单位物理可分);`amplitude` / `turnover_rate` **置 `None`** 交由 pipeline 按价格与股本口径重算,并记录 WARNING |
-| 列已配置 `transforms` | 视为用户已接管该列单位,原样透传 |
+| 未声明 | 配置校验失败;防御性运行路径会把所有比例列置 `None`,绝不根据数值猜测 |
+
+只要 `field_map` 映射了任一比例字段,即使同时配置了 `transforms`,也必须声明 `pct_unit`。
+
+`daily`、`realtime`、`minute` 或 `full_minute` 只要映射 `volume`，都必须显式声明：
+
+- `volume_unit: lots`：上游已按手返回，原样使用；
+- `volume_unit: shares`：上游按股返回，写入前除以 `100`。
 
 ## 请求约定
 
@@ -206,7 +244,7 @@ auth:
   token_env: MY_DATA_TOKEN
 ```
 
-Token 可以放在系统环境变量或项目 `.env` 中。
+启用鉴权时 `token_env` 必填，且必须是合法环境变量名。Token 可以放在系统环境变量或项目 `.env` 中；变量未设置时请求会直接失败，不会以匿名方式访问上游。
 
 ## 联调流程
 
@@ -283,14 +321,14 @@ cp docs/examples/custom-data-source/mock_source.yaml data/data_sources/mock_sour
 除权因子 (adj_factor):
   symbol = 股票代码
   trade_date = 除权日期
-  ex_factor = 复权因子
+  ex_factor = 复权因子（需声明 adj_factor_kind: event_ratio 或 cumulative）
 
 实时行情 (realtime):
   symbol = 股票代码
   last_price = 最新价
   prev_close = 昨收价
   open / high / low = 当日 OHLC
-  volume = 成交量
+  volume = 成交量（需声明 volume_unit: lots 或 shares）
   amount = 成交额
   change_pct = 涨跌幅 (小数, 0.0366 = 3.66%)
   change_amount = 涨跌额
@@ -298,6 +336,7 @@ cp docs/examples/custom-data-source/mock_source.yaml data/data_sources/mock_sour
   turnover_rate = 换手率 (小数, 0.05 = 5%)
   # 上游若返回百分数值 (3.66 表示 3.66%), 在 realtime 数据集声明 pct_unit: percent,
   # 不要依赖数值自动识别; 逐列转换也可用 transforms: turnover_rate: "value / 100"
+  # daily/realtime/minute/full_minute 映射 volume 时必须声明 volume_unit: lots 或 shares
 
 分钟K (minute) 与 全量分钟 (full_minute, 字段同 minute):
   symbol = 股票代码

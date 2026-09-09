@@ -163,7 +163,7 @@ def test_run_regime_batch_does_not_apply_current_st_snapshot(tmp_path, monkeypat
         part.write_bytes(b"cache-fixture")
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
         def get_enriched_range(self, start, end):
@@ -209,7 +209,7 @@ def test_run_regime_batch_cache_path_loads_previous_trading_day(tmp_path, monkey
         part.write_bytes(b"cache-only-placeholder")
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
         def get_enriched_range(self, start, end):
@@ -412,7 +412,7 @@ def test_detect_stale_dates_by_mtime(tmp_path):
         "state": ["range", "range"], "score": [50, 50],
     }))
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
     regime_builder.mark_regime_range_processed(
         tmp_path,
@@ -439,7 +439,7 @@ def test_date_source_version_survives_unrelated_partial_recompute(tmp_path):
         part.write_bytes(b"source-v1")
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
     repo = _FakeRepo()
@@ -483,7 +483,7 @@ def test_index_source_version_marks_regime_date_stale(tmp_path):
     index.write_bytes(b"index-v1")
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
     repo = _FakeRepo()
@@ -518,7 +518,7 @@ def test_compute_incremental_missing_dates(tmp_path):
         (d / "part.parquet").write_bytes(b"x")
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
         def get_enriched_range(self, *a, **k): return None  # 无缓存, 不实际算
 
@@ -546,7 +546,7 @@ def test_compute_incremental_defaults_to_cn_business_date(tmp_path, monkeypatch)
     )
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
     regime_builder.compute_regime_incremental(_FakeRepo(), tmp_path)
@@ -571,7 +571,7 @@ def test_compute_incremental_clears_stale_date_when_recompute_is_empty(
         "score": [50, 80],
     }))
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
     regime_builder.mark_regime_range_processed(
         tmp_path,
@@ -616,7 +616,7 @@ def test_compute_incremental_rejects_source_change_before_publish(
     published: list[object] = []
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
     def change_source_during_compute(*args, **kwargs):
@@ -657,7 +657,7 @@ def test_compute_incremental_publishes_labeled_history_and_coverage_together(
     published: list[list[tuple[object, pl.DataFrame]]] = []
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
     monkeypatch.setattr(
@@ -712,7 +712,7 @@ def test_compute_incremental_phase_label_failure_keeps_old_snapshot(
     published: list[object] = []
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
     monkeypatch.setattr(
@@ -765,7 +765,7 @@ def test_compute_incremental_clears_deleted_enriched_date(
         "score": [50, 80],
     }))
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
     regime_builder.mark_regime_range_processed(
         tmp_path,
@@ -797,7 +797,7 @@ def test_run_regime_batch_ignores_cached_deleted_target(tmp_path):
     target = date(2026, 1, 2)
 
     class _FakeRepo:
-        class store:
+        class store:  # noqa: N801
             data_dir = tmp_path
 
         def get_enriched_range(self, start, end):

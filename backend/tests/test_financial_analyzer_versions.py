@@ -40,8 +40,11 @@ def test_current_financial_analysis_uses_latest_version_per_report_period(
 
     monkeypatch.setattr(
         financial_analyzer,
-        "get_financial_df",
-        lambda _data_dir, table: metrics if table == "metrics" else pl.DataFrame(),
+        "get_financial_snapshot",
+        lambda _data_dir: {
+            table: metrics if table == "metrics" else pl.DataFrame()
+            for table in financial_analyzer.FINANCIAL_TABLES
+        },
     )
 
     rows = financial_analyzer._load_stock_financials(tmp_path, "600000.SH")["metrics"]

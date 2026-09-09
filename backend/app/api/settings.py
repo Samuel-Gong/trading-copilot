@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Literal
 
@@ -44,6 +45,14 @@ def _sync_financial_scheduler_caps(app_state, capset) -> None:
         fs.update_capabilities(capset)
     except Exception as e:  # noqa: BLE001
         logging.getLogger(__name__).warning("update financial_scheduler capabilities failed: %s", e)
+
+
+def _refresh_provider_runtime(request: Request) -> None:
+    """Provider 注册变化后同步能力快照及长寿命消费者。"""
+    capset = detect_capabilities()
+    request.app.state.capabilities = capset
+    _sync_financial_scheduler_caps(request.app.state, capset)
+    _reconcile_quote_service(request.app.state)
 
 
 class TickflowKeyIn(BaseModel):
@@ -290,55 +299,61 @@ def save_ai_settings(req: AiSettingsIn) -> dict:
         normalize_codex_reasoning_effort,
     )
 
-    updates: dict = {}
-    if req.provider:
-        updates["ai_provider"] = req.provider
-        settings.ai_provider = req.provider
+    # 所有可能失败的规范化与数值校验必须先完成，避免返回 400 时留下部分配置。
+    if req.max_output_tokens is not None and req.max_output_tokens <= 0:
+        raise HTTPException(status_code=400, detail="输出上限必须为正整数")
+    if req.context_window is not None and req.context_window <= 0:
+        raise HTTPException(status_code=400, detail="上下文窗口必须为正整数")
+    codex_command = None
+    codex_reasoning_effort = None
     if req.provider == "codex_cli":
-        updates["ai_codex_model"] = normalize_codex_model(req.model)
         try:
             codex_command = normalize_codex_command(req.codex_command)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        codex_reasoning_effort = normalize_codex_reasoning_effort(req.codex_reasoning_effort)
+        codex_reasoning_effort = normalize_codex_reasoning_effort(
+            req.codex_reasoning_effort
+        )
+
+    updates: dict = {}
+    delete_keys: tuple[str, ...] = ()
+    if req.provider:
+        updates["ai_provider"] = req.provider
+    if req.provider == "codex_cli":
+        updates["ai_codex_model"] = normalize_codex_model(req.model)
         updates["ai_codex_command"] = codex_command
         updates["ai_codex_reasoning_effort"] = codex_reasoning_effort
-        settings.ai_codex_command = codex_command
-        settings.ai_codex_reasoning_effort = codex_reasoning_effort
     else:
         if req.base_url:
             updates["ai_base_url"] = req.base_url
-            settings.ai_base_url = req.base_url
         if req.api_key is not None:
             if req.api_key:
                 updates["ai_api_key"] = req.api_key
-                settings.ai_api_key = req.api_key
             else:
-                secrets_store.clear("ai_api_key")
-                settings.ai_api_key = ""
+                delete_keys = ("ai_api_key",)
         if req.model:
             updates["ai_model"] = req.model
-            settings.ai_model = req.model
         if req.provider == OPENAI_PROVIDER:
             updates["ai_reasoning_effort"] = req.reasoning_effort.strip()
     # user_agent 允许清空(回到默认浏览器 UA),故无条件持久化
     updates["ai_user_agent"] = req.user_agent
-    settings.ai_user_agent = req.user_agent
 
     # 输出上限 / 输入上下文窗口 (数值配置, 缺省保持原值)
     if req.max_output_tokens is not None:
-        if req.max_output_tokens <= 0:
-            raise HTTPException(status_code=400, detail="输出上限必须为正整数")
         updates["ai_max_output_tokens"] = req.max_output_tokens
-        settings.ai_max_output_tokens = req.max_output_tokens
     if req.context_window is not None:
-        if req.context_window <= 0:
-            raise HTTPException(status_code=400, detail="上下文窗口必须为正整数")
         updates["ai_context_window"] = req.context_window
-        settings.ai_context_window = req.context_window
 
-    if updates:
-        secrets_store.save(updates)
+    if updates or delete_keys:
+        if delete_keys:
+            secrets_store.save(updates, delete_keys=delete_keys)
+        else:
+            secrets_store.save(updates)
+    for key, value in updates.items():
+        if hasattr(settings, key):
+            setattr(settings, key, value)
+    if delete_keys:
+        settings.ai_api_key = ""
 
     provider = current_ai_provider()
     return {
@@ -406,10 +421,16 @@ def _minute_history_days() -> int | None:
     """
     from app.services import kline_sync, preferences
     provider_name = preferences.get_minute_data_provider()
-    provider, fallback, _err = kline_sync._resolve_minute_provider(provider_name)
-    if fallback or provider is None:
+    available, fallback, _err = kline_sync._resolve_minute_provider(provider_name)
+    if fallback or available is None:
         return None
-    return getattr(provider, "minute_history_days", None)
+    from app.data_providers import custom as custom_sources
+
+    try:
+        with custom_sources.lease_provider(provider_name) as (provider, _generation):
+            return getattr(provider, "minute_history_days", None)
+    except Exception:
+        return None
 
 
 class MinuteSyncPrefs(BaseModel):
@@ -465,6 +486,9 @@ class DatasetConfigIn(BaseModel):
     end_param: str = "end_time"
     asset_type_param: str | None = None
     freq_param: str | None = None
+    pct_unit: Literal["percent", "decimal"] | None = None
+    volume_unit: Literal["lots", "shares"] | None = None
+    adj_factor_kind: Literal["event_ratio", "cumulative"] | None = None
     timeout: float | None = Field(
         default=None,
         gt=0,
@@ -600,6 +624,7 @@ def get_capability_matrix() -> dict:
             "realtime_data_provider": preferences.get_realtime_data_provider(),
             "daily_data_provider": preferences.get_daily_data_provider(),
             "minute_data_provider": preferences.get_minute_data_provider(),
+            "full_minute_data_provider": preferences.get_full_minute_data_provider(),
             "depth5_data_provider": preferences.get_depth5_data_provider(),
             "adj_factor_provider": preferences.get_adj_factor_provider(),
             "financial_data_provider": preferences.get_financial_provider(),
@@ -609,7 +634,7 @@ def get_capability_matrix() -> dict:
 
 
 @router.post("/plugin-key")
-def save_plugin_key(req: PluginKeyIn) -> dict:
+def save_plugin_key(req: PluginKeyIn, request: Request) -> dict:
     """保存插件 API Key(先探后存, 对齐 /tickflow-key 语义)。
 
     流程: probe_plugin_key 用候选 Key 实探 → 有效才写 secrets.json
@@ -626,6 +651,7 @@ def save_plugin_key(req: PluginKeyIn) -> dict:
         return {"ok": False, "reason": "invalid", "error": message}
     secrets_store.save({f"{name}_api_key": key})
     custom_sources.load_all()
+    _refresh_provider_runtime(request)
     status = next((p for p in custom_sources.list_plugins() if p["name"] == name), None)
     return {
         "ok": True,
@@ -636,7 +662,7 @@ def save_plugin_key(req: PluginKeyIn) -> dict:
 
 
 @router.delete("/plugin-key/{name}")
-def clear_plugin_key(name: str) -> dict:
+def clear_plugin_key(name: str, request: Request) -> dict:
     """清除插件的界面配置 Key(secrets.json);.env 里的同名变量仍然生效。"""
     from app.data_providers import custom as custom_sources
 
@@ -647,6 +673,7 @@ def clear_plugin_key(name: str) -> dict:
         raise HTTPException(status_code=400, detail=f"插件 '{name}' 不支持在界面配置 Key")
     secrets_store.clear(f"{name.lower()}_api_key")
     custom_sources.load_all()
+    _refresh_provider_runtime(request)
     status = next((p for p in custom_sources.list_plugins() if p["name"] == name), None)
     return {
         "ok": True,
@@ -656,15 +683,17 @@ def clear_plugin_key(name: str) -> dict:
 
 
 @router.post("/data-sources/reload")
-def reload_data_sources() -> dict:
+def reload_data_sources(request: Request) -> dict:
     """重新加载 data_sources/*.yaml。"""
     from app.data_providers import custom as custom_sources
-    custom_sources.load_all()
-    return list_data_sources()
+    with custom_sources.mutation_lock():
+        custom_sources.load_all()
+        _refresh_provider_runtime(request)
+        return list_data_sources()
 
 
 @router.post("/plugins/{name}/install")
-def install_plugin(name: str) -> dict:
+def install_plugin(name: str, request: Request) -> dict:
     """安装指定插件的依赖 (npm install / pip install), 完成后重新扫描。
 
     根据 plugin.yaml 的 runtime 字段决定安装方式。安装可能耗时较长 (网络下载),
@@ -673,17 +702,34 @@ def install_plugin(name: str) -> dict:
     from app.data_providers import custom as custom_sources
     if not custom_sources.is_builtin(name):
         raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
-    ok, message = custom_sources.install_plugin(name)
-    # 无论成功失败都重新扫描, 刷新插件状态 (安装可能部分成功)
-    custom_sources.load_all()
-    result = list_data_sources()
+    with custom_sources.mutation_lock():
+        ok, message = custom_sources.install_plugin(name)
+        # 无论成功失败都重新扫描, 刷新插件状态 (安装可能部分成功)
+        custom_sources.load_all()
+        _refresh_provider_runtime(request)
+        result = list_data_sources()
     result["install_ok"] = ok
     result["install_message"] = message
     return result
 
 
+def _provider_route_fallback_updates(provider_name: str) -> dict[str, str]:
+    """从能力注册表统一推导卸载/删除 Provider 后的路由回退。"""
+    from app.data_providers.capabilities import CAPABILITY_REGISTRY
+    from app.services import preferences
+
+    normalized_name = provider_name.lower()
+    raw_preferences = preferences.load()
+    return {
+        item["field"]: item["default"]
+        for item in CAPABILITY_REGISTRY
+        if item.get("field")
+        and str(raw_preferences.get(item["field"]) or "").lower() == normalized_name
+    }
+
+
 @router.delete("/plugins/{name}/install")
-def uninstall_plugin(name: str) -> dict:
+def uninstall_plugin(name: str, request: Request) -> dict:
     """卸载指定插件的依赖 (删除 node_modules / pip uninstall), 完成后重新扫描。
 
     如果该插件当前正被使用, 自动回退到 tickflow。
@@ -692,18 +738,15 @@ def uninstall_plugin(name: str) -> dict:
     from app.services import preferences
     if not custom_sources.is_builtin(name):
         raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
-    ok, message = custom_sources.uninstall_plugin(name)
-    # 卸载后若该插件正被使用, 回退 tickflow
-    for getter, key, default in [
-        (preferences.get_daily_data_provider, "daily_data_provider", "tickflow"),
-        (preferences.get_minute_data_provider, "minute_data_provider", "tickflow"),
-        (preferences.get_realtime_data_provider, "realtime_data_provider", "tickflow"),
-        (preferences.get_financial_provider, "financial_data_provider", "tickflow"),
-    ]:
-        if getter() == name:
-            preferences.save({key: default})
-    custom_sources.load_all()
-    result = list_data_sources()
+    with custom_sources.mutation_lock():
+        ok, message = custom_sources.uninstall_plugin(name)
+        # 卸载后若该插件正被使用, 按注册表一次性回退全部路由字段。
+        updates = _provider_route_fallback_updates(name)
+        if updates:
+            preferences.save(updates)
+        custom_sources.load_all()
+        _refresh_provider_runtime(request)
+        result = list_data_sources()
     result["uninstall_ok"] = ok
     result["uninstall_message"] = message
     return result
@@ -720,17 +763,39 @@ def get_data_source(name: str) -> dict:
 
 
 @router.post("/data-sources")
-def save_data_source(req: CustomSourceIn) -> dict:
+def save_data_source(req: CustomSourceIn, request: Request) -> dict:
     """创建或更新一个自定义数据源 yaml, 保存后自动 reload。"""
     from app.data_providers import custom as custom_sources
     config = req.model_dump()
     config["name"] = (config.get("name") or "").lower()
-    try:
-        custom_sources.save_config(config["name"], config)
-        custom_sources.load_all()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    return list_data_sources()
+    if not re.fullmatch(r"[a-z0-9_]+", config["name"]):
+        raise HTTPException(
+            status_code=400,
+            detail="数据源名称仅允许小写字母、数字和下划线",
+        )
+    with custom_sources.mutation_lock():
+        target = custom_sources.data_sources_dir() / f"{config['name']}.yaml"
+        previous = target.read_text(encoding="utf-8") if target.exists() else None
+        try:
+            candidate = custom_sources.create_provider(config)
+            candidate.close()
+            custom_sources.save_config(config["name"], config)
+            custom_sources.load_all()
+            with custom_sources.lease_provider(config["name"]):
+                pass
+        except Exception as exc:
+            from app.services.fs_utils import atomic_write_text
+
+            try:
+                if previous is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    atomic_write_text(target, previous)
+            finally:
+                custom_sources.load_all()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _refresh_provider_runtime(request)
+        return list_data_sources()
 
 
 @router.delete("/data-sources/{name}")
@@ -741,28 +806,18 @@ def delete_data_source(name: str, request: Request) -> dict:
     """
     from app.data_providers import custom as custom_sources
     from app.services import preferences
-    try:
-        custom_sources.delete_config(name)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    custom_sources.load_all()
-    # 回退被删源的偏好
-    updates: dict = {}
-    if preferences.get_daily_data_provider() == name:
-        updates["daily_data_provider"] = "tickflow"
-    if preferences.get_realtime_data_provider() == name:
-        updates["realtime_data_provider"] = "tickflow"
-    if preferences.get_financial_provider() == name:
-        updates["financial_data_provider"] = "tickflow"
-    if preferences.get_adj_factor_provider() == name:
-        updates["adj_factor_provider"] = "tickflow"
-    if updates:
-        preferences.save(updates)
-    # 删除源可能触发偏好回退 tickflow, 同步刷新能力快照
-    capset = detect_capabilities()
-    request.app.state.capabilities = capset
-    _sync_financial_scheduler_caps(request.app.state, capset)
-    return list_data_sources()
+    with custom_sources.mutation_lock():
+        updates = _provider_route_fallback_updates(name)
+        try:
+            custom_sources.delete_config(name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        custom_sources.load_all()
+        if updates:
+            preferences.save(updates)
+        # 删除源可能触发偏好回退 tickflow, 同步刷新能力快照
+        _refresh_provider_runtime(request)
+        return list_data_sources()
 
 
 @router.post("/data-sources/test")
@@ -780,9 +835,9 @@ def test_data_source(req: CustomSourceTestIn) -> dict:
                 raise ValueError(f"dataset '{req.dataset}' is not configured")
             config["datasets"] = {req.dataset: dataset_config}
             provider = custom_sources.create_provider(config)
-        else:
-            provider = custom_sources.get_provider(req.provider)
-        return provider.test_dataset(req.dataset, req.symbols)
+            return provider.test_dataset(req.dataset, req.symbols)
+        with custom_sources.lease_provider(req.provider) as (leased, _generation):
+            return leased.test_dataset(req.dataset, req.symbols)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"自定义数据源测试失败: {e}") from e
     finally:
@@ -793,14 +848,25 @@ def test_data_source(req: CustomSourceTestIn) -> dict:
 @router.put("/preferences/data-providers")
 def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
     """保存数据源选择。"""
+    from app.data_providers import custom as custom_sources
     from app.services import preferences
     updates = req.model_dump(exclude_none=True)
+    daily_provider = updates.get("daily_data_provider")
+    if daily_provider and daily_provider != "tickflow":
+        if not custom_sources.provider_has_dataset(daily_provider, "daily"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"日K数据源 '{daily_provider}' 不可用或未声明 daily 数据集",
+            )
+        if not custom_sources.provider_has_dataset(daily_provider, "instruments"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"日K数据源 '{daily_provider}' 必须同时提供 instruments 标的维表",
+            )
     if updates:
         preferences.save(updates)
     # 刷新能力快照: 当前 provider 变化会改变自定义源能力增广结果 (读缓存, 无网络请求)
-    capset = detect_capabilities()
-    request.app.state.capabilities = capset
-    _sync_financial_scheduler_caps(request.app.state, capset)
+    _refresh_provider_runtime(request)
     return {
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
@@ -1020,7 +1086,7 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
         if repo is not None:
             try:
                 issues = data_integrity.scan_recent_integrity(repo.store.data_dir)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 issues = []
             earliest = data_integrity.earliest_issue_day(issues)
             if issues and data_integrity.within_auto_repair_window(earliest):
@@ -1095,9 +1161,10 @@ def update_realtime_monitor_config(req: RealtimeMonitorConfigIn, request: Reques
         data_dir = request.app.state.repo.store.data_dir
         if monitor_engine is not None and strategy_engine is not None:
             from app.api.monitor_rules import sync_engine
+            from app.services.definition_transactions import definitions_transaction
             from app.strategy import monitor_rules as mr_store
             try:
-                with mr_store.locked():
+                with definitions_transaction(data_dir), mr_store.locked():
                     if preferences.get_strategy_monitor_enabled():
                         ids = preferences.get_strategy_monitor_ids()
                         names = {s.id: s.name for s in strategy_engine.list_strategies()}
@@ -1288,8 +1355,7 @@ def test_webhook(req: WebhookTestIn) -> dict:
     未配置 / 地址非法 / 发送失败均返回 HTTP 200 + {ok: False}，
     前端统一读 detail 渲染绿/红，不抛 400。
     """
-    from app.services import preferences
-    from app.services import webhook_adapter
+    from app.services import preferences, webhook_adapter
 
     title = "TickFlow Stock Panel 推送测试"
     body = "如果你看到这条消息，说明推送配置正确 🎉"

@@ -7,7 +7,15 @@ from typing import Any, Literal
 
 import yaml
 
-DatasetName = Literal["daily", "adj_factor", "realtime", "minute", "financial"]
+DatasetName = Literal[
+    "daily",
+    "adj_factor",
+    "realtime",
+    "minute",
+    "full_minute",
+    "financial",
+    "instruments",
+]
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
 
@@ -37,9 +45,13 @@ class DatasetConfig:
     end_param: str = "end_time"
     asset_type_param: str | None = None
     freq_param: str | None = None
-    # realtime 比例字段(change_pct/amplitude/turnover_rate)的单位声明:
-    # "percent"(返回 3.66 表示 3.66%)或 "decimal"(返回 0.0366 表示 3.66%)。
+    # realtime/financial 比例字段的单位声明。realtime 内部统一为小数制，
+    # financial 指标内部统一为百分数值（20 表示 20%）。
     pct_unit: str | None = None
+    # volume 内部统一为“手”；shares 源会在 Provider 边界除以 100。
+    volume_unit: str | None = None
+    # adj_factor 内部统一为单次除权事件 pre/post 比值。
+    adj_factor_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,9 +68,10 @@ class CustomSourceConfig:
 
 def _auth_from_dict(raw: dict[str, Any] | None) -> AuthConfig:
     raw = raw or {}
+    token_env = str(raw.get("token_env") or "").strip() or None
     return AuthConfig(
         type=str(raw.get("type", "none") or "none").lower(),
-        token_env=raw.get("token_env"),
+        token_env=token_env,
         header=str(raw.get("header", "Authorization") or "Authorization"),
         param=str(raw.get("param", "token") or "token"),
     )
@@ -81,6 +94,17 @@ def _dataset_from_dict(raw: dict[str, Any]) -> DatasetConfig:
     pct_unit = str(raw.get("pct_unit") or "").strip().lower() or None
     if pct_unit not in (None, "percent", "decimal"):
         raise ValueError(f"pct_unit must be 'percent' or 'decimal', got {pct_unit!r}")
+    volume_unit = str(raw.get("volume_unit") or "").strip().lower() or None
+    if volume_unit not in (None, "lots", "shares"):
+        raise ValueError(
+            f"volume_unit must be 'lots' or 'shares', got {volume_unit!r}"
+        )
+    adj_factor_kind = str(raw.get("adj_factor_kind") or "").strip().lower() or None
+    if adj_factor_kind not in (None, "event_ratio", "cumulative"):
+        raise ValueError(
+            "adj_factor_kind must be 'event_ratio' or 'cumulative', "
+            f"got {adj_factor_kind!r}"
+        )
 
     return DatasetConfig(
         url=str(raw.get("url", "") or ""),
@@ -99,6 +123,8 @@ def _dataset_from_dict(raw: dict[str, Any]) -> DatasetConfig:
         asset_type_param=(str(raw.get("asset_type_param") or "").strip() or None),
         freq_param=(str(raw.get("freq_param") or "").strip() or None),
         pct_unit=pct_unit,
+        volume_unit=volume_unit,
+        adj_factor_kind=adj_factor_kind,
     )
 
 
@@ -106,7 +132,16 @@ def config_from_dict(raw: dict[str, Any], path: Path | None = None) -> CustomSou
     datasets = {
         name: _dataset_from_dict(cfg)
         for name, cfg in (raw.get("datasets") or {}).items()
-        if name in {"daily", "adj_factor", "realtime", "minute", "financial"} and isinstance(cfg, dict)
+        if name in {
+            "daily",
+            "adj_factor",
+            "realtime",
+            "minute",
+            "full_minute",
+            "financial",
+            "instruments",
+        }
+        and isinstance(cfg, dict)
     }
     default_name = path.stem if path else "preview"
     name = str(raw.get("name", default_name) or default_name).lower()

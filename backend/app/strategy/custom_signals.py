@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
 from pathlib import Path
+
+from app.services.definition_transactions import definitions_transaction
 
 import polars as pl
 
@@ -75,7 +79,12 @@ def allowed_fields() -> frozenset[str]:
     """
     from app.factors.registry import all_factors
 
-    return frozenset(ALLOWED_FIELDS | {spec.id for spec in all_factors()})
+    runtime_factor_ids = {
+        spec.id
+        for spec in all_factors()
+        if not spec.pit and {"stock", "etf"}.issubset(spec.asset_types)
+    }
+    return frozenset(ALLOWED_FIELDS | runtime_factor_ids)
 
 
 def materialize_factor_columns(
@@ -106,7 +115,29 @@ def materialize_factor_columns(
         return df
     from app.strategy.scoring import materialize_scoring_columns
 
-    return materialize_scoring_columns(df, sorted(to_compute))
+    try:
+        return materialize_scoring_columns(df, sorted(to_compute))
+    except ValueError as exc:
+        logger.warning("custom signal factor materialization partially failed: %s", exc)
+
+    # 历史遗留定义可能引用现已不支持的 PIT/单资产因子。逐信号隔离补算,
+    # 让可计算信号继续工作; 缺列的表达式随后由 inject 自身跳过。
+    result = df
+    for signal_name, expression in exprs.items():
+        if needed is not None and signal_name not in needed:
+            continue
+        dependencies = expression_dependencies({signal_name: expression})[signal_name]
+        signal_factors = {
+            name for name in dependencies
+            if name not in result.columns and name in factor_ids
+        }
+        if not signal_factors:
+            continue
+        try:
+            result = materialize_scoring_columns(result, sorted(signal_factors))
+        except ValueError as exc:
+            logger.warning("custom signal %s skipped: %s", signal_name, exc)
+    return result
 
 
 # ── 持久化（镜像 strategy/config.py 的写法）──────────────
@@ -133,17 +164,35 @@ def load_all(data_dir: Path) -> list[dict]:
 
 
 def save_one(data_dir: Path, sig: dict) -> None:
-    p = _path(data_dir, sig["id"])
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(sig, ensure_ascii=False, indent=2), encoding="utf-8")
+    with definitions_transaction(data_dir):
+        p = _path(data_dir, sig["id"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                fd = -1
+                json.dump(sig, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, p)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            temporary.unlink(missing_ok=True)
 
 
 def delete_one(data_dir: Path, signal_id: str) -> bool:
-    p = _path(data_dir, signal_id)
-    if p.exists():
-        p.unlink()
-        return True
-    return False
+    with definitions_transaction(data_dir):
+        p = _path(data_dir, signal_id)
+        if p.exists():
+            p.unlink()
+            return True
+        return False
 
 
 # ── 校验 ────────────────────────────────────────────────

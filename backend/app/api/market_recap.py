@@ -46,8 +46,8 @@ def get_dragon_tiger(
     if date:
         try:
             target = date_cls.fromisoformat(date)
-        except ValueError:
-            raise HTTPException(400, f"date 格式应为 YYYY-MM-DD, 收到: {date}")
+        except ValueError as exc:
+            raise HTTPException(400, f"date 格式应为 YYYY-MM-DD, 收到: {date}") from exc
     return dragon_tiger.get_dragon_tiger(
         request.app.state.repo.store.data_dir, target
     )
@@ -66,8 +66,8 @@ def get_auction_benchmark(
     if date:
         try:
             target = date_cls.fromisoformat(date)
-        except ValueError:
-            raise HTTPException(400, f"date 格式应为 YYYY-MM-DD, 收到: {date}")
+        except ValueError as exc:
+            raise HTTPException(400, f"date 格式应为 YYYY-MM-DD, 收到: {date}") from exc
     return auction_benchmark.get_auction_benchmark(
         request.app.state.repo.store.data_dir, target
     )

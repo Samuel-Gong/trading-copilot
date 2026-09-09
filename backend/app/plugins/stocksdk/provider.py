@@ -327,6 +327,16 @@ class StockSDKProvider:
                 "columns": list(head[0].keys()) if head else [],
                 "preview": head,
             }
+        if dataset == "instruments":
+            rows = self.get_instruments("stock")
+            head = rows[:5]
+            return {
+                "provider": self.name,
+                "dataset": "instruments",
+                "rows": len(rows),
+                "columns": list(head[0].keys()) if head else [],
+                "preview": head,
+            }
         raise ValueError(f"stock-sdk 不支持数据集: {dataset}")
 
 

@@ -62,6 +62,23 @@ def test_save_override_invalidates_cache(tmp_path):
     assert strat_config.load_override(tmp_path, "s1")["params"]["p"] == 9
 
 
+def test_save_override_failure_preserves_file_and_cache(tmp_path, monkeypatch):
+    strat_config.save_override(tmp_path, "s1", {"params": {"p": 1}})
+    path = tmp_path / "user_data" / "strategy_overrides" / "s1.json"
+    previous = path.read_bytes()
+    assert strat_config.load_override(tmp_path, "s1")["params"]["p"] == 1
+
+    def fail_write(_path, _text):
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(strat_config, "atomic_write_text", fail_write)
+    with pytest.raises(OSError, match="synthetic write failure"):
+        strat_config.save_override(tmp_path, "s1", {"params": {"p": 9}})
+
+    assert path.read_bytes() == previous
+    assert strat_config.load_override(tmp_path, "s1")["params"]["p"] == 1
+
+
 def test_delete_override_invalidates_cache(tmp_path):
     strat_config.save_override(tmp_path, "s1", {"params": {"p": 1}})
     assert strat_config.load_override(tmp_path, "s1") != {}

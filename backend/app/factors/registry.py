@@ -14,13 +14,20 @@ P1 边界 (诚实声明):
 """
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
 Kind = Literal["base", "virtual", "composite", "custom"]
 Direction = Literal["high", "low", "none"]
 Unit = Literal["ratio", "pct", "score", "count", "days", "currency", "none"]
-PitSource = Literal["financial_announce", "share_capital_announce", "none"]
+PitSource = Literal[
+    "financial_announce",
+    "share_capital_announce",
+    "mixed_announce",
+    "none",
+]
 Stability = Literal["stable", "experimental", "deprecated"]
 
 _ALL_ASSETS = frozenset({"stock", "etf"})
@@ -220,7 +227,7 @@ _CATALOG: tuple[FactorSpec, ...] = (
     # --- 扩充批次 (2026-09-05): 规模/收益分解/长窗口/下行风险/量能潮/换手水平 ---
     _virtual(
         "log_float_mv", "流通市值对数", "规模",
-        "ln(收盘价 x 当日成交量 / 换手率), 由换手率反推流通股本, 高值代表大盘",
+        "ln(收盘价 x 成交量(手) x 10000 / 换手率(%)), 由换手率反推流通股本",
         deps=frozenset({"close", "volume", "turnover_rate"}), scale_free=False,
     ),
     _virtual(
@@ -301,14 +308,23 @@ _CATALOG: tuple[FactorSpec, ...] = (
 )
 
 _REGISTRY: dict[str, FactorSpec] = {}
+_REGISTRY_LOCK = threading.RLock()
+
+
+@contextmanager
+def registry_transaction():
+    """使一组注册表变更对所有读侧原子可见。"""
+    with _REGISTRY_LOCK:
+        yield
 
 
 def register_factor(spec: FactorSpec) -> None:
     """注册因子; 重复 id 且版本未增时拒绝 (fail-closed)。"""
-    existing = _REGISTRY.get(spec.id)
-    if existing is not None and existing.version >= spec.version:
-        raise ValueError(f"factor id 已注册且版本未提升: {spec.id}")
-    _REGISTRY[spec.id] = spec
+    with _REGISTRY_LOCK:
+        existing = _REGISTRY.get(spec.id)
+        if existing is not None and existing.version >= spec.version:
+            raise ValueError(f"factor id 已注册且版本未提升: {spec.id}")
+        _REGISTRY[spec.id] = spec
 
 
 for _spec in _CATALOG:
@@ -316,22 +332,47 @@ for _spec in _CATALOG:
 
 
 def get_factor(fid: str) -> FactorSpec | None:
-    return _REGISTRY.get(fid)
+    with _REGISTRY_LOCK:
+        return _REGISTRY.get(fid)
 
 
 def unregister_factor(fid: str) -> FactorSpec | None:
     """注销动态注册的因子 (内置目录因子不可注销, fail-closed)。"""
-    if any(spec.id == fid for spec in _CATALOG):
-        raise ValueError(f"内置因子不可注销: {fid}")
-    return _REGISTRY.pop(fid, None)
+    with _REGISTRY_LOCK:
+        if any(spec.id == fid for spec in _CATALOG):
+            raise ValueError(f"内置因子不可注销: {fid}")
+        return _REGISTRY.pop(fid, None)
+
+
+def dynamic_factor_specs() -> tuple[FactorSpec, ...]:
+    """返回当前动态因子快照，供定义事务原子回滚。"""
+    with _REGISTRY_LOCK:
+        catalog_ids = {spec.id for spec in _CATALOG}
+        return tuple(spec for fid, spec in _REGISTRY.items() if fid not in catalog_ids)
+
+
+def replace_dynamic_factors(specs: tuple[FactorSpec, ...]) -> None:
+    """一次性替换动态注册表，避免读侧观察到拓扑重建的中间态。"""
+    with _REGISTRY_LOCK:
+        catalog = {spec.id: spec for spec in _CATALOG}
+        replacement = dict(catalog)
+        for spec in specs:
+            if spec.id in catalog:
+                raise ValueError(f"动态因子不能覆盖内置因子: {spec.id}")
+            if spec.id in replacement:
+                raise ValueError(f"动态因子 id 重复: {spec.id}")
+            replacement[spec.id] = spec
+        global _REGISTRY
+        _REGISTRY = replacement
 
 
 def _ordered_specs() -> list[FactorSpec]:
     """内置目录顺序在前, 动态注册因子 (custom/composite) 按注册顺序追加。"""
-    ordered: list[FactorSpec] = list(_CATALOG)
-    known = {spec.id for spec in _CATALOG}
-    ordered.extend(spec for fid, spec in _REGISTRY.items() if fid not in known)
-    return ordered
+    with _REGISTRY_LOCK:
+        ordered: list[FactorSpec] = list(_CATALOG)
+        known = {spec.id for spec in _CATALOG}
+        ordered.extend(spec for fid, spec in _REGISTRY.items() if fid not in known)
+        return ordered
 
 
 def all_factors(
@@ -348,16 +389,17 @@ def all_factors(
 
 def factor_dependencies(fids) -> frozenset[str]:
     """递归展开依赖到 enriched base 列; 未知 id 原样保留 (与 scoring_dependencies 历史语义一致)。"""
-    resolved: set[str] = set()
-    for fid in fids:
-        spec = _REGISTRY.get(str(fid))
-        if spec is None:
-            resolved.add(str(fid))
-        elif spec.dependencies:
-            resolved.update(spec.dependencies)
-        else:
-            resolved.add(spec.id)
-    return frozenset(resolved)
+    with _REGISTRY_LOCK:
+        resolved: set[str] = set()
+        for fid in fids:
+            spec = _REGISTRY.get(str(fid))
+            if spec is None:
+                resolved.add(str(fid))
+            elif spec.dependencies:
+                resolved.update(spec.dependencies)
+            else:
+                resolved.add(spec.id)
+        return frozenset(resolved)
 
 
 def factor_columns_view() -> list[dict]:

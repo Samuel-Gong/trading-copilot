@@ -131,6 +131,8 @@ def test_update_data_providers_refreshes_capability_snapshot(monkeypatch):
     from app.api import settings as settings_api
 
     monkeypatch.setattr("app.services.preferences.save", lambda upd: None)
+    monkeypatch.setattr("app.data_providers.custom.is_custom_provider", lambda name: name == "mock_src")
+    monkeypatch.setattr("app.data_providers.custom.provider_has_dataset", lambda name, dataset: dataset in {"daily", "instruments"})
     sentinel = CapabilitySet()
     monkeypatch.setattr(settings_api, "detect_capabilities", lambda: sentinel)
 
@@ -143,6 +145,28 @@ def test_update_data_providers_refreshes_capability_snapshot(monkeypatch):
     mock_request.app.state.financial_scheduler.update_capabilities.assert_called_once_with(sentinel)
 
 
+def test_provider_registry_refresh_updates_capabilities_and_consumers(monkeypatch):
+    """运行期 Provider 注册变化后，grant/revoke 必须立即替换长寿命快照。"""
+    from app.api import settings as settings_api
+
+    granted = CapabilitySet()
+    granted.grant(Cap.KLINE_DAILY_BATCH)
+    revoked = CapabilitySet()
+    detected = iter((granted, revoked))
+    monkeypatch.setattr(settings_api, "detect_capabilities", lambda: next(detected))
+    monkeypatch.setattr(settings_api, "_reconcile_quote_service", lambda state: None)
+    request = MagicMock()
+
+    settings_api._refresh_provider_runtime(request)
+    assert request.app.state.capabilities is granted
+    settings_api._refresh_provider_runtime(request)
+    assert request.app.state.capabilities is revoked
+    assert request.app.state.financial_scheduler.update_capabilities.call_args_list == [
+        ((granted,),),
+        ((revoked,),),
+    ]
+
+
 def test_delete_active_financial_source_refreshes_scheduler_capabilities(monkeypatch):
     """删除正在使用的财务源后，调度器不能继续持有旧的增广能力。"""
     from app.api import settings as settings_api
@@ -151,10 +175,7 @@ def test_delete_active_financial_source_refreshes_scheduler_capabilities(monkeyp
 
     monkeypatch.setattr(custom_sources, "delete_config", lambda name: None)
     monkeypatch.setattr(custom_sources, "load_all", lambda: None)
-    monkeypatch.setattr(preferences, "get_daily_data_provider", lambda: "tickflow")
-    monkeypatch.setattr(preferences, "get_realtime_data_provider", lambda: "tickflow")
-    monkeypatch.setattr(preferences, "get_financial_provider", lambda: "mock_src")
-    monkeypatch.setattr(preferences, "get_adj_factor_provider", lambda: "same_as_daily")
+    monkeypatch.setattr(preferences, "load", lambda: {"financial_data_provider": "mock_src"})
     monkeypatch.setattr(preferences, "save", MagicMock())
     monkeypatch.setattr(settings_api, "list_data_sources", lambda: {"custom": []})
     sentinel = CapabilitySet()
@@ -164,3 +185,57 @@ def test_delete_active_financial_source_refreshes_scheduler_capabilities(monkeyp
     assert settings_api.delete_data_source("mock_src", mock_request) == {"custom": []}
     assert mock_request.app.state.capabilities is sentinel
     mock_request.app.state.financial_scheduler.update_capabilities.assert_called_once_with(sentinel)
+    preferences.save.assert_called_once_with({"financial_data_provider": "tickflow"})
+
+
+def test_delete_source_clears_every_raw_route_before_registry_reload(monkeypatch):
+    from app.api import settings as settings_api
+    from app.data_providers import custom as custom_sources
+    from app.data_providers.capabilities import CAPABILITY_REGISTRY
+    from app.services import preferences
+
+    route_defaults = {
+        item["field"]: item["default"]
+        for item in CAPABILITY_REGISTRY
+        if item.get("field")
+    }
+    monkeypatch.setattr(preferences, "load", lambda: dict.fromkeys(route_defaults, "mock_src"))
+    saved = MagicMock()
+    monkeypatch.setattr(preferences, "save", saved)
+    monkeypatch.setattr(custom_sources, "delete_config", lambda name: None)
+    monkeypatch.setattr(custom_sources, "load_all", lambda: None)
+    monkeypatch.setattr(settings_api, "list_data_sources", lambda: {"custom": []})
+    monkeypatch.setattr(settings_api, "detect_capabilities", lambda: CapabilitySet())
+
+    settings_api.delete_data_source("mock_src", MagicMock())
+
+    saved.assert_called_once_with(route_defaults)
+
+
+def test_capability_matrix_reports_selected_full_minute_custom_source(monkeypatch):
+    from app.api import settings as settings_api
+    from app.data_providers import custom as custom_sources
+    from app.services import preferences
+    from app.tickflow import policy
+
+    monkeypatch.setattr(custom_sources, "list_plugins", lambda: [])
+    monkeypatch.setattr(custom_sources, "list_sources", lambda: [{
+        "name": "full_source",
+        "display_name": "Full Source",
+        "datasets": ["full_minute"],
+    }])
+    monkeypatch.setattr(preferences, "get_realtime_data_provider", lambda: "tickflow")
+    monkeypatch.setattr(preferences, "get_daily_data_provider", lambda: "tickflow")
+    monkeypatch.setattr(preferences, "get_minute_data_provider", lambda: "tickflow")
+    monkeypatch.setattr(preferences, "get_full_minute_data_provider", lambda: "full_source")
+    monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: "tickflow")
+    monkeypatch.setattr(preferences, "get_adj_factor_provider", lambda: "tickflow")
+    monkeypatch.setattr(preferences, "get_financial_provider", lambda: "tickflow")
+    monkeypatch.setattr(policy, "base_tier_name", lambda: "pro")
+
+    matrix = settings_api.get_capability_matrix()
+    full_minute = next(item for item in matrix["capabilities"] if item["id"] == "full_minute")
+
+    assert full_minute["current"] == "full_source"
+    assert full_minute["effective"] == "full_source"
+    assert full_minute["usable"] is True

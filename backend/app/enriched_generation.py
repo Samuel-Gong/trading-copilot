@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -160,9 +161,7 @@ def _process_is_alive(pid: Any) -> bool:
     except (OSError, PermissionError) as exc:
         # Windows 对不存在的 pid 返回 WinError 87 (ERROR_INVALID_PARAMETER),
         # 不会映射为 ProcessLookupError; 按存活处理会让孤儿发布锁永远无法恢复。
-        if getattr(exc, "winerror", None) == 87:
-            return False
-        return True
+        return getattr(exc, "winerror", None) != 87
     return True
 
 
@@ -237,25 +236,39 @@ def bump_enriched_generation(data_dir: Path, asset_type: str = "stock") -> str:
 
 
 @contextmanager
+def enriched_commit_guard(
+    data_dir: Path,
+    asset_type: str = "stock",
+) -> Iterator[str]:
+    """仅在派生结果的最终复验和发布期间阻止来源 generation 切换。"""
+    get_enriched_generation(data_dir, asset_type)
+    with _exclusive_generation_lock(
+        data_dir, asset_type, wait_timeout=_GENERATION_LOCK_WAIT_SECONDS,
+    ):
+        yield get_enriched_generation(data_dir, asset_type, initialize=False)
+
+
+@contextmanager
 def stable_enriched_generation(
     data_dir: Path,
     asset_type: str = "stock",
 ) -> Iterator[str]:
-    """锁定一个 ready generation，直到依赖该快照的派生发布完成。"""
-    path = _marker_path(data_dir, asset_type)
-    with _exclusive_generation_lock(data_dir, asset_type):
-        payload = _read_marker(path)
-        if payload is None:
-            generation = uuid.uuid4().hex
-            _write_marker(path, _ready_payload(generation))
-        else:
-            state = payload.get("state", "ready")
-            generation = payload.get("generation")
-            if state != "ready" or not isinstance(generation, str) or not generation:
-                raise EnrichedGenerationUnavailableError(
-                    "enriched data is being published; retry after the update finishes"
-                )
-        yield generation
+    """在不持 writer 锁的前提下验证一次只读操作使用同一 ready generation。
+
+    调用方可以在 ``yield`` 内执行全盘扫描或重计算；结束时再次读取 marker。
+    若期间发生发布则抛错并丢弃结果，避免为了快照一致性长期阻塞并发读写。
+    """
+    generation = get_enriched_generation(data_dir, asset_type)
+    yield generation
+    final_generation = get_enriched_generation(
+        data_dir,
+        asset_type,
+        initialize=False,
+    )
+    if final_generation != generation:
+        raise EnrichedGenerationUnavailableError(
+            "enriched data generation changed during read"
+        )
 
 
 class EnrichedPublication:
@@ -267,10 +280,14 @@ class EnrichedPublication:
         asset_type: str = "stock",
         *,
         recover: bool = False,
+        scope: str = "unspecified",
+        allow_scope_takeover: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.asset_type = asset_type
         self.recover = recover
+        self.scope = scope
+        self.allow_scope_takeover = allow_scope_takeover
         self._publishing = False
         self._changed = False
         self._base_generation: str | None = None
@@ -323,6 +340,22 @@ class EnrichedPublication:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def delete_tree(self, target: Path) -> bool:
+        """在 publishing 标记保护下删除一个 enriched 分区目录。"""
+        target = Path(target)
+        if not target.exists():
+            return False
+        with _exclusive_generation_lock(
+            self.data_dir,
+            self.asset_type,
+            wait_timeout=_GENERATION_LOCK_WAIT_SECONDS,
+        ):
+            self._claim_or_verify()
+            shutil.rmtree(target)
+            _fsync_directory(target.parent)
+            self._changed = True
+        return True
+
     def commit(self) -> str | None:
         if not self._changed:
             return None
@@ -347,7 +380,7 @@ class EnrichedPublication:
         try:
             current = _read_marker(path)
         except EnrichedGenerationUnavailableError:
-            if not self.recover:
+            if not self.recover or not self.allow_scope_takeover:
                 raise
             current = None
         if self._publishing:
@@ -371,6 +404,11 @@ class EnrichedPublication:
                 raise EnrichedGenerationUnavailableError(
                     "another enriched publication is incomplete"
                 )
+            current_scope = current.get("scope")
+            if current_scope != self.scope and not self.allow_scope_takeover:
+                raise EnrichedGenerationUnavailableError(
+                    "incomplete enriched publication belongs to a different scope"
+                )
         generation = None if current is None else current.get("generation")
         if not isinstance(generation, str) or not generation:
             generation = uuid.uuid4().hex
@@ -380,6 +418,7 @@ class EnrichedPublication:
             "generation": generation,
             "publication_id": self._publication_id,
             "owner_pid": os.getpid(),
+            "scope": self.scope,
             "updated_at_ns": time.time_ns(),
         })
         self._publishing = True

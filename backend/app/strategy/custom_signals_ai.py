@@ -54,6 +54,8 @@ def _format_fields() -> str:
 
     factor_groups: dict[str, list[str]] = {}
     for spec in all_factors():
+        if spec.id not in allowed:
+            continue
         if spec.id in custom_signals.ALLOWED_FIELDS:
             continue  # 已作为物理列出现在清单里
         label = spec.label

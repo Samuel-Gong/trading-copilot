@@ -38,8 +38,10 @@ class _FakeEngine:
                     "close": (1.0 + daily_return) ** index * 10.0 * (ord(symbol_id) - ord("A") + 1),
                 })
         self.panel = pl.DataFrame(rows).sort(["symbol", "date"])
+        self.last_range: tuple[date, date] | None = None
 
     def load_panel(self, symbols, start, end, *, columns=None, asset_type="stock", **_kwargs):
+        self.last_range = (start, end)
         frame = self.panel
         if columns is not None:
             for column in columns:
@@ -64,7 +66,7 @@ def test_validate_ok_formula() -> None:
     assert payload["ok"] is True
     assert payload["errors"] == []
     assert payload["dependencies"] == ["change_pct"]
-    assert payload["warmup_bars"] == 6
+    assert payload["warmup_bars"] == 5
     assert payload["cross_sectional"] is True
 
 
@@ -93,6 +95,34 @@ def test_trial_golden_ic() -> None:
     assert len(payload["ic_series"]) == 30
 
 
+def test_trial_and_save_preflight_default_to_beijing_today(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from app.api import factors as factors_api
+
+    target = date.today() - timedelta(days=1)
+    engine = _FakeEngine()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = engine
+    monkeypatch.setattr(factors_api, "cn_today", lambda: target)
+
+    response = TestClient(app).post(
+        "/api/factors/trial",
+        json={"formula": "close", "days": 20},
+    )
+    assert response.status_code == 200
+    assert engine.last_range is not None
+    assert engine.last_range[1] == target
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        backtest_engine=engine,
+    )))
+    factors_api._trial_nonempty(request, "close")
+    assert engine.last_range is not None
+    assert engine.last_range[1] == target
+
+
 def test_trial_compile_failure_400() -> None:
     response = _client(with_engine=True).post(
         "/api/factors/trial", json={"formula": "nope_col + 1", "days": 30},
@@ -113,6 +143,79 @@ def test_trial_computes_virtual_factor_via_shared_path() -> None:
     assert payload["ok"] is True
     assert payload["n_dates"] == 20
     assert payload["ic_mean"] is not None
+
+
+def test_trial_attaches_recursive_financial_dependency(
+    tmp_path,
+    cleanup_registry,
+) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.factors import store
+    from app.factors.registry import register_factor
+
+    factor_id = "uf_financial_trial"
+    register_factor(store.to_spec({
+        "id": factor_id,
+        "kind": "custom",
+        "version": 1,
+        "label": "财务试算",
+        "formula": "rank(roe_latest)",
+        "status": "draft",
+    }))
+    cleanup_registry.add(factor_id)
+    metrics = Path(tmp_path) / "financials" / "metrics" / "part.parquet"
+    metrics.parent.mkdir(parents=True)
+    announce = (date.today() - timedelta(days=60)).isoformat()
+    pl.DataFrame({
+        "symbol": ["A", "B", "C"],
+        "period_end": ["2026-03-31"] * 3,
+        "announce_date": [announce] * 3,
+        "bps": [1.0, 2.0, 3.0],
+        "roe": [10.0, 20.0, 30.0],
+        "gross_margin": [1.0, 2.0, 3.0],
+        "net_margin": [1.0, 2.0, 3.0],
+        "revenue_yoy": [1.0, 2.0, 3.0],
+        "net_income_yoy": [1.0, 2.0, 3.0],
+        "debt_to_asset_ratio": [1.0, 2.0, 3.0],
+    }).write_parquet(metrics)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=Path(tmp_path)))
+
+    response = TestClient(app).post(
+        "/api/factors/trial",
+        json={"formula": factor_id, "days": 20},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["n_dates"] == 20
+
+
+def test_trial_rejects_financial_custom_factor_for_etf(cleanup_registry) -> None:
+    from app.factors import store
+    from app.factors.registry import register_factor
+
+    factor_id = "uf_stock_only_trial"
+    register_factor(store.to_spec({
+        "id": factor_id,
+        "kind": "custom",
+        "version": 1,
+        "label": "股票专属试算",
+        "formula": "roe_latest",
+        "status": "draft",
+    }))
+    cleanup_registry.add(factor_id)
+
+    response = _client(with_engine=True).post(
+        "/api/factors/trial",
+        json={"formula": factor_id, "asset_type": "etf", "days": 20},
+    )
+
+    assert response.status_code == 400
+    assert "不支持资产类型 etf" in response.json()["detail"]
 
 
 def test_group_and_status_update_after_registry_load(tmp_path, cleanup_registry) -> None:
@@ -214,6 +317,119 @@ def test_update_custom_factor_bumps_version(tmp_path, cleanup_registry) -> None:
         "label": "x", "formula": "close",
     })
     assert missing.status_code == 404
+
+
+def test_child_update_refreshes_transitive_factor_metadata(
+    tmp_path,
+    monkeypatch,
+    cleanup_registry,
+) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.api import factors as factors_api
+    from app.factors.registry import get_factor
+
+    ids = {"uf_meta_child", "uf_meta_parent", "cf_meta_outer"}
+    cleanup_registry.update(ids)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=Path(tmp_path)))
+    client = TestClient(app)
+
+    assert client.post("/api/factors/custom", json={
+        "id": "uf_meta_child",
+        "label": "元数据子因子",
+        "formula": "close",
+    }).status_code == 200
+    assert client.post("/api/factors/custom", json={
+        "id": "uf_meta_parent",
+        "label": "元数据父因子",
+        "formula": "rank(uf_meta_child)",
+    }).status_code == 200
+    assert client.post("/api/factors/composite", json={
+        "id": "cf_meta_outer",
+        "label": "元数据外层组合",
+        "members": {"uf_meta_parent": 1.0, "amount": 1.0},
+    }).status_code == 200
+
+    monkeypatch.setattr(factors_api, "_trial_nonempty", lambda *_args, **_kwargs: None)
+    response = client.post("/api/factors/custom/uf_meta_child/update", json={
+        "label": "财务子因子",
+        "formula": "ts_mean(roe_latest, 20)",
+    })
+
+    assert response.status_code == 200
+    for factor_id in ids:
+        spec = get_factor(factor_id)
+        assert spec is not None
+        expected_dependencies = (
+            {"roe_latest", "amount"}
+            if factor_id == "cf_meta_outer"
+            else {"roe_latest"}
+        )
+        assert spec.dependencies == frozenset(expected_dependencies)
+        assert spec.warmup_bars == 20
+        assert spec.asset_types == frozenset({"stock"})
+        assert spec.pit is True
+        assert spec.pit_source == "financial_announce"
+
+
+def test_dependent_metadata_refresh_failure_rolls_back_atomically(
+    tmp_path,
+    monkeypatch,
+    cleanup_registry,
+) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.api import factors as factors_api
+    from app.factors import store
+    from app.factors.registry import get_factor
+
+    child_id = "uf_meta_rollback_child"
+    parent_id = "uf_meta_rollback_parent"
+    cleanup_registry.update({child_id, parent_id})
+    data_dir = Path(tmp_path)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=data_dir))
+    client = TestClient(app)
+    assert client.post("/api/factors/custom", json={
+        "id": child_id,
+        "label": "回滚子因子",
+        "formula": "close",
+    }).status_code == 200
+    assert client.post("/api/factors/custom", json={
+        "id": parent_id,
+        "label": "回滚父因子",
+        "formula": child_id,
+    }).status_code == 200
+    child_path = data_dir / "user_data" / "custom_factors" / f"{child_id}.json"
+    previous_bytes = child_path.read_bytes()
+    previous_child = get_factor(child_id)
+    previous_parent = get_factor(parent_id)
+    real_to_spec = store.to_spec
+
+    def fail_parent(definition):
+        if definition.get("id") == parent_id and get_factor(child_id).pit:
+            raise ValueError("synthetic dependent refresh failure")
+        return real_to_spec(definition)
+
+    monkeypatch.setattr(factors_api, "_trial_nonempty", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(store, "to_spec", fail_parent)
+    response = client.post(f"/api/factors/custom/{child_id}/update", json={
+        "label": "财务子因子",
+        "formula": "roe_latest",
+    })
+
+    assert response.status_code == 400
+    assert "synthetic dependent refresh failure" in response.json()["detail"]
+    assert child_path.read_bytes() == previous_bytes
+    assert get_factor(child_id) is previous_child
+    assert get_factor(parent_id) is previous_parent
 
 
 def test_trial_response_includes_newey_west_t() -> None:
@@ -345,6 +561,204 @@ def test_delete_with_nested_python_strategy_reference_is_side_effect_free(
     assert blocked.json()["detail"]["references"] == ["strategies/custom/my_strategy.py"]
     assert get_factor("uf_python_ref") is not None
     assert store.exists(data_dir, "uf_python_ref")
+
+
+def test_delete_checks_strategy_override_and_custom_signal_references(
+    tmp_path, cleanup_registry,
+) -> None:
+    """override 与自定义信号引用也必须阻止无副作用删除。"""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.factors import store
+    from app.strategy import config as strategy_config
+    from app.strategy import custom_signals
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=Path(tmp_path)))
+    client = TestClient(app)
+    data_dir = Path(tmp_path)
+    factor_id = "uf_definition_ref"
+    cleanup_registry.add(factor_id)
+
+    created = client.post("/api/factors/custom", json={
+        "id": factor_id,
+        "label": "定义图引用",
+        "formula": "rank(-ts_sum(change_pct, 5))",
+    })
+    assert created.status_code == 200
+    strategy_config.save_override(
+        data_dir,
+        "alpha",
+        {"scoring": {factor_id: 1.0}},
+    )
+    custom_signals.save_one(data_dir, {
+        "id": "factor_ref",
+        "name": "因子引用",
+        "kind": "entry",
+        "enabled": True,
+        "conditions": [{
+            "left": factor_id,
+            "op": ">",
+            "right": "0",
+            "leftDays": 0,
+            "rightDays": 0,
+        }],
+    })
+
+    blocked = client.delete(f"/api/factors/custom/{factor_id}")
+
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["references"] == [
+        "user_data/strategy_overrides/alpha.json",
+        "user_data/custom_signals/factor_ref.json",
+    ]
+    assert store.exists(data_dir, factor_id)
+
+
+def test_factor_update_invalidates_only_transitive_strategy_dependents(
+    tmp_path, cleanup_registry,
+) -> None:
+    """因子语义变化清理直接/间接/信号引用策略, 保留无关导出缓存。"""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.services import strategy_cache
+    from app.strategy import config as strategy_config
+    from app.strategy import custom_signals
+
+    data_dir = Path(tmp_path)
+    calls: list[str] = []
+
+    def strategy(strategy_id, *, scoring=None):
+        return SimpleNamespace(
+            meta={"id": strategy_id, "scoring": scoring or {}},
+            required_features=frozenset(),
+            entry_signals=[],
+            exit_signals=[],
+            matrix_strategy=None,
+        )
+
+    definitions = [
+        strategy("alpha", scoring={"uf_cache_dependent": 1.0}),
+        strategy("signal_user"),
+        strategy("blend"),
+        strategy("unrelated", scoring={"momentum_10d": 1.0}),
+    ]
+    strategy_engine = SimpleNamespace(
+        strategy_definitions=lambda: definitions,
+        find_dependents=lambda strategy_id: ["blend"] if strategy_id == "alpha" else [],
+        invalidate_realtime_matrices=lambda: calls.append("matrix"),
+    )
+    repo = SimpleNamespace(
+        store=SimpleNamespace(data_dir=data_dir),
+        clear_cache=lambda: calls.append("repo"),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.strategy_engine = strategy_engine
+    app.state.monitor_engine = SimpleNamespace(
+        invalidate_strategy_state=lambda: calls.append("monitor"),
+    )
+    app.state.repo = repo
+    client = TestClient(app)
+
+    for factor_id, formula in (
+        ("uf_cache_target", "close"),
+        ("uf_cache_dependent", "uf_cache_target"),
+    ):
+        response = client.post("/api/factors/custom", json={
+            "id": factor_id,
+            "label": factor_id,
+            "formula": formula,
+        })
+        assert response.status_code == 200
+        cleanup_registry.add(factor_id)
+
+    custom_signals.save_one(data_dir, {
+        "id": "factor_signal",
+        "name": "因子信号",
+        "kind": "entry",
+        "enabled": True,
+        "conditions": [{
+            "left": "uf_cache_target",
+            "op": ">",
+            "right": "0",
+            "leftDays": 0,
+            "rightDays": 0,
+        }],
+    })
+    strategy_config.save_override(
+        data_dir,
+        "signal_user",
+        {"entry_signals": ["csg_factor_signal"]},
+    )
+    result = {"rows": [], "total": 0, "as_of": "2026-09-07"}
+    strategy_cache.write_cache(data_dir, "2026-09-07", {
+        strategy_id: result
+        for strategy_id in ("alpha", "signal_user", "blend", "unrelated")
+    })
+    calls.clear()
+
+    updated = client.post("/api/factors/custom/uf_cache_target/update", json={
+        "label": "目标因子 v2",
+        "formula": "rank(close)",
+    })
+
+    assert updated.status_code == 200
+    cached = strategy_cache.read_cache(data_dir)
+    assert cached is not None
+    assert cached["results"] == {"unrelated": result}
+    assert calls == ["matrix", "monitor", "repo"]
+
+
+def test_factor_update_invalidation_failure_restores_disk_and_registry(
+    tmp_path,
+    cleanup_registry,
+    monkeypatch,
+) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.factors import store
+    from app.factors.registry import get_factor
+    from app.services import strategy_cache
+
+    factor_id = "uf_factor_rollback"
+    app = FastAPI()
+    app.include_router(router)
+    app.state.backtest_engine = _FakeEngine()
+    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=Path(tmp_path)))
+    client = TestClient(app)
+    created = client.post("/api/factors/custom", json={
+        "id": factor_id,
+        "label": "回滚因子",
+        "formula": "close",
+    })
+    assert created.status_code == 200
+    cleanup_registry.add(factor_id)
+    previous = next(item for item in store.load_all(tmp_path) if item["id"] == factor_id)
+    previous_spec = get_factor(factor_id)
+    monkeypatch.setattr(
+        strategy_cache,
+        "clear_cache",
+        lambda _data_dir: (_ for _ in ()).throw(OSError("synthetic invalidation failure")),
+    )
+
+    with pytest.raises(OSError, match="synthetic invalidation failure"):
+        client.post(f"/api/factors/custom/{factor_id}/update", json={
+            "label": "不应生效",
+            "formula": "close * 2",
+        })
+
+    assert next(item for item in store.load_all(tmp_path) if item["id"] == factor_id) == previous
+    restored_spec = get_factor(factor_id)
+    assert restored_spec is not None and previous_spec is not None
+    assert restored_spec.version == previous_spec.version
+    assert restored_spec.formula_text == previous_spec.formula_text
 
 
 def test_delete_cannot_be_undone_by_concurrent_update(

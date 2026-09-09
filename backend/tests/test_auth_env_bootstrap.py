@@ -55,11 +55,13 @@ def test_bootstrap_recovers_compose_interpolated_password_from_raw_env(
     assert auth.verify_and_create_session("pw-secret") is None
 
 
-def test_compose_marks_auth_password_as_mounted_raw_env_source() -> None:
+def test_compose_uses_raw_env_without_mounting_host_env_file() -> None:
     compose_path = Path(__file__).resolve().parents[2] / "docker-compose.yml"
     compose = compose_path.read_text(encoding="utf-8")
 
-    assert "TICKFLOW_AUTH_PASSWORD_SOURCE=mounted_env" in compose
+    assert "format: raw" in compose
+    assert "./.env:/app/.env" not in compose
+    assert "TICKFLOW_AUTH_PASSWORD_SOURCE=mounted_env" not in compose
 
 
 def test_bootstrap_prefers_explicit_process_env_over_dotenv(

@@ -72,6 +72,17 @@ def test_factor_batch_omitted_start_uses_factor_default(patched):
     assert cfg.start != end - timedelta(days=bt.STRATEGY_DEFAULT_DAYS)
 
 
+def test_factor_batch_omitted_end_uses_beijing_today(patched, monkeypatch):
+    target = date(2026, 9, 7)
+    monkeypatch.setattr(bt, "cn_today", lambda: target)
+
+    bt.factor_batch(bt.FactorBatchRequest(factor_names=["momentum_5d"]), _Req())
+
+    cfg = patched.captured[-1]
+    assert cfg.end == target
+    assert cfg.start == target - timedelta(days=bt.FACTOR_DEFAULT_DAYS)
+
+
 def test_factor_run_explicit_null_start_means_all_history(patched):
     """显式传 start=null 语义不变: 代表全部历史。"""
     end = date(2026, 8, 24)

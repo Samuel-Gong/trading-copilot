@@ -50,20 +50,52 @@ logger = logging.getLogger(__name__)
 # 增量路径每秒级执行, 若不缓存则每轮 glob + 读所有 JSON + 重编译表达式。
 _custom_signal_exprs: dict[str, pl.Expr] | None = None
 _custom_signal_exprs_today: dict[str, pl.Expr] | None = None
+_custom_signal_cache_lock = threading.RLock()
+_custom_signal_cache_generation = 0
+
+
+def _load_custom_signal_exprs(*, allow_shift: bool) -> dict[str, pl.Expr]:
+    """锁外加载表达式, 仅在失效代际未变化时提交缓存。"""
+    global _custom_signal_exprs, _custom_signal_exprs_today
+    while True:
+        with _custom_signal_cache_lock:
+            cached = (
+                _custom_signal_exprs
+                if allow_shift
+                else _custom_signal_exprs_today
+            )
+            if cached is not None:
+                return cached
+            generation = _custom_signal_cache_generation
+
+        from app.strategy import custom_signals
+
+        try:
+            sigs = custom_signals.load_all(settings.data_dir)
+            loaded = custom_signals.build_expressions(
+                sigs,
+                allow_shift=allow_shift,
+            )
+        except Exception as e:
+            suffix = "" if allow_shift else " (today)"
+            logger.warning("custom signals load failed%s: %s", suffix, e)
+            loaded = {}
+
+        with _custom_signal_cache_lock:
+            if generation != _custom_signal_cache_generation:
+                continue
+            if allow_shift:
+                if _custom_signal_exprs is None:
+                    _custom_signal_exprs = loaded
+                return _custom_signal_exprs
+            if _custom_signal_exprs_today is None:
+                _custom_signal_exprs_today = loaded
+            return _custom_signal_exprs_today
 
 
 def _get_custom_signal_exprs() -> dict[str, pl.Expr]:
     """懒加载自定义信号表达式（带模块级缓存，allow_shift=True）。"""
-    global _custom_signal_exprs
-    if _custom_signal_exprs is None:
-        from app.strategy import custom_signals
-        try:
-            sigs = custom_signals.load_all(settings.data_dir)
-            _custom_signal_exprs = custom_signals.build_expressions(sigs)
-        except Exception as e:
-            logger.warning("custom signals load failed: %s", e)
-            _custom_signal_exprs = {}
-    return _custom_signal_exprs
+    return _load_custom_signal_exprs(allow_shift=True)
 
 
 def _get_custom_signal_exprs_today() -> dict[str, pl.Expr]:
@@ -72,23 +104,17 @@ def _get_custom_signal_exprs_today() -> dict[str, pl.Expr]:
     与全量版分开缓存：盘中单日快照上 .shift 跨 symbol 语义不正确,
     build_expressions(allow_shift=False) 会跳过带偏移的信号, 结果集不同。
     """
-    global _custom_signal_exprs_today
-    if _custom_signal_exprs_today is None:
-        from app.strategy import custom_signals
-        try:
-            sigs = custom_signals.load_all(settings.data_dir)
-            _custom_signal_exprs_today = custom_signals.build_expressions(sigs, allow_shift=False)
-        except Exception as e:
-            logger.warning("custom signals load failed (today): %s", e)
-            _custom_signal_exprs_today = {}
-    return _custom_signal_exprs_today
+    return _load_custom_signal_exprs(allow_shift=False)
 
 
 def invalidate_custom_signals() -> None:
     """失效自定义信号缓存（保存/删除信号后调用，下次计算重新加载）。"""
+    global _custom_signal_cache_generation
     global _custom_signal_exprs, _custom_signal_exprs_today
-    _custom_signal_exprs = None
-    _custom_signal_exprs_today = None
+    with _custom_signal_cache_lock:
+        _custom_signal_cache_generation += 1
+        _custom_signal_exprs = None
+        _custom_signal_exprs_today = None
 
 
 # enriched parquet 仅存储的列 (14 列)
@@ -1057,18 +1083,14 @@ def _select_storage_cols(df: pl.DataFrame) -> pl.DataFrame:
 
 DEVIATION_WINDOWS: tuple[int, ...] = (3, 10, 30)
 
-# 各板块基准指数 (偏离值规则的「对应指数」, 按交易所官方口径): 优先首选, 缺失时回退
-# - 沪主板:   上证A指 → 上证指数 (两者差异可忽略)
-# - 科创板:   科创50 (上交所《交易规则》2026修订 6.12 指定基准) → 上证A指
-# - 深主板:   深证A指 → 深证成指 (深交所投教口径)
-# - 创业板:   创业板综合指数 → 深证A指 (深交所投教口径)
-# - 北交所:   北证50 → 上证指数 (北交所《交易规则》5.4.4)
+# 各板块法定“对应指数”。禁止用其他宽基指数替代：替代基准会改变监管阈值结论；
+# 对应指数缺失时偏离值保持不可用。
 _BENCHMARK_PREFERENCE: dict[str, list[str]] = {
-    "SH": ["000002.SH", "000001.SH"],
-    "STAR": ["000688.SH", "000002.SH"],
-    "SZ": ["399107.SZ", "399001.SZ"],
-    "GEM": ["399102.SZ", "399107.SZ"],
-    "BJ": ["899050.BJ", "000001.SH"],
+    "SH": ["000002.SH"],
+    "STAR": ["000688.SH"],
+    "SZ": ["399107.SZ"],
+    "GEM": ["399102.SZ"],
+    "BJ": ["899050.BJ"],
 }
 
 # 偏离值计算需要的全部基准指数 (quote_service 并入实时显式拉取, 不依赖监控规则)
@@ -1133,8 +1155,7 @@ def load_benchmark_momentum(data_dir: Path) -> pl.DataFrame | None:
         )
         if not df_idx.is_empty():
             available = set(df_idx["symbol"].to_list())
-            # 每个交易所仅在声明的候选内取优先级最高者；全缺时保持不可计算。
-            # 同一基准仍可被多个交易所显式声明（如北交所回退上证指数）。
+            # 每个板块仅取其法定对应指数；缺失时保持不可计算。
             pairs: list[tuple[str, str]] = []
             for bench_key, candidates in _BENCHMARK_PREFERENCE.items():
                 hit = next((s for s in candidates if s in available), None)
@@ -1161,7 +1182,7 @@ def load_benchmark_momentum(data_dir: Path) -> pl.DataFrame | None:
                     # 兼容既有消费者；新代码统一使用更精确的 bench_key。
                     .with_columns(pl.col("bench_key").alias("bench_exchange"))
                 )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("基准指数偏离数据加载失败: %s", exc)
         frame = None
 
@@ -1441,7 +1462,8 @@ def compute_enriched_history_window(
 def run_pipeline(data_dir: Path | None = None,
                  symbols: list[str] | None = None,
                  new_dates_only: bool = False,
-                 on_batch_done: Callable[[int, int], None] | None = None) -> int:
+                 on_batch_done: Callable[[int, int], None] | None = None,
+                 publication: EnrichedPublication | None = None) -> int:
     """运行盘后管道:读 kline_daily + adj_factor → 前复权 + 计算存储列 → 写 enriched。
 
     enriched 表仅存储 14 列基础行情窄表 (OHLCV + raw_close/high/low + turnover_rate + 连板数)。
@@ -1468,7 +1490,15 @@ def run_pipeline(data_dir: Path | None = None,
         logger.warning("检测到未完成的 enriched 发布,改为全量重建")
         symbols = None
         new_dates_only = False
-    publication = EnrichedPublication(d, "stock", recover=True)
+    owns_publication = publication is None
+    if publication is None:
+        publication = EnrichedPublication(
+            d,
+            "stock",
+            recover=True,
+            scope="pipeline-full-rebuild",
+            allow_scope_takeover=True,
+        )
     daily_dir = d / "kline_daily"
     enriched_base = d / "kline_daily_enriched"
     factor_path = d / "adj_factor" / "all.parquet"
@@ -1594,7 +1624,8 @@ def run_pipeline(data_dir: Path | None = None,
                     written += date_df.height
                 logger.info("除权重算: %d 只, 共写入 %d 行", len(sym_set), written)
 
-        publication.commit()
+        if owns_publication:
+            publication.commit()
         t_done = _t.perf_counter()
         logger.info("增量管道完成: %.2fs, %d 行", t_done - t0, written)
         return written
@@ -1641,10 +1672,10 @@ def run_pipeline(data_dir: Path | None = None,
     # 小内存机器自动收缩, 大内存机器保持用户设置
     total_rows = lf_all.select(pl.len()).collect(streaming=True).item()
     rows_per_sym = max(1, -(-int(total_rows) // total_syms))
-    SYM_BATCH = _adaptive_sym_batch(prefs_mod.get_enriched_batch_size(), rows_per_sym)
-    total_batches = (total_syms + SYM_BATCH - 1) // SYM_BATCH
+    sym_batch = _adaptive_sym_batch(prefs_mod.get_enriched_batch_size(), rows_per_sym)
+    total_batches = (total_syms + sym_batch - 1) // sym_batch
     logger.info("全量计算: %d 只标的 (%d 行, ~%d 行/只), symbol 分批 %d 只/批, %d 批 [%s]",
-                total_syms, total_rows, rows_per_sym, SYM_BATCH, total_batches, mode)
+                total_syms, total_rows, rows_per_sym, sym_batch, total_batches, mode)
 
     # 全量模式: 流式暂存发布 (#208) —— 每批落盘暂存文件, 不再内存累积;
     # 暂存目录在 enriched 树外, 不会被任何 **/*.parquet 业务 glob 扫到
@@ -1656,8 +1687,8 @@ def run_pipeline(data_dir: Path | None = None,
         staging_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        for batch_start in range(0, total_syms, SYM_BATCH):
-            batch_end = min(batch_start + SYM_BATCH, total_syms)
+        for batch_start in range(0, total_syms, sym_batch):
+            batch_end = min(batch_start + sym_batch, total_syms)
             batch_syms = all_symbols[batch_start:batch_end]
 
             # 只读取本批 symbol 的数据
@@ -1709,7 +1740,7 @@ def run_pipeline(data_dir: Path | None = None,
                 else:
                     # 全量模式: 写单批暂存文件 (按 date,symbol 排序 →
                     # 合并期 parquet 行组统计可按日期裁剪), 随即释放本批内存
-                    out = staging_dir / f"batch-{batch_start // SYM_BATCH:04d}.parquet"
+                    out = staging_dir / f"batch-{batch_start // sym_batch:04d}.parquet"
                     _select_storage_cols(enriched).sort(["date", "symbol"]).write_parquet(out)
                     staging_files.append(str(out))
                     written += enriched.height
@@ -1718,13 +1749,13 @@ def run_pipeline(data_dir: Path | None = None,
             gc.collect()
 
             logger.info("symbol 批次 %d/%d (%s ~ %s), 已处理 %d 行",
-                         batch_start // SYM_BATCH + 1,
+                         batch_start // sym_batch + 1,
                          total_batches,
                          batch_syms[0], batch_syms[-1], written)
 
             # 通知进度
             if on_batch_done:
-                on_batch_done(batch_start // SYM_BATCH + 1, total_batches)
+                on_batch_done(batch_start // sym_batch + 1, total_batches)
 
         # 全量模式: 日期覆盖校验 → 按日期分块流式合并 → 逐分区原子替换
         if not symbols and staging_files:
@@ -1771,7 +1802,8 @@ def run_pipeline(data_dir: Path | None = None,
         if staging_dir is not None:
             shutil.rmtree(staging_dir, ignore_errors=True)
 
-    publication.commit()
+    if owns_publication:
+        publication.commit()
     t_done = _t.perf_counter()
     adj_label = "含复权" if not factors.is_empty() else "无复权"
     logger.info("enriched 完成 [%s]: %.2fs, 共 %d 行, %s",

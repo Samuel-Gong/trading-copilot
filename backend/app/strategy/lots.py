@@ -42,9 +42,15 @@ def validate_lot(lot: dict) -> None:
     """校验批次字段, 非法抛 ValueError (中文信息)。"""
     lot_id = lot.get("id")
     if lot_id is not None and (
-        not isinstance(lot_id, str) or not _ID.match(lot_id) or len(lot_id) > _MAX_ID_LEN
+        not isinstance(lot_id, str)
+        or not lot_id.startswith("lot_")
+        or not _ID.match(lot_id)
+        or len(lot_id) > _MAX_ID_LEN
     ):
-        raise ValueError(f"批次 id 非法 (仅小写字母数字下划线, 且需为派生规则 id 留位): {lot_id!r}")
+        raise ValueError(
+            "批次 id 非法 (必须以 lot_ 开头，仅含小写字母数字下划线，"
+            f"且需为派生规则 id 留位): {lot_id!r}"
+        )
     if not (lot.get("symbol") or "").strip():
         raise ValueError("symbol 不能为空")
     cost = lot.get("cost_price")
@@ -66,6 +72,18 @@ def validate_lot(lot: dict) -> None:
                 raise ValueError(f"{label} 必须是 YYYY-MM-DD: {raw!r}") from None
     if not (lot.get("target_pct", 0) > 0 or lot.get("stop_pct", 0) > 0 or lot.get("remind_date")):
         raise ValueError("止盈% / 止损% / 到期日 至少设置一项 (否则无监控点)")
+
+
+def validate_lot_id(lot_id: object) -> str:
+    """校验批次 id，供删除等不携完整批次载荷的边界复用。"""
+    if (
+        not isinstance(lot_id, str)
+        or not lot_id.startswith("lot_")
+        or not _ID.match(lot_id)
+        or len(lot_id) > _MAX_ID_LEN
+    ):
+        raise ValueError(f"批次 id 非法: {lot_id!r}")
+    return lot_id
 
 
 def normalize_lot(lot: dict) -> dict:
@@ -107,6 +125,18 @@ def delete_one(data_dir: Path, lot_id: str) -> bool:
         p.unlink()
         return True
     return False
+
+
+def load_one(data_dir: Path, lot_id: str) -> dict | None:
+    """读取单个批次；不存在或损坏时返回 None。"""
+    p = _path(data_dir, lot_id)
+    if not p.exists():
+        return None
+    try:
+        return normalize_lot(json.loads(p.read_text(encoding="utf-8")))
+    except Exception as exc:
+        logger.warning("lot load failed %s: %s", p.name, exc)
+        return None
 
 
 # ── 批次 → 监控规则 (纯映射) ───────────────────────────

@@ -5,7 +5,7 @@ null); 历史交易日的 quote_ts 时刻 < 15:00 即盘中快照 → 坏。
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 
 import polars as pl
@@ -342,9 +342,9 @@ def test_branch4_start_without_stale_day_uses_latest():
 
 def test_timezone_conversion_is_cn():
     # quote_ts 是毫秒 Unix 时间戳, 必须按 UTC+8 折算 — 15:00 边界用例
-    ts = int(datetime(2026, 8, 21, 7, 0, tzinfo=timezone.utc).timestamp() * 1000)  # 北京 15:00
+    ts = int(datetime(2026, 8, 21, 7, 0, tzinfo=UTC).timestamp() * 1000)  # 北京 15:00
     assert _is_snapshot(FRIDAY, ts) is False
-    ts_morning = int(datetime(2026, 8, 21, 3, 58, tzinfo=timezone.utc).timestamp() * 1000)  # 北京 11:58
+    ts_morning = int(datetime(2026, 8, 21, 3, 58, tzinfo=UTC).timestamp() * 1000)  # 北京 11:58
     assert _is_snapshot(FRIDAY, ts_morning) is True
 
 
@@ -598,7 +598,16 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     monkeypatch.setattr(instrument_sync, "sync_instruments", lambda data_dir: 0)
     batch_calls: list[dict] = []
 
-    def _fake_batch(universe, repo, capset, start_date=None, end_date=None, on_chunk_done=None):
+    def _fake_batch(
+        universe,
+        repo,
+        capset,
+        start_date=None,
+        end_date=None,
+        on_chunk_done=None,
+        failed_out=None,
+    ):
+        del universe, repo, capset, on_chunk_done, failed_out
         batch_calls.append({
             "start": start_date.date() if hasattr(start_date, "date") else start_date,
             "end": end_date.date() if hasattr(end_date, "date") else end_date,
@@ -624,3 +633,57 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     )
     assert enriched_left == [f"date={yesterday.isoformat()}", f"date={today.isoformat()}"]
     assert result["enriched_days"] > 0
+
+
+def test_pipeline_range_failure_preserves_old_enriched_partition(tmp_path, monkeypatch):
+    """日K区间只要有一批失败，就必须在删除旧 enriched 之前终止。"""
+    from app.config import settings as app_settings
+    from app.jobs import daily_pipeline
+    from app.services import instrument_sync, kline_sync
+    from app.tickflow.repository import DataStore, KlineRepository
+
+    today = datetime.now(CN_TZ).date()
+    yesterday = today - timedelta(days=1)
+    while yesterday.weekday() >= 5:
+        yesterday -= timedelta(days=1)
+
+    _write_full_partition(
+        tmp_path, "kline_daily", yesterday, _ts_ms(yesterday, time(11, 58))
+    )
+    _write_full_partition(
+        tmp_path,
+        "kline_daily_enriched",
+        yesterday,
+        _ts_ms(yesterday, time(11, 58)),
+    )
+    enriched_path = (
+        tmp_path
+        / "kline_daily_enriched"
+        / f"date={yesterday.isoformat()}"
+        / "part.parquet"
+    )
+    before = enriched_path.read_bytes()
+
+    monkeypatch.setattr(instrument_sync, "sync_instruments", lambda _data_dir: 0)
+    monkeypatch.setattr(app_settings, "data_dir", tmp_path)
+
+    def _failed_batch(*_args, failed_out=None, **_kwargs):
+        failed_out.extend(["600001.SH"])
+        return 0
+
+    monkeypatch.setattr(kline_sync, "sync_and_persist_daily_batch", _failed_batch)
+    monkeypatch.setattr(
+        daily_pipeline,
+        "run_pipeline",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("日K失败后不应计算 enriched")
+        ),
+    )
+
+    repo = KlineRepository(DataStore(tmp_path))
+    capset = SimpleNamespace(has=lambda _key: False)
+
+    with pytest.raises(daily_pipeline.PipelineStageError, match="日K范围同步不完整"):
+        daily_pipeline.run_now(repo, capset)  # type: ignore[arg-type]
+
+    assert enriched_path.read_bytes() == before

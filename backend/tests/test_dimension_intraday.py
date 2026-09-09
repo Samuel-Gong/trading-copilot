@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import polars as pl
 
+from app.api import ext_data as ext_data_api
 from app.api.ext_data import _dimension_intraday_compute
-from app.services.ext_data import ExtConfig
+from app.services.ext_data import ExtConfig, ExtConfigStore, ExtField, write_ext_parquet
 
 
 def _mk_config() -> ExtConfig:
@@ -156,3 +158,83 @@ def test_dimension_intraday_explicit_date_uses_that_partition(tmp_path: Path) ->
     explicit = _dimension_intraday_compute(_mk_config(), data_dir, "所属概念", "人工智能", "2026-08-27")
     assert explicit["date"] == "2026-08-27"
     assert explicit["points"][0]["sector"] == 0.05
+
+
+def test_dimension_intraday_cache_tracks_member_and_minute_generations(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    store = ExtConfigStore(data_dir)
+    config = ExtConfig(
+        id="ext_gn",
+        label="测试概念",
+        mode="snapshot",
+        fields=[ExtField("symbol", "string"), ExtField("所属概念", "string")],
+    )
+    store.create(config)
+    write_ext_parquet(
+        pl.DataFrame({"symbol": ["000001.SZ", "000002.SZ"], "所属概念": ["人工智能", "其他"]}),
+        config,
+        data_dir,
+    )
+    _write_daily(data_dir, "2026-08-27", {"000001.SZ": 10.0, "000002.SZ": 20.0})
+    _write_minute(data_dir, "2026-08-28", [
+        ("000001.SZ", "2026-08-28T09:31:00", 11.0),
+        ("000002.SZ", "2026-08-28T09:31:00", 24.0),
+    ])
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(repo=SimpleNamespace(
+            store=SimpleNamespace(data_dir=data_dir),
+        )))
+    )
+    with ext_data_api._DIMENSION_INTRADAY_CACHE_LOCK:
+        ext_data_api._DIMENSION_INTRADAY_CACHE.clear()
+
+    first = ext_data_api.dimension_intraday(
+        request, "ext_gn", "所属概念", "人工智能", None,
+    )
+    assert first["points"][0]["sector"] == 0.1
+
+    current = store.get("ext_gn")
+    assert current is not None
+    write_ext_parquet(
+        pl.DataFrame({"symbol": ["000001.SZ", "000002.SZ"], "所属概念": ["其他", "人工智能"]}),
+        current,
+        data_dir,
+    )
+    after_members = ext_data_api.dimension_intraday(
+        request, "ext_gn", "所属概念", "人工智能", None,
+    )
+    assert after_members["points"][0]["sector"] == 0.2
+
+    _write_minute(data_dir, "2026-08-28", [
+        ("000001.SZ", "2026-08-28T09:31:00", 11.0),
+        ("000002.SZ", "2026-08-28T09:31:00", 26.0),
+    ])
+    after_minute = ext_data_api.dimension_intraday(
+        request, "ext_gn", "所属概念", "人工智能", None,
+    )
+    assert after_minute["points"][0]["sector"] == 0.3
+
+
+def test_dimension_intraday_cache_is_bounded_and_expires(monkeypatch) -> None:
+    monkeypatch.setattr(ext_data_api, "_DIMENSION_INTRADAY_CACHE_MAX_SIZE", 3)
+    monkeypatch.setattr(ext_data_api, "_DIMENSION_INTRADAY_CACHE_TTL_S", 10.0)
+    with ext_data_api._DIMENSION_INTRADAY_CACHE_LOCK:
+        ext_data_api._DIMENSION_INTRADAY_CACHE.clear()
+
+    for index in range(5):
+        ext_data_api._put_dimension_intraday_cache(
+            ("ext", "field", f"value-{index}", None),
+            float(index),
+            (index,),
+            {"index": index},
+        )
+
+    with ext_data_api._DIMENSION_INTRADAY_CACHE_LOCK:
+        assert len(ext_data_api._DIMENSION_INTRADAY_CACHE) == 3
+        assert {key[2] for key in ext_data_api._DIMENSION_INTRADAY_CACHE} == {
+            "value-2",
+            "value-3",
+            "value-4",
+        }
+        ext_data_api._prune_dimension_intraday_cache(20.0)
+        assert ext_data_api._DIMENSION_INTRADAY_CACHE == {}

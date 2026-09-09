@@ -317,15 +317,27 @@ async def recap_market_stream(
     try:
         from app.services.ai_provider import stream_ai_text
 
+        try:
+            context_as_of = date.fromisoformat(as_of_str)
+        except ValueError:
+            logger.warning("忽略非 ISO 复盘日期的扩展上下文: %s", as_of_str)
+            context_as_of = None
+
         # 龙虎榜摘要 (fuyao 专有): 拉取失败/未配置 → 空串, 复盘主流程不受影响
         from app.services import dragon_tiger as dragon_tiger_svc
 
-        lhb_ctx = dragon_tiger_svc.build_recap_context(repo.store.data_dir)
+        lhb_ctx = (
+            dragon_tiger_svc.build_recap_context(repo.store.data_dir, context_as_of)
+            if context_as_of is not None else ""
+        )
 
         # 盘前风向标摘要 (fuyao 专有): 失败/未配置 → 空串
         from app.services import auction_benchmark as auction_benchmark_svc
 
-        bench_ctx = auction_benchmark_svc.build_recap_context(repo.store.data_dir)
+        bench_ctx = (
+            auction_benchmark_svc.build_recap_context(repo.store.data_dir, context_as_of)
+            if context_as_of is not None else ""
+        )
         user_prompt = _build_user_prompt(overview, news or [], focus, lhb_ctx, bench_ctx)
         got_content = False
         async for delta in stream_ai_text(

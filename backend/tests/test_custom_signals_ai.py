@@ -67,6 +67,13 @@ def test_build_messages_contains_factor_fields():
     assert "预计算的因子值" in system
 
 
+def test_build_messages_excludes_point_in_time_and_single_asset_factors():
+    system = build_messages("低估值股票")[0]["content"]
+    field_section = system.split("运算符（op）", 1)[0]
+    for unsupported in ("pb_latest", "roe_latest", "revenue_yoy_latest"):
+        assert f"{unsupported}(" not in field_section
+
+
 def test_parse_and_validate_accepts_factor_condition():
     # AI 输出以因子为条件字段: 应通过白名单校验
     raw = json.dumps({

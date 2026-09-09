@@ -2,7 +2,9 @@
 
 数据源插件是可选的行情数据来源(fuyao、stock-sdk、akshare 等),作为独立模块放在
 `backend/app/plugins/` 下。services 层(kline_sync / quote_service / financial_sync)
-全部通过统一路由点分流:插件声明了某数据集就走插件,未声明自动回退 TickFlow。
+全部通过统一路由点分流:用户明确选择插件后,该数据集只走所选插件；插件未声明、
+不可用或返回契约异常时 fail-closed,不会跨源回退 TickFlow。只有用户明确选择
+TickFlow 时才调用 TickFlow。
 因此**一个合格的插件只需要正确实现契约,不需要改动任何 service / API 代码**;
 反过来,插件也必须遵守内部数据契约(单位、代码格式、复权口径),框架不会替你转换。
 
@@ -36,8 +38,8 @@ install_hint: "pip install xxx"          # 未装依赖时显示的安装提示
 homepage: "https://example.com"          # (可选)官网/申请地址, 显示在设置页 Key 配置说明中
 ```
 
-只声明真实提供的数据集;未声明的数据集 `provider_has_dataset` 返回 False,自动回退
-TickFlow。不要声明做不了的数据集(粒度含义见下文"能力声明的粒度")。
+只声明真实提供的数据集;未声明的数据集 `provider_has_dataset` 返回 False,所选路由
+fail-closed。不要声明做不了的数据集(粒度含义见下文"能力声明的粒度")。
 
 #### api_key_env(界面配置 API Key)
 
@@ -99,7 +101,7 @@ def availability() -> tuple[bool, str]:
 | --- | --- | --- |
 | `change_pct` | **小数制**, `0.0366` = 3.66% | 接口给百分数(3.66)时必须在 provider 内显式 /100 |
 | `turnover_rate`(realtime 入口) | **小数制**, `0.05` = 5% | 下游 enriched 管道统一转百分数值存储 |
-| `volume` | 股 | |
+| `volume` | **手**（1 手 = 100 股） | 上游返回股时必须在 provider 边界除以 100 |
 | `amount` / `turnover` | 元 | |
 | 日K OHLC | **不复权原始价** | 复权由 adj_factor + enriched 管道处理, provider 不得自行复权 |
 
@@ -120,6 +122,10 @@ def availability() -> tuple[bool, str]:
 
 这是当前框架的设计行为。要么在数据里尽量覆盖指数/ETF,要么接受降级并在
 `description` 里向用户说明覆盖范围。
+
+同理，声明 `daily` 或 `adj_factor` 必须同时覆盖系统会请求的 stock/index/ETF；
+只支持 A 股股票的实现不能在 manifest 中声明这两个全局数据集。当前路由不会因
+某个资产类型返回空数据而偷偷切换到另一来源。
 
 ## Provider 接口契约
 
@@ -175,7 +181,7 @@ class MyProvider:
     def test_dataset(self, dataset: str, symbols=None) -> dict:
         """(强烈建议)设置页"试拉"按钮。
         返回 {provider, dataset, rows, columns, preview, error?}; 未支持的数据集
-        返回 error 字段说明会回退 TickFlow。"""
+        返回 error 字段说明所选路由不可用。"""
 ```
 
 ### get_minute 的 datetime 时区契约
@@ -187,7 +193,8 @@ class MyProvider:
 
 入口守卫（`kline_sync._enforce_minute_beijing_wallclock`）对所有分钟源强制归一：
 带时区 → 自动换算成北京墙钟；naive 但整体呈 UTC 特征（如 01:30）→ 自动 +8 纠偏并
-记日志；完全无法识别的口径 → 拒收并回退 TickFlow。契约仍要求源头写对，守卫只是兜底。
+记日志；完全无法识别的口径 → 拒收并让所选路由 fail-closed。契约仍要求源头写对，
+守卫只是兜底。
 
 可选类属性 `minute_history_days = 5` 声明 1 分钟历史深度（交易日）；未声明视为
 深历史（TickFlow 基准）。浅源（如 stock-sdk 免费分时仅保留最近 5 个交易日）声明后，
@@ -199,7 +206,7 @@ class MyProvider:
 > 能力键 `intraday.universe`)。需实现:
 >
 > - `get_intraday_batch(symbols, count=300, asset_type="stock") -> pl.DataFrame`
->   — **必须**(或已有 `get_minute` 自动回退,但强烈建议实现批量端点)。
+>   — **必须**(未实现时所选 full_minute 路由不可用)。
 >   返回给定标的当日 1 分钟K,canonical 8 列
 >   `[symbol, datetime(北京墙钟 naive), open, high, low, close, volume, amount]`,
 >   内部自行分块/限速。服务在冷启动、覆盖断档、连续空轮时调用(修复轮)。
@@ -219,7 +226,7 @@ class MyProvider:
 | --- | --- |
 | `get_realtime` | **软失败**: 返回 `[]` + warning 日志, 保证轮询线程不中断 |
 | `get_realtime_indices` | **软失败**: 返回 `None` + warning 日志, 保留上轮有效缓存; 成功无数据返回 `[]` |
-| `get_minute` | 抛异常时调用方自动回退 TickFlow 重试 |
+| `get_minute` | 抛异常时调用方记录告警并返回空数据，不跨源回退 |
 | `get_daily` / `get_adj_factors` / `get_financials` | 异常由上层同步流程捕获记录; 无数据返回空 DataFrame |
 
 ### get_realtime 行字段
@@ -230,19 +237,19 @@ class MyProvider:
 | `last_price` | ✅ | 最新价 |
 | `prev_close` | ✅ | 昨收, 涨跌幅推导基准 |
 | `open` / `high` / `low` | ✅ | 当日 OHLC |
-| `volume` | ✅ | 股 |
+| `volume` | ✅ | 手（1 手 = 100 股） |
 | `amount` | 建议 | 成交额(元) |
 | `change_pct` | 建议 | **小数制**; 缺失时下游按 change_amount/prev_close 推导 |
 | `change_amount` | 建议 | 涨跌额(元) |
-| `timestamp` | 建议 | 毫秒; 优先用服务端时间(行情归属), 缺失退本地时间 |
+| `timestamp` | ✅ | 服务端毫秒 epoch；缺失或无效时整份快照拒收，不得用本地接收时间替代 |
 | `name` | 可选 | 快照无名称时置 None, 下游用标的维表关联 |
 | `amplitude` / `turnover_rate` / `session` | 可选 | 缺失置 None, 不启发式伪造; turnover_rate 入口为小数制 |
 
 ### config.datasets 的作用
 
 `provider_has_dataset(name, dataset)` 通过 `dataset in provider.config.datasets` 判断。
-这是 services 层路由的关键: 用户在设置页选了插件, 但某数据集未声明时, 该数据集
-自动回退 TickFlow。
+这是 services 层路由的关键:用户在设置页选了插件,但某数据集未声明时,该数据集
+fail-closed；只有把设置明确切回 `tickflow` 才会调用 TickFlow。
 
 ```python
 class MyConfig:
@@ -267,7 +274,7 @@ Client/桥接注入。以 `backend/tests/test_fuyao_provider.py` 为范本, 至�
 2. 接口响应结构变体: 实测结构 vs 官方文档示例双兼容(供应商文档与实际不一致是常态)
 3. 分页: 多页合并、空页终止、页数上限
 4. 软失败: 接口报错返回 []; 整页 schema 变化有告警而非静默空数据
-5. 能力声明: 未声明数据集 `provider_has_dataset` 为 False
+5. 能力声明: 未声明数据集 `provider_has_dataset` 为 False，所选路由 fail-closed
 6. Key 语义: 先探后存(无效不落盘)、secrets.json > .env 优先级、availability 两态
 7. loader 集成: 清单解析后正确注册(或 hidden 时正确跳过)
 
@@ -279,7 +286,7 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
 ## 现有插件参考
 
 - **`backend/app/plugins/fuyao/`** — 同花顺官方 REST 数据源(runtime: none, 纯 HTTP 零依赖)
-  - 提供 `realtime`(A 股全市场快照, 分页拉取)、`daily`(原始价日K三档: 近端窗口走 daily-k-10d dump, 深窗口走 daily-k 10 年全量 dump(172MB 一次下载、缓存复用、10d 补尾), 兜底单标的接口按 10 年自动分片)、`adj_factor`(事件 dump + 前收盘价从本地日K dump 一次取齐、缺价标的回退单标的接口, 按交易所公式推导单事件比值, 涨跌停自检; 全市场配价从逐标的 ~13 分钟降为秒级); Key 在设置页卡片直接配置(先探后存), 或 `.env` 配 `FUYAO_API_KEY`
+  - 对外声明 `realtime`(A 股全市场快照, 分页拉取)与 `financial`；其日K/复权实现目前只覆盖 stock，因全局路由还会请求 index/ETF，故不声明这两项 dataset。Key 在设置页卡片直接配置(先探后存), 或 `.env` 配 `FUYAO_API_KEY`
   - `client.py` — httpx 客户端(X-api-key 认证 + 统一信封解包 + 分页 + 页间隔限频 + 单标的日K + dump 预签名下载, S3 下载不带 Key 头)
   - `provider.py` — Provider 实现(实测/文档双字段名映射、百分数→小数制、volume 股→手、上海零点戳 +8h 时区、dump 按 release 版本缓存、软失败、Key 探测)
   - `tests/test_fuyao_provider.py` — 73 个契约测试, 是新插件的测试范本

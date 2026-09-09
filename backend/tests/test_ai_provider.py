@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import httpx
 import openai
@@ -455,8 +456,9 @@ def test_save_ai_settings_persists_token_sizes(monkeypatch):
 
 
 def test_save_ai_settings_rejects_non_positive(monkeypatch):
-    from app.api import settings as settings_api
     from fastapi import HTTPException
+
+    from app.api import settings as settings_api
 
     req = settings_api.AiSettingsIn(provider="openai_compat", max_output_tokens=-1)
     with pytest.raises(HTTPException):
@@ -464,6 +466,33 @@ def test_save_ai_settings_rejects_non_positive(monkeypatch):
     req2 = settings_api.AiSettingsIn(provider="openai_compat", context_window=0)
     with pytest.raises(HTTPException):
         settings_api.save_ai_settings(req2)
+
+
+def test_save_ai_settings_validation_failure_has_no_side_effects(monkeypatch):
+    from fastapi import HTTPException
+
+    from app.api import settings as settings_api
+    from app.config import settings as app_settings
+
+    original_provider = app_settings.ai_provider
+    original_key = app_settings.ai_api_key
+    save = MagicMock()
+    clear = MagicMock()
+    monkeypatch.setattr(settings_api.secrets_store, "save", save)
+    monkeypatch.setattr(settings_api.secrets_store, "clear", clear)
+    request = settings_api.AiSettingsIn(
+        provider="changed-provider",
+        api_key="",
+        max_output_tokens=0,
+    )
+
+    with pytest.raises(HTTPException):
+        settings_api.save_ai_settings(request)
+
+    assert app_settings.ai_provider == original_provider
+    assert app_settings.ai_api_key == original_key
+    save.assert_not_called()
+    clear.assert_not_called()
 
 
 async def _fake_openai_stream(*chunks):
@@ -708,6 +737,7 @@ def test_codex_cli_available_false_when_command_missing(monkeypatch):
 async def test_codex_exec_args_exclude_ephemeral(monkeypatch):
     """exec 参数不含 --ephemeral: 老版本 codex(如 0.58)无此参数, 传了直接报错。"""
     captured: dict = {}
+    monkeypatch.setattr(ai_provider, "_supported_codex_features", lambda *args: ai_provider._CODEX_DISABLED_LOCAL_FEATURES)
 
     def fake_run_process(args, prompt, env, timeout):
         captured["args"] = list(args)
@@ -729,3 +759,9 @@ async def test_codex_exec_args_exclude_ephemeral(monkeypatch):
     assert "--ephemeral" not in args
     assert "exec" in args and "--skip-git-repo-check" in args
     assert args[args.index("--model") + 1] == "gpt-5.6-sol"
+    disabled = {
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--disable"
+    }
+    assert disabled == set(ai_provider._CODEX_DISABLED_LOCAL_FEATURES)

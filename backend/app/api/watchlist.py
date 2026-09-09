@@ -5,7 +5,7 @@ import logging
 import math
 import time
 from datetime import date
-from typing import Callable
+from collections.abc import Callable
 
 import anyio
 import polars as pl
@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
 from app.services import watchlist
+from app.services.definition_transactions import definitions_transaction
 from app.services.watchlist_csv import import_watchlist_codes, import_watchlist_csv
 from app.services.watchlist_ocr import import_watchlist_image
 from app.services.watchlist_ocr.provider import get_ocr_provider
@@ -81,7 +82,7 @@ def _with_names(rows: list[dict], request: Request) -> list[dict]:
         if not name_by_symbol:
             return rows
         return [{**row, "name": name_by_symbol.get(row.get("symbol"))} for row in rows]
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug("attach watchlist names failed: %s", e)
         return rows
 
@@ -151,10 +152,12 @@ def rename_group(group_id: str, req: GroupNameRequest):
 
 @router.delete("/groups/{group_id}")
 def delete_group(group_id: str, request: Request):
-    try:
-        groups, rows = watchlist.delete_group(group_id)
-    except KeyError as e:
-        raise HTTPException(404, "自选分组不存在") from e
+    data_dir = request.app.state.repo.store.data_dir
+    with definitions_transaction(data_dir):
+        try:
+            groups, rows = watchlist.delete_group(group_id)
+        except KeyError as e:
+            raise HTTPException(404, "自选分组不存在") from e
     return {"groups": groups, "symbols": _with_names(rows, request)}
 
 
@@ -219,7 +222,7 @@ def _run_candidate_import(parse: Callable[[], dict], empty_msg: str) -> dict:
         result = parse()
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.exception("watchlist import failed")
         raise HTTPException(500, f"解析失败: {e}") from e
     if not result["candidates"]:
@@ -229,7 +232,7 @@ def _run_candidate_import(parse: Callable[[], dict], empty_msg: str) -> dict:
 
 
 @router.post("/import-csv")
-async def import_from_csv(request: Request, file: UploadFile = File(...)):
+async def import_from_csv(request: Request, file: UploadFile = File(...)):  # noqa: B008
     """从 CSV / TXT 导入自选候选列表（不自动写入自选）。
 
     兼容同花顺/东财/通达信导出（逗号或 Tab 分隔、UTF-8 或 GBK 编码）。目标分组

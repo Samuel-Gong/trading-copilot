@@ -105,51 +105,6 @@
 
 ---
 
-## 📸 界面预览
-
-<table>
-  <tr>
-    <td width="50%" align="center"><b>看板 Dashboard</b></td>
-    <td width="50%" align="center"><b>策略 Screener</b></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="./screenshots/看板.png" alt="看板页面"></td>
-    <td width="50%"><img src="./screenshots/策略.png" alt="策略页"></td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><b>回测 Backtest</b></td>
-    <td width="50%" align="center"><b>挖掘 Mining</b></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="./screenshots/回测.png" alt="回测页"></td>
-    <td width="50%"><img src="./screenshots/挖掘因子.png" alt="挖掘页"></td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><b>监控中心 Monitor</b></td>
-    <td width="50%" align="center"><b>连板梯队 Limit Ladder</b></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="./screenshots/监控中心.png" alt="监控中心"></td>
-    <td width="50%"><img src="./screenshots/连板梯队.png" alt="连板梯队页"></td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><b>概念分析 Concept</b></td>
-    <td width="50%" align="center"><b>自选 Watchlist</b></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="./screenshots/概念分析.png" alt="概念分析"></td>
-    <td width="50%"><img src="./screenshots/自选.png" alt="自选页"></td>
-  </tr>
-</table>
-
-<div align="center">
-
-### 📸 [查看更多界面截图 »](./screenshots/README.md)
-
-</div>
-
----
-
 ## 🏗️ 技术架构
 
 ### 分层总览
@@ -272,7 +227,7 @@ cp .env.example .env       # 按需填 TICKFLOW_API_KEY(留空 = None 模式)
 
 自动检查 / 下载依赖、释放端口、同时起前后端。后端 → <http://localhost:3018> · 前端 → <http://localhost:3011>。启动器会清除父进程继承的代理环境变量，开发服务直接联网；系统内执行的 Codex CLI 会单独强制使用 `CODEX_PROXY_URL`，Vite 的 `/api` 转发仍只连接本机后端。
 
-### 方式 B:Docker(部署最省心)
+### 方式 B:Docker(部署最省心，需 Docker Compose 2.30+)
 
 ```bash
 cp .env.example .env

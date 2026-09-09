@@ -14,7 +14,7 @@ from typing import AsyncIterator
 
 import polars as pl
 
-from app.services.financial_sync import FINANCIAL_TABLES, get_financial_df
+from app.services.financial_sync import FINANCIAL_TABLES, get_financial_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,9 @@ def _load_stock_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]
     数值统一做 NaN/Inf → null 清洗,保证 JSON 序列化不报错。
     """
     result: dict[str, list[dict]] = {}
+    snapshot = get_financial_snapshot(data_dir)
     for table in FINANCIAL_TABLES:
-        df = get_financial_df(data_dir, table)
+        df = snapshot[table]
         if df.is_empty():
             result[table] = []
             continue

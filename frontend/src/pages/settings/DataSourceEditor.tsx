@@ -9,23 +9,27 @@ import { toast } from '@/components/Toast'
 const INPUT_CLS =
   'w-full h-9 px-2.5 rounded-lg bg-base border-0 ring-1 ring-border/40 text-xs text-foreground placeholder:text-muted/30 focus:outline-none focus:ring-2 focus:ring-accent/40 transition-shadow'
 
-const DATASETS = ['daily', 'adj_factor', 'realtime', 'minute', 'full_minute'] as const
+const DATASETS = ['instruments', 'daily', 'adj_factor', 'realtime', 'minute', 'full_minute', 'financial'] as const
 type DatasetKey = typeof DATASETS[number]
 
 const DATASET_LABEL: Record<DatasetKey, string> = {
+  instruments: '标的维表',
   daily: '日K',
   adj_factor: '除权因子',
   realtime: '实时行情',
   minute: '分钟K',
   full_minute: '全量分钟',
+  financial: '财务数据',
 }
 
 const TARGET_FIELDS: Record<DatasetKey, string[]> = {
+  instruments: ['symbol', 'name', 'code', 'exchange', 'region', 'type', 'listing_date', 'total_shares', 'float_shares', 'tick_size', 'limit_up', 'limit_down'],
   daily: ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount'],
   adj_factor: ['symbol', 'trade_date', 'ex_factor'],
   realtime: ['symbol', 'name', 'last_price', 'prev_close', 'open', 'high', 'low', 'volume', 'amount', 'change_pct', 'change_amount', 'amplitude', 'turnover_rate', 'timestamp', 'session'],
   minute: ['symbol', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount'],
   full_minute: ['symbol', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'amount'],
+  financial: ['symbol', 'period_end', 'announce_date', 'bps', 'roe', 'gross_margin', 'net_margin', 'revenue_yoy', 'net_income_yoy', 'debt_to_asset_ratio'],
 }
 
 // 内部字段的中文说明 (下拉选项展示用)
@@ -50,6 +54,25 @@ const FIELD_LABELS: Record<string, string> = {
   turnover_rate: '换手率 (小数 0.05=5%)',
   timestamp: '时间戳',
   session: '交易时段',
+  period_end: '报告期末（YYYY-MM-DD）',
+  announce_date: '公告日（YYYY-MM-DD）',
+  bps: '每股净资产（元）',
+  roe: '净资产收益率',
+  gross_margin: '毛利率',
+  net_margin: '净利率',
+  revenue_yoy: '营收同比',
+  net_income_yoy: '净利润同比',
+  debt_to_asset_ratio: '资产负债率',
+  code: '纯数字代码',
+  exchange: '交易所',
+  region: '地区',
+  type: '标的类型',
+  listing_date: '上市日期',
+  total_shares: '总股本（股）',
+  float_shares: '流通股本（股）',
+  tick_size: '最小报价单位',
+  limit_up: '涨停价',
+  limit_down: '跌停价',
 }
 
 function normalizeConfig(config: CustomSourceConfig): CustomSourceConfig {
@@ -133,13 +156,30 @@ export function DataSourceEditor({
             `数据集「${DATASET_LABEL[key as DatasetKey] || key}」超时必须在 0 到 300 秒之间`
           )
         }
+        if (
+          (key === 'realtime' || key === 'financial') &&
+          Object.values(ds.field_map).some(field => (
+            key === 'realtime'
+              ? ['change_pct', 'amplitude', 'turnover_rate']
+              : ['roe', 'gross_margin', 'net_margin', 'revenue_yoy', 'net_income_yoy', 'debt_to_asset_ratio']
+          ).includes(field)) &&
+          !ds.pct_unit
+        ) {
+          throw new Error(`${DATASET_LABEL[key as DatasetKey]}映射比例字段时，必须声明比例单位`)
+        }
+        if (Object.values(ds.field_map).includes('volume') && !ds.volume_unit) {
+          throw new Error(`数据集「${DATASET_LABEL[key as DatasetKey] || key}」映射成交量时，必须声明成交量单位`)
+        }
+        if (key === 'adj_factor' && !ds.adj_factor_kind) {
+          throw new Error('除权因子必须声明因子类型')
+        }
       }
       return api.saveDataSource(normalizeConfig(config))
     },
     onSuccess: () => {
       toast(isNew ? '数据源已创建' : '数据源已更新', 'success')
-      // 保存后强制重新拉取最新配置, 让数据集开关状态正确刷新
-      fetchCfg.refetch()
+      // 新建尚无 existingName，由父组件刷新列表；仅编辑时重新读取配置。
+      if (existingName) fetchCfg.refetch()
       onSaved()
     },
     onError: (e: Error) => {
@@ -343,7 +383,7 @@ function DatasetDetail({
   const enabled = !!cfg
   const [testSymbols, setTestSymbols] = useState('000001.SZ,600000.SH')
   const [showParams, setShowParams] = useState(false)
-  const showTimeParams = datasetKey !== 'realtime'
+  const showTimeParams = datasetKey !== 'realtime' && datasetKey !== 'instruments'
   const test = useMutation({
     mutationFn: () => api.testDataSource(
       providerName,
@@ -437,6 +477,57 @@ function DatasetDetail({
               </Field>
             </div>
 
+            {(datasetKey === 'realtime' || datasetKey === 'financial') && (
+              <Field
+                label="比例字段单位"
+                hint={datasetKey === 'realtime' ? '涨跌幅、振幅、换手率统一按此换算' : 'ROE、利润率、同比和资产负债率统一按此换算'}
+              >
+                <select
+                  value={cfg.pct_unit ?? ''}
+                  onChange={e => onUpdate({
+                    pct_unit: (e.target.value || null) as DatasetConfig['pct_unit'],
+                  })}
+                  className={`${INPUT_CLS} w-full`}
+                >
+                  <option value="">请选择</option>
+                  <option value="decimal">小数（0.0366 表示 3.66%）</option>
+                  <option value="percent">百分数（3.66 表示 3.66%）</option>
+                </select>
+              </Field>
+            )}
+
+            {TARGET_FIELDS[datasetKey].includes('volume') && (
+              <Field label="成交量单位" hint="内部统一换算为手">
+                <select
+                  value={cfg.volume_unit ?? ''}
+                  onChange={e => onUpdate({
+                    volume_unit: (e.target.value || null) as DatasetConfig['volume_unit'],
+                  })}
+                  className={`${INPUT_CLS} w-full`}
+                >
+                  <option value="">请选择</option>
+                  <option value="lots">手（1 表示 100 股）</option>
+                  <option value="shares">股（100 表示 1 手）</option>
+                </select>
+              </Field>
+            )}
+
+            {datasetKey === 'adj_factor' && (
+              <Field label="复权因子类型" hint="内部统一为单次除权事件比值">
+                <select
+                  value={cfg.adj_factor_kind ?? ''}
+                  onChange={e => onUpdate({
+                    adj_factor_kind: (e.target.value || null) as DatasetConfig['adj_factor_kind'],
+                  })}
+                  className={`${INPUT_CLS} w-full`}
+                >
+                  <option value="">请选择</option>
+                  <option value="event_ratio">单次事件比值</option>
+                  <option value="cumulative">累计复权因子</option>
+                </select>
+              </Field>
+            )}
+
             {/* 请求参数字段映射 — 折叠区 */}
             <div>
               <button
@@ -488,7 +579,7 @@ function DatasetDetail({
                           </Field>
                         </>
                       )}
-                      {(datasetKey === 'minute' || datasetKey === 'full_minute') && (
+                      {(datasetKey === 'minute' || datasetKey === 'full_minute' || datasetKey === 'instruments') && (
                         <>
                           <Field label="资产类型参数">
                             <input
@@ -498,14 +589,16 @@ function DatasetDetail({
                               className={`${INPUT_CLS} w-full`}
                             />
                           </Field>
-                          <Field label="周期参数">
-                            <input
-                              value={cfg.freq_param ?? ''}
-                              onChange={e => onUpdate({ freq_param: e.target.value || null })}
-                              placeholder="period"
-                              className={`${INPUT_CLS} w-full`}
-                            />
-                          </Field>
+                          {datasetKey !== 'instruments' && (
+                            <Field label="周期参数">
+                              <input
+                                value={cfg.freq_param ?? ''}
+                                onChange={e => onUpdate({ freq_param: e.target.value || null })}
+                                placeholder="period"
+                                className={`${INPUT_CLS} w-full`}
+                              />
+                            </Field>
+                          )}
                         </>
                       )}
                       {datasetKey === 'realtime' && (

@@ -369,7 +369,7 @@ class TestComputeMainline:
         monkeypatch,
     ):
         """增量主线计算期间来源变化时不得发布旧结果或新水位。"""
-        repo, d1, d2 = self._setup(tmp_path, monkeypatch)
+        repo, _d1, d2 = self._setup(tmp_path, monkeypatch)
         overwritten = (
             tmp_path
             / "kline_daily_enriched"
@@ -752,7 +752,7 @@ class TestMainlineFilterPreferences:
         got = preferences.set_mainline_filter_config({
             "max_members": 99999,          # 超上限被夹到 5000
             "min_members": 0,              # 低于下限被夹到 1
-            "blacklist": "融资融券, 沪股通；深股通",  # noqa: RUF001
+            "blacklist": "融资融券, 沪股通；深股通",
         })
         assert got["max_members"] == 5000
         assert got["min_members"] == 1

@@ -588,7 +588,6 @@ def compile_formula(text: str) -> CompiledFormula:
 
     dependencies: set[str] = set()
     referenced_factors: set[str] = set()
-    warmup = 1
     cross_sectional = False
     for name in identifiers:
         if name in BASE_COLUMNS:
@@ -599,12 +598,26 @@ def compile_formula(text: str) -> CompiledFormula:
             continue
         referenced_factors.add(name)
         dependencies.update(factor_dependencies([name]))
-        warmup = max(warmup, spec.warmup_bars)
 
-    for node_constants in constants_by_call.values():
-        n_value = node_constants.get("n")
-        if n_value is not None and n_value == int(n_value) and int(n_value) > 0:
-            warmup = max(warmup, int(n_value) + 1)
+    def _node_warmup(node: dict) -> int:
+        """沿 AST 路径累计时序窗口，分支取最大值。"""
+        if node["kind"] == "col":
+            spec = get_factor(node["value"])
+            return max(1, spec.warmup_bars) if spec is not None else 1
+        child_warmup = max(
+            (_node_warmup(child) for child in node["children"]),
+            default=1,
+        )
+        if node["kind"] != "call" or node["value"] not in TS_OPERATORS:
+            return child_warmup
+        n_value = constants_by_call.get(id(node), {}).get("n")
+        if n_value is None or n_value != int(n_value) or int(n_value) <= 0:
+            return child_warmup
+        n = int(n_value)
+        additional = n if node["value"] in {"ts_delay", "ts_delta"} else n - 1
+        return child_warmup + additional
+
+    warmup = _node_warmup(ast)
 
     def _find_cross(node: dict) -> None:
         nonlocal cross_sectional

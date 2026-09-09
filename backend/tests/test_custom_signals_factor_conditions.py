@@ -90,3 +90,43 @@ def test_materialize_skips_unknown_columns() -> None:
     df = _frame()
     df2 = custom_signals.materialize_factor_columns(df, exprs)
     assert df2.columns == df.columns
+
+
+def test_legacy_financial_factor_signal_is_isolated_from_enriched_pipeline() -> None:
+    """历史遗留 PIT 因子信号缺输入时跳过, 不得中断股票或 ETF enriched。"""
+    from app.factors import store
+    from app.factors.registry import unregister_factor
+
+    factor_id = "uf_financial_signal_legacy"
+    store.register_definition({
+        "id": factor_id,
+        "kind": "custom",
+        "version": 1,
+        "label": "财务遗留信号因子",
+        "formula": "roe_latest + pb_latest",
+        "status": "draft",
+    })
+    try:
+        assert factor_id not in custom_signals.allowed_fields()
+        signal = {
+            "id": "financial_legacy",
+            "name": "财务遗留信号",
+            "kind": "entry",
+            "enabled": True,
+            "conditions": [{
+                "left": factor_id,
+                "op": ">",
+                "right": "0",
+                "leftDays": 0,
+                "rightDays": 0,
+            }],
+        }
+        exprs = custom_signals.build_expressions([signal])
+
+        materialized = custom_signals.materialize_factor_columns(_frame(), exprs)
+        injected = custom_signals.inject(materialized, exprs)
+
+        assert factor_id not in materialized.columns
+        assert "csg_financial_legacy" not in injected.columns
+    finally:
+        unregister_factor(factor_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ import polars as pl
 from app.market_time import CN_TZ
 from app.services.ext_data import EXT_DATA_GENERATION_FILE, ExtConfig, ExtConfigStore
 from app.services.index_const import CORE_INDEX_NAMES as CORE_INDICES
+
 SECTOR_KINDS = {"index", "concept", "industry"}
 _VALUE_SEP = re.compile(r"[\u3001,\uff0c;\uff1b|]+")
 _NULL_VALUES = {"nan", "none", "null", "<na>", "n/a", "-"}
@@ -58,23 +60,31 @@ class SectorMonitorService:
         self._members_by_key: dict[str, set[str]] = {}
         self._history: dict[str, deque[tuple[float, float]]] = {}
         self._history_day: str | None = None
+        self._lock = threading.RLock()
 
     def list_targets(self) -> dict[str, list[dict]]:
-        self._ensure_catalog()
-        return {kind: [dict(item) for item in self._catalog[kind]] for kind in self._catalog}
+        with self._lock:
+            self._ensure_catalog()
+            return {kind: [dict(item) for item in self._catalog[kind]] for kind in self._catalog}
 
     def missing_target_keys(self, targets: list[dict]) -> list[str]:
-        self._ensure_catalog()
-        return [str(target.get("key") or "") for target in targets if target.get("key") not in self._targets_by_key]
+        with self._lock:
+            self._ensure_catalog()
+            return [
+                str(target.get("key") or "")
+                for target in targets
+                if target.get("key") not in self._targets_by_key
+            ]
 
     def unavailable_target_keys(self, targets: list[dict]) -> list[str]:
-        self._ensure_catalog()
-        return [
-            str(target.get("key") or "")
-            for target in targets
-            if target.get("key") in self._targets_by_key
-            and not self._targets_by_key[target["key"]].get("available", True)
-        ]
+        with self._lock:
+            self._ensure_catalog()
+            return [
+                str(target.get("key") or "")
+                for target in targets
+                if target.get("key") in self._targets_by_key
+                and not self._targets_by_key[target["key"]].get("available", True)
+            ]
 
     def build_snapshots(
         self,
@@ -87,38 +97,39 @@ class SectorMonitorService:
     ) -> dict[str, dict]:
         if not targets:
             return {}
-        self._ensure_catalog()
-        self._reset_history_for_day(now)
+        with self._lock:
+            self._ensure_catalog()
+            self._reset_history_for_day(now)
 
-        stock_rows = self._row_map(stock_df, index_values_are_percent=False)
-        index_rows = self._row_map(index_df, index_values_are_percent=True)
-        snapshots: dict[str, dict] = {}
+            stock_rows = self._row_map(stock_df, index_values_are_percent=False)
+            index_rows = self._row_map(index_df, index_values_are_percent=True)
+            snapshots: dict[str, dict] = {}
 
-        for raw_target in targets:
-            key = str(raw_target.get("key") or "")
-            target = self._targets_by_key.get(key)
-            if not target:
-                continue
-            if target["kind"] == "index":
-                snapshot = self._index_snapshot(target, index_rows)
-            else:
-                snapshot = self._dimension_snapshot(target, stock_rows)
-            if snapshot is None:
-                continue
+            for raw_target in targets:
+                key = str(raw_target.get("key") or "")
+                target = self._targets_by_key.get(key)
+                if not target:
+                    continue
+                if target["kind"] == "index":
+                    snapshot = self._index_snapshot(target, index_rows)
+                else:
+                    snapshot = self._dimension_snapshot(target, stock_rows)
+                if snapshot is None:
+                    continue
 
-            change_pct = snapshot.get("change_pct")
-            history = self._history.setdefault(key, deque())
-            if snapshot["valid"] and change_pct is not None:
-                history.append((now, float(change_pct)))
-                while history and history[0][0] < now - _HISTORY_SECONDS:
-                    history.popleft()
+                change_pct = snapshot.get("change_pct")
+                history = self._history.setdefault(key, deque())
+                if snapshot["valid"] and change_pct is not None:
+                    history.append((now, float(change_pct)))
+                    while history and history[0][0] < now - _HISTORY_SECONDS:
+                        history.popleft()
 
-            snapshot["window_changes"] = {
-                window: self._window_change(history, now, window, change_pct)
-                for window in windows
-            }
-            snapshots[key] = snapshot
-        return snapshots
+                snapshot["window_changes"] = {
+                    window: self._window_change(history, now, window, change_pct)
+                    for window in windows
+                }
+                snapshots[key] = snapshot
+            return snapshots
 
     def _ensure_catalog(self) -> None:
         signature = self._data_signature()

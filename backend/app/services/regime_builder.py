@@ -21,13 +21,18 @@ from pathlib import Path
 
 import polars as pl
 
-from app.enriched_generation import stable_enriched_generation
 from app.market_time import cn_today
-from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
 from app.services.market_environment_lock import (
+    market_commit_guard,
     market_environment_journal_path,
     market_environment_snapshot,
     serialized_market_environment_update,
+)
+from app.services.market_environment_lock import (
+    replace_market_parquet_set as replace_parquet_set,
+)
+from app.services.market_environment_lock import (
+    write_market_parquet as write_parquet_atomic,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,7 +51,7 @@ def assert_enriched_source_empty(repo) -> None:
 @contextmanager
 def locked_empty_enriched_source(repo) -> Iterator[None]:
     """从空源复验到派生清理发布持续阻止 enriched generation 切换。"""
-    with stable_enriched_generation(repo.store.data_dir, "stock"):
+    with market_commit_guard(repo.store.data_dir):
         assert_enriched_source_empty(repo)
         yield
 
@@ -547,10 +552,12 @@ def regime_coverage_path(data_dir: Path) -> Path:
     return data_dir / REGIME_DIR / "coverage.parquet"
 
 
+@serialized_market_environment_update
 def clear_regime_history(data_dir: Path) -> None:
     """删除失去 enriched 来源后的 regime 历史及逐日完成水位。"""
-    for path in (regime_path(data_dir), regime_coverage_path(data_dir)):
-        path.unlink(missing_ok=True)
+    with market_environment_snapshot(data_dir):
+        for path in (regime_path(data_dir), regime_coverage_path(data_dir)):
+            path.unlink(missing_ok=True)
 
 
 def _load_regime_coverage(data_dir: Path) -> pl.DataFrame:
@@ -559,7 +566,7 @@ def _load_regime_coverage(data_dir: Path) -> pl.DataFrame:
         return pl.DataFrame()
     try:
         frame = pl.read_parquet(path)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("load regime coverage failed: %s", exc)
         return pl.DataFrame()
     if not {"date", "source_mtime_ns"}.issubset(frame.columns):
@@ -656,6 +663,7 @@ def assert_regime_source_unchanged(
         raise RegimeSourceChangedError("环境计算期间行情来源已更新，请重试全量重算")
 
 
+@serialized_market_environment_update
 def mark_regime_range_processed(
     data_dir: Path,
     repo,
@@ -702,7 +710,7 @@ def load_regime_history(data_dir: Path) -> pl.DataFrame:
             return pl.DataFrame()
         try:
             return pl.read_parquet(p)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("load_regime_history failed: %s", e)
             return pl.DataFrame()
 

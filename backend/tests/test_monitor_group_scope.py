@@ -136,6 +136,24 @@ def test_engine_group_rebind_clears_rule_runtime_state():
     assert not eng._strategy_signal_seen
 
 
+def test_rule_condition_edit_clears_cooldown_but_cosmetic_edit_preserves_it():
+    """命中语义变化立即重置冷却，名称与文案修改不重复告警。"""
+    eng = MonitorRuleEngine()
+    rule = _group_rule(group_id="group-a", cooldown_seconds=3600)
+    key = ("r_grp", "600000.SH", "signal")
+    eng.set_rules([rule])
+    eng._last_fire[key] = 100.0
+
+    eng.set_rules([{**rule, "name": "新名称", "message": "新文案"}])
+    assert eng._last_fire == {key: 100.0}
+
+    eng.set_rules([{
+        **rule,
+        "conditions": [{"field": "rsi_14", "op": "<", "value": 50}],
+    }])
+    assert eng._last_fire == {}
+
+
 def test_abnormal_group_scope_filtering(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     _, group = watchlist.create_group("异动池")

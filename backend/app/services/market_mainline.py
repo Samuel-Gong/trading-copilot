@@ -26,12 +26,17 @@ from pathlib import Path
 import polars as pl
 
 from app.market_time import cn_today
-from app.services.atomic_parquet import replace_parquet_set, write_parquet_atomic
 from app.services.ext_data import ExtConfigStore
 from app.services.market_environment_lock import (
     market_environment_journal_path,
     market_environment_snapshot,
     serialized_market_environment_update,
+)
+from app.services.market_environment_lock import (
+    replace_market_parquet_set as replace_parquet_set,
+)
+from app.services.market_environment_lock import (
+    write_market_parquet as write_parquet_atomic,
 )
 from app.services.market_overview_builder import (
     _dimension_field,
@@ -142,10 +147,12 @@ def mainline_coverage_path(data_dir: Path) -> Path:
     return data_dir / MAINLINE_DIR / "coverage.parquet"
 
 
+@serialized_market_environment_update
 def clear_mainline_history(data_dir: Path) -> None:
     """删除失去 enriched 来源后的主线历史及逐日完成水位。"""
-    for path in (mainline_path(data_dir), mainline_coverage_path(data_dir)):
-        path.unlink(missing_ok=True)
+    with market_environment_snapshot(data_dir):
+        for path in (mainline_path(data_dir), mainline_coverage_path(data_dir)):
+            path.unlink(missing_ok=True)
 
 
 def _processed_mainline_dates(data_dir: Path, kind: str) -> set[date]:
@@ -154,7 +161,7 @@ def _processed_mainline_dates(data_dir: Path, kind: str) -> set[date]:
         return set()
     try:
         frame = pl.read_parquet(path)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("load mainline coverage failed: %s", exc)
         return set()
     if not {"date", "kind"}.issubset(frame.columns):
@@ -300,7 +307,7 @@ def _stale_mainline_dates(
                     .select(["date", "filter_version"])
                     .iter_rows(named=True)
                 }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("load mainline coverage versions failed: %s", exc)
 
     legacy_mtime_ns = 0
@@ -327,9 +334,7 @@ def _stale_mainline_dates(
             source_mtime_ns is not None
             and target_date in versions
             and recorded_source_mtime_ns != source_mtime_ns
-        ):
-            stale.add(target_date)
-        elif (
+        ) or (
             source_mtime_ns is not None
             and target_date not in versions
             and source_mtime_ns > legacy_mtime_ns
@@ -341,9 +346,7 @@ def _stale_mainline_dates(
             target_date in membership_versions
             and recorded_membership_version is not None
             and recorded_membership_version != current_version
-        ):
-            stale.add(target_date)
-        elif (
+        ) or (
             recorded_membership_version is None
             and membership_mtime_ns > legacy_mtime_ns
         ):
@@ -353,6 +356,7 @@ def _stale_mainline_dates(
     return stale
 
 
+@serialized_market_environment_update
 def _mark_mainline_dates_processed(
     data_dir: Path,
     repo,
@@ -499,6 +503,7 @@ def assert_mainline_source_unchanged(
         raise MainlineSourceChangedError("主线计算期间来源已更新，请重试")
 
 
+@serialized_market_environment_update
 def _remove_mainline_dates_processed(
     data_dir: Path,
     kind: str,
@@ -591,7 +596,7 @@ def _load_point_in_time_map_df(repo, kind: str) -> pl.DataFrame:
             frame = pl.read_parquet(files, hive_partitioning=True)
         except TypeError:
             frame = pl.read_parquet(files)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("load point-in-time %s membership failed: %s", kind, exc)
             continue
         if frame.is_empty() or field not in frame.columns or "date" not in frame.columns:
@@ -1090,19 +1095,10 @@ def compute_mainline_incremental(repo, data_dir: Path, *, today: date | None = N
         start=to_compute[0],
         end=to_compute[-1],
     )
-    replace_mainline_history_range(
-        data_dir,
-        new_rows,
-        start=to_compute[0],
-        end=to_compute[-1],
-        kind=kind,
-    )
-    _remove_mainline_dates_processed(data_dir, kind, set(removed))
-    _mark_mainline_dates_processed(
-        data_dir,
-        repo,
-        kind,
-        set(source_snapshot.coverage["date"].to_list()),
+    entries, _ = build_mainline_history_range_snapshot(
+        data_dir, {kind: new_rows},
+        start=to_compute[0], end=to_compute[-1],
         source_snapshot=source_snapshot,
     )
+    replace_parquet_set(entries, journal_path=market_environment_journal_path(data_dir))
     return new_rows

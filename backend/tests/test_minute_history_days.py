@@ -7,6 +7,7 @@ preferences GET 带出该字段, 前端分时档位据此收窄 (浅源默认 5�
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from app.api import settings
@@ -18,6 +19,11 @@ def _mock_resolver(monkeypatch, provider, fallback, err=None):
         "app.services.kline_sync._resolve_minute_provider",
         lambda name: (provider, fallback, err),
     )
+    if provider is not None:
+        monkeypatch.setattr(
+            "app.data_providers.custom.lease_provider",
+            lambda name: nullcontext((provider, 1)),
+        )
 
 
 def test_stocksdk_declares_five_day_history():
@@ -30,6 +36,17 @@ def test_history_days_from_custom_provider(monkeypatch):
     """自定义浅源 → 声明值; 前端据此只显示 1/5 日档。"""
     _mock_resolver(monkeypatch, SimpleNamespace(minute_history_days=5), False)
     monkeypatch.setattr(preferences, "get_minute_data_provider", lambda: "stocksdk")
+    assert settings._minute_history_days() == 5
+
+
+def test_history_days_uses_real_resolver_and_registry(monkeypatch):
+    from app.data_providers.custom import loader
+    from app.plugins.stocksdk.provider import StockSDKProvider
+
+    provider = StockSDKProvider()
+    monkeypatch.setattr(loader, "_PROVIDERS", {"stocksdk": provider})
+    monkeypatch.setattr(preferences, "get_minute_data_provider", lambda: "stocksdk")
+
     assert settings._minute_history_days() == 5
 
 

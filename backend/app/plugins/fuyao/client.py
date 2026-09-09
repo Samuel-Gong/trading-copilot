@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import httpx
 
@@ -93,7 +95,7 @@ class FuyaoClient:
     def snapshot_all(self) -> tuple[list[dict], int]:
         """分页拉取全市场快照。返回 (rows, 服务端时间戳ms)。
 
-        服务端时间戳用于行情归属; 缺失时返回 0, 由调用方退回本地时间。
+        服务端时间戳用于行情归属；缺失时返回 0，由调用方 fail-closed 丢弃快照。
         空数据 / 中途失败时抛 FuyaoError。
         """
         out: list[dict] = []
@@ -164,7 +166,7 @@ class FuyaoClient:
     # ---- 财务 ----
     # 端点均单标的(thscode 不接受逗号)。取数模式二选一: limit=最近N期 或 start/end 区间,
     # 这里只用 limit。period=quarterly 覆盖每个季度末(含年报期), 与项目"各报告期累积"口径一致。
-    _STATEMENT_ENDPOINTS = {
+    _STATEMENT_ENDPOINTS: ClassVar[dict[str, str]] = {
         "income": "income-statements",
         "balance_sheet": "balance-sheets",
         "cash_flow": "cash-flow-statements",
@@ -276,27 +278,44 @@ class FuyaoClient:
         """
         return self._get(f"/api/dump/market-dumps/{dump_kind}/download-url", {})
 
-    def download_dump(self, dump_kind: str, dest: Path) -> Path:
+    def download_dump(
+        self,
+        dump_kind: str,
+        dest: Path,
+        *,
+        presigned_url: str | None = None,
+    ) -> Path:
         """下载 dump 到 dest(先写 .part 临时文件, 成功后原子改名)。失败抛 FuyaoError。
 
         预签名 URL 指向对象存储, 请求不得携带 X-api-key 头 → 用独立裸请求,
         不经过持有认证头的 self._http。
         """
-        url = str(self.dump_download_url(dump_kind).get("presigned_url") or "")
+        url = presigned_url or str(
+            self.dump_download_url(dump_kind).get("presigned_url") or ""
+        )
         if not url:
             raise FuyaoError(f"dump {dump_kind} 未返回预签名 URL")
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.name + ".part")
+        tmp: Path | None = None
         try:
             with httpx.stream("GET", url, timeout=120.0, follow_redirects=True) as resp:
                 if resp.status_code != 200:
                     raise FuyaoError(f"dump {dump_kind} 下载失败 HTTP {resp.status_code}")
-                with open(tmp, "wb") as fh:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{dest.name}.",
+                    suffix=".part",
+                    dir=dest.parent,
+                    delete=False,
+                ) as fh:
+                    tmp = Path(fh.name)
                     for chunk in resp.iter_bytes(1 << 20):
                         fh.write(chunk)
+            assert tmp is not None
             tmp.replace(dest)
         except httpx.HTTPError as e:
             raise FuyaoError(f"dump {dump_kind} 下载网络失败: {e}") from e
         finally:
-            tmp.unlink(missing_ok=True)
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
         return dest

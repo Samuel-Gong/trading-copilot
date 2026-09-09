@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from app.backtest.worker import make_worker_task, run_worker_task
 from app.services.heavy_job_limiter import (
@@ -29,6 +30,7 @@ WorkerRunner = Callable[
 TaskFactory = Callable[[str, Path, dict[str, Any]], dict[str, Any]]
 
 _SUCCESS_STATUSES = {"succeeded", "succeeded_with_budget_exhausted"}
+_WORKER_JOIN_TIMEOUT_SECONDS = 10.0
 
 
 class MiningJobManager:
@@ -139,10 +141,11 @@ class MiningJobManager:
             self.cancel(run_id)
 
         current = threading.current_thread()
+        deadline = time.monotonic() + _WORKER_JOIN_TIMEOUT_SECONDS
         for _, thread in workers:
             if thread is current:
                 continue
-            thread.join()
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def recover_interrupted(self) -> int:
         return self._store.recover_interrupted()
@@ -165,7 +168,15 @@ class MiningJobManager:
             for _run_id, thread in workers:
                 if thread is current:
                     raise RuntimeError("mining worker cannot clear its own run store")
-                thread.join()
+            deadline = time.monotonic() + _WORKER_JOIN_TIMEOUT_SECONDS
+            for _run_id, thread in workers:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            active = [run_id for run_id, thread in workers if thread.is_alive()]
+            if active:
+                raise RuntimeError(
+                    "mining workers did not stop before clear timeout: "
+                    + ", ".join(active[:5])
+                )
             yield self._store
         finally:
             with self._lock:

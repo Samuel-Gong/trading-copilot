@@ -5,12 +5,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from app.services.definition_transactions import definitions_transaction
 from app.strategy import monitor_rules
 from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals
 
@@ -265,7 +265,7 @@ def list_rules(request: Request):
             for rule in group_rules:
                 if rule.get("group_id") not in existing_ids:
                     rule["runtime_warning"] = "绑定的自选分组已删除, 规则已暂停监控, 编辑可重新选择"
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     # 按 created_at 倒序
     rules.sort(key=lambda r: r.get("created_at", ""), reverse=True)
@@ -275,6 +275,11 @@ def list_rules(request: Request):
 # ── 新建 / 更新 ────────────────────────────────────────
 @router.post("")
 def save_rule(req: RuleModel, request: Request):
+    with definitions_transaction(_data_dir(request)):
+        return _save_rule_locked(req, request)
+
+
+def _save_rule_locked(req: RuleModel, request: Request):
     rule = monitor_rules.normalize(req.model_dump())
     rule = _reconcile_index_asset_type(rule, request.app.state.repo)
     # 连板梯队封单监控 (type=ladder) 依赖五档盘口数据, 需 Pro+ (DEPTH5_BATCH 能力)。
@@ -288,6 +293,7 @@ def save_rule(req: RuleModel, request: Request):
                 detail="封单监控需要 Pro+ 套餐 (批量五档能力),请升级后在「设置」页配置",
             )
     if rule.get("type") == "strategy":
+        from app.market_time import cn_today
         from app.strategy.engine import StrategyDataContext
 
         strategy_engine = getattr(request.app.state, "strategy_engine", None)
@@ -300,7 +306,7 @@ def save_rule(req: RuleModel, request: Request):
                 StrategyDataContext(
                     asset_type=str(rule.get("asset_type") or "stock"),
                     timeframe="1d",
-                    as_of=date.today(),
+                    as_of=cn_today(),
                 ),
             )
         except ValueError as e:
@@ -317,6 +323,25 @@ def save_rule(req: RuleModel, request: Request):
             monitor_rules.validate(rule)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        custom_signal_ids = {
+            str(condition.get("field"))[len("csg_"):]
+            for condition in rule.get("conditions", [])
+            if str(condition.get("field") or "").startswith("csg_")
+        }
+        if custom_signal_ids:
+            from app.strategy import custom_signals
+
+            defined_signal_ids = {
+                str(signal.get("id"))
+                for signal in custom_signals.load_all(_data_dir(request))
+            }
+            missing_signal_ids = sorted(custom_signal_ids - defined_signal_ids)
+            if missing_signal_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="监控规则引用了不存在的自定义信号: "
+                    + ", ".join(f"csg_{signal_id}" for signal_id in missing_signal_ids),
+                )
         if rule.get("scope") == "watchlist_group":
             # 绑定的分组必须存在 (strategy 层校验形状, 存在性在本层校验)
             from app.services import watchlist as watchlist_service
@@ -324,7 +349,7 @@ def save_rule(req: RuleModel, request: Request):
             group_id = str(rule.get("group_id") or "")
             try:
                 group_ids = {g["id"] for g in watchlist_service.list_groups()}
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 raise HTTPException(status_code=503, detail=f"自选分组读取失败: {e}") from e
             if group_id not in group_ids:
                 raise HTTPException(status_code=400, detail="自选分组不存在或已被删除, 请重新选择")
@@ -371,6 +396,11 @@ def save_rule(req: RuleModel, request: Request):
 # ── 删除 ───────────────────────────────────────────────
 @router.delete("/{rule_id}")
 def delete_rule(rule_id: str, request: Request):
+    with definitions_transaction(_data_dir(request)):
+        return _delete_rule_locked(rule_id, request)
+
+
+def _delete_rule_locked(rule_id: str, request: Request):
     if not monitor_rules.ID_RE.match(rule_id):
         raise HTTPException(status_code=400, detail="规则 id 非法")
     with monitor_rules.locked():
@@ -446,7 +476,7 @@ def seed_demo_rules(request: Request):
     ts = int(_time.time() * 1000)
     created = []
     i = 0
-    with monitor_rules.locked():
+    with definitions_transaction(_data_dir(request)), monitor_rules.locked():
         for (
             name,
             rtype,
@@ -660,7 +690,7 @@ def trigger_ladder(request: Request):
         inst = repo.get_instruments()
         if not inst.is_empty() and "name" in inst.columns:
             name_map = {r["symbol"]: r["name"] for r in inst.select(["symbol", "name"]).iter_rows(named=True) if r.get("name")}
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
     for rule in engine.rules.values():
@@ -713,7 +743,7 @@ def trigger_ladder(request: Request):
     # 1. 落盘到 alerts.jsonl
     try:
         alert_store.append_many(repo.store.data_dir, rule_events)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass  # 落盘失败不阻断推送
 
     # 2. SSE 推送 (入 pending_alerts 队列)

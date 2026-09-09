@@ -14,11 +14,13 @@ from fastapi import APIRouter, Query, Request
 
 from app.market_time import cn_today
 from app.services import regime_builder
-from app.services.atomic_parquet import replace_parquet_set
 from app.services.market_environment_lock import (
     market_environment_journal_path,
     market_environment_snapshot,
     serialized_market_environment_update,
+)
+from app.services.market_environment_lock import (
+    replace_market_parquet_set as replace_parquet_set,
 )
 
 router = APIRouter(prefix="/api/regime", tags=["regime"])
@@ -26,15 +28,17 @@ router = APIRouter(prefix="/api/regime", tags=["regime"])
 _CACHE_TTL = 5.0
 _cache: dict[str, Any] | None = None
 _cache_ts: float = 0.0
+_cache_generation: int = 0
 _cache_lock = threading.Lock()
 
 
 def invalidate_regime_cache() -> None:
     """清空 regime 查询缓存。批算/重算后调用。"""
-    global _cache, _cache_ts
+    global _cache, _cache_ts, _cache_generation
     with _cache_lock:
         _cache = None
         _cache_ts = 0.0
+        _cache_generation += 1
 
 
 def _data_dir(request: Request) -> Any:
@@ -70,6 +74,7 @@ def regime_history(
             and (time.time() - _cache_ts) < _CACHE_TTL
         ):
             return _cache["data"]
+        generation = _cache_generation
 
     df = regime_builder.load_regime_history(_data_dir(request))
     if df.is_empty():
@@ -88,8 +93,9 @@ def regime_history(
         result = {"rows": rows, "total": len(rows)}
 
     with _cache_lock:
-        _cache = {"key": cache_key, "data": result}
-        _cache_ts = time.time()
+        if _cache_generation == generation:
+            _cache = {"key": cache_key, "data": result}
+            _cache_ts = time.time()
     return result
 
 

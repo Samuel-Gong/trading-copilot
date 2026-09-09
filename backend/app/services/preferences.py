@@ -15,6 +15,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,13 @@ _update_lock = threading.RLock()
 # 文件仅在用户改设置时变化, 以 (mtime_ns, size) 签名判断是否重读。
 _cache: dict | None = None
 _cache_sig: tuple[int, int] | None = None
+
+
+@contextmanager
+def provider_route_lock():
+    """阻止数据源偏好在一次校验并提交事务中途变化。"""
+    with _update_lock:
+        yield
 
 
 def _path() -> Path:
@@ -51,7 +59,7 @@ def _load_unlocked(p: Path) -> dict:
         _cache = None
         _cache_sig = None
         return {}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("preferences.json malformed: %s", e)
         return {}
     _cache = data
@@ -407,48 +415,39 @@ def get_daily_batch_compress() -> bool:
     return bool(raw)
 
 
-def _allowed_data_providers() -> set[str]:
-    try:
-        from app.data_providers import custom as custom_sources
-        return _ALLOWED_DATA_PROVIDERS | custom_sources.names()
-    except Exception:  # noqa: BLE001
-        return set(_ALLOWED_DATA_PROVIDERS)
+def _provider_preference(key: str) -> str:
+    """返回用户显式选择；Provider 暂时失效时不静默改走 TickFlow。"""
+    return str(load().get(key, "tickflow") or "tickflow").strip().lower()
 
 
 def get_daily_data_provider() -> str:
-    provider = str(load().get("daily_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _provider_preference("daily_data_provider")
 
 
 def get_adj_factor_provider() -> str:
     # 「跟随日K」(same_as_daily) 特殊值已下线: 存量配置里的旧值按非法值回退 tickflow
-    provider = str(load().get("adj_factor_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    provider = _provider_preference("adj_factor_provider")
+    return "tickflow" if provider == "same_as_daily" else provider
 
 
 def get_minute_data_provider() -> str:
-    provider = str(load().get("minute_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _provider_preference("minute_data_provider")
 
 
 def get_full_minute_data_provider() -> str:
-    provider = str(load().get("full_minute_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _provider_preference("full_minute_data_provider")
 
 
 def get_depth5_data_provider() -> str:
-    provider = str(load().get("depth5_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _provider_preference("depth5_data_provider")
 
 
 def get_realtime_data_provider() -> str:
-    provider = str(load().get("realtime_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _provider_preference("realtime_data_provider")
 
 
 def get_financial_provider() -> str:
-    provider = str(load().get("financial_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _provider_preference("financial_data_provider")
 
 
 # ===== 盘后管道拉取内容开关 (A股 / ETF / 指数 独立控制) =====
@@ -549,7 +548,7 @@ def get_mainline_blacklist() -> list[str]:
     """
     v = load().get("mainline_blacklist", [])
     if isinstance(v, str):
-        v = [part for part in re.split(r"[,，、;；\s]+", v) if part]  # noqa: RUF001
+        v = [part for part in re.split(r"[,，、;；\s]+", v) if part]
     if not isinstance(v, list):
         return []
     return [str(x).strip() for x in v if str(x).strip()]
@@ -591,7 +590,7 @@ def get_mainline_filter_config() -> dict:
     if isinstance(blacklist, str):
         blacklist = [
             part for part in re.split(r"[,，、;；\s]+", blacklist) if part
-        ]  # noqa: RUF001
+        ]
     if not isinstance(blacklist, list):
         blacklist = []
     return {
@@ -616,7 +615,7 @@ def set_mainline_filter_config(cfg: dict) -> dict:
     if "blacklist" in cfg and cfg["blacklist"] is not None:
         raw = cfg["blacklist"]
         if isinstance(raw, str):
-            raw = [part for part in re.split(r"[,，、;；\s]+", raw) if part]  # noqa: RUF001
+            raw = [part for part in re.split(r"[,，、;；\s]+", raw) if part]
         updates["mainline_blacklist"] = [str(x).strip() for x in (raw or []) if str(x).strip()]
     if updates:
         save(updates)

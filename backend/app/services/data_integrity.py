@@ -17,8 +17,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -30,6 +32,7 @@ import polars as pl
 from app.market_time import CN_TZ
 
 logger = logging.getLogger(__name__)
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 # 尾盘定版线: quote_ts 达到当日 15:00 即视为收盘后写入 (含 close_final 定版)
 CLOSE_CUTOFF = dt_time(15, 0)
@@ -92,7 +95,7 @@ def _quote_ts_max_ms(part_dir: Path) -> int | None:
                     .item()
                 )
             candidates.append(file_max)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.debug("quote_ts scan skipped %s: %s", path, e)
     values = [v for v in candidates if v is not None]
     return max(values) if values else None
@@ -293,9 +296,6 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
     调度自适应: 调用方在事件循环内 (API 端点) → executor 后台执行;
     无事件循环 (boot Timer 线程) → 独立 daemon 线程执行。
     """
-    import asyncio
-    import threading
-
     repo = getattr(app_state, "repo", None)
     capset = getattr(app_state, "capabilities", None)
     if repo is None or capset is None:
@@ -306,7 +306,7 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
         if not capset.has(Cap.KLINE_DAILY_BATCH):
             logger.info("integrity repair skipped: no KLINE_DAILY_BATCH capability")
             return None, False
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None, False
 
     from app.services.pipeline_jobs import (
@@ -347,7 +347,7 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
                 job_store.succeed(job_id, result)
         except JobCancelledError:
             pass  # 已由 terminate() 标记失败
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.exception("integrity repair failed: job_id=%s", job_id)
             job_store.fail(job_id, str(e))
         finally:
@@ -363,7 +363,9 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
         async def task() -> None:
             await loop.run_in_executor(None, _execute)
 
-        asyncio.create_task(task())
+        background_task = asyncio.create_task(task())
+        _BACKGROUND_TASKS.add(background_task)
+        background_task.add_done_callback(_BACKGROUND_TASKS.discard)
     except RuntimeError:
         threading.Thread(
             target=_execute, daemon=True, name=f"integrity-repair-{job_id[:8]}"
@@ -384,7 +386,7 @@ def boot_integrity_check(app_state) -> None:
         return
     try:
         issues = scan_recent_integrity(repo.store.data_dir)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("boot integrity scan failed: %s", e)
         return
     if not issues:

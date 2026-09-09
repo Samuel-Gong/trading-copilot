@@ -4039,6 +4039,7 @@ def _compute_matrix_feature(market: MarketDataMatrix, name: str) -> np.ndarray:
         valid = close_valid & np.isfinite(turnover) & (turnover > 0) & (market.volume > 0)
         out = np.full(market.shape, np.nan, dtype=np.float32)
         np.multiply(market.close, market.volume, out=out, where=valid)
+        np.multiply(out, np.float32(10_000.0), out=out, where=valid)
         np.divide(out, turnover, out=out, where=valid)
         np.log(out, out=out, where=valid)
         return out

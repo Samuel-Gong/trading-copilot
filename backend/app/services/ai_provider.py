@@ -36,6 +36,26 @@ _CODEX_PROXY_ENV_NAMES = (
     "all_proxy",
 )
 
+# Codex CLI 在这里用于文本生成，关闭当前版本可识别的执行、联网与扩展能力。
+# 工具清单不一定为空；只读沙箱的实际写入拒绝由 canary 测试验证，
+# 不把这份禁用列表当作任意本机文件读取已被隔离的证明。
+_CODEX_DISABLED_LOCAL_FEATURES = (
+    "apps",
+    "browser_use",
+    "code_mode",
+    "computer_use",
+    "deferred_executor",
+    "image_generation",
+    "goals",
+    "multi_agent",
+    "plugins",
+    "shell_snapshot",
+    "shell_tool",
+    "skill_search",
+    "unified_exec",
+    "view_image",
+)
+
 _CODEX_ENV_ALLOWLIST = (
     "PATH",
     "PATHEXT",
@@ -708,12 +728,20 @@ async def _run_codex_cli(
         workspace_path.mkdir()
         output_path = codex_home_path / "last-message.txt"
         _prepare_codex_home(codex_home_path)
+        base_command = _codex_base_command()
+        env = _codex_process_env(codex_home_path)
+        disabled_features = _supported_codex_features(
+            base_command,
+            env,
+            _CODEX_DISABLED_LOCAL_FEATURES,
+        )
 
         # 不传 --ephemeral: 老版本 codex(如 0.58)无此参数, 传了直接报
         # unexpected argument; 会话隔离已由一次性临时 CODEX_HOME 保证(跑完即删)。
         args = [
-            *_codex_base_command(),
+            *base_command,
             "exec",
+            "--strict-config",
             "--sandbox",
             "read-only",
             "--skip-git-repo-check",
@@ -721,13 +749,15 @@ async def _run_codex_cli(
             "never",
             "--output-last-message",
             str(output_path),
+            "-c",
+            'web_search="disabled"',
         ]
+        for feature in disabled_features:
+            args.extend(["--disable", feature])
         model = current_ai_model().strip()
         if model:
             args.extend(["--model", model])
         args.extend(["--cd", str(workspace_path), "-"])
-
-        env = _codex_process_env(codex_home_path)
 
         returncode, stdout, stderr = await asyncio.to_thread(
             _run_codex_process,
@@ -769,6 +799,33 @@ def _run_codex_process(
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Codex CLI 调用超时, 请稍后重试或检查本机 Codex 登录状态") from exc
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _supported_codex_features(
+    base_command: Sequence[str],
+    env: dict[str, str],
+    required_disabled: Sequence[str],
+) -> tuple[str, ...]:
+    """只传当前 CLI 认识的禁用项；能力清单探测失败时拒绝继续。"""
+    try:
+        completed = subprocess.run(
+            [*base_command, "features", "list"],
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Codex CLI 能力清单探测失败") from exc
+    if completed.returncode != 0:
+        detail = _clean_process_text(completed.stderr) or _clean_process_text(completed.stdout)
+        raise RuntimeError(f"Codex CLI 能力清单探测失败: {detail[-600:]}")
+    available = {
+        line.split(maxsplit=1)[0]
+        for line in _clean_process_text(completed.stdout).splitlines()
+        if line.strip()
+    }
+    return tuple(feature for feature in required_disabled if feature in available)
 
 
 def _codex_process_env(codex_home_path: Path) -> dict[str, str]:

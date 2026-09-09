@@ -51,7 +51,9 @@ from app.extensions.loader import (
     start_backend_extensions,
 )
 from app.jobs import daily_pipeline
+from app.services.environment_sources import EnvironmentSourceChangedError
 from app.services.matrix_prewarm_owner import MatrixCachePrewarmOwner
+from app.services.update_slots import UpdateBusyError
 from app.services.mining_process_lock import MiningProcessLock
 from app.services.quote_service import QuoteService
 from app.tickflow import client as tf_client
@@ -63,6 +65,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _load_data_sources_and_capabilities(app: FastAPI):
+    """先建立 Provider 注册表，再根据已保存路由增广能力。"""
+    try:
+        from app.data_providers import custom as custom_sources
+
+        custom_sources.load_all()
+        logger.info("custom data sources loaded: %d", len(custom_sources.list_sources()))
+    except Exception as e:
+        logger.warning("custom data sources init failed: %s", e)
+    capset = detect_capabilities()
+    app.state.capabilities = capset
+    logger.info("ready; %d capabilities active", len(capset.all()))
+    return capset
 
 # 追加文件日志: uvicorn (含 --reload 开发模式) 默认只有 StreamHandler, 同步/管道等
 # 运行时日志仅出现在 dev 终端, 关掉或滚屏后即丢失, 排查「同步后日志没落」时无处可查。
@@ -83,7 +100,7 @@ if not getattr(sys, "frozen", False):
             logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         )
         logging.getLogger().addHandler(_file_handler)
-    except Exception as _e:  # noqa: BLE001
+    except Exception as _e:
         logger.warning("文件日志初始化失败, 仅输出到终端: %s", _e)
 
 
@@ -124,7 +141,7 @@ async def _application_lifespan(app: FastAPI):
         loaded_factors = load_into_registry(store.data_dir)
         if loaded_factors:
             logger.info("custom factors loaded: %s", len(loaded_factors))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("custom factors load failed: %s", exc)
     from app.services.mining_manager import MiningJobManager
 
@@ -147,18 +164,8 @@ async def _application_lifespan(app: FastAPI):
     # instruments/index/ETF 仍同步 (毫秒级)。应用立即 ready, 指标算完后自动替换。
     repo.refresh_cache(background=True)
 
-    # 能力探测
-    capset = detect_capabilities()
-    app.state.capabilities = capset
-    logger.info("ready; %d capabilities active", len(capset.all()))
-
-    # 自定义数据源配置(可选): 失败只记录错误, 不影响 TickFlow 基准路径。
-    try:
-        from app.data_providers import custom as custom_sources
-        custom_sources.load_all()
-        logger.info("custom data sources loaded: %d", len(custom_sources.list_sources()))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("custom data sources init failed: %s", e)
+    # Provider 注册表会影响已保存路由的能力增广，必须先加载再探测。
+    capset = _load_data_sources_and_capabilities(app)
 
     # 全局行情服务
     qs = QuoteService()
@@ -185,7 +192,7 @@ async def _application_lifespan(app: FastAPI):
         daily_pipeline.set_app_state(app.state)  # 供 depth_finalize job 访问 depth_service
         scheduler = daily_pipeline.start_scheduler(repo, capset)
         app.state.scheduler = scheduler
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("scheduler not started: %s", e)
         app.state.scheduler = None
 
@@ -216,7 +223,7 @@ async def _application_lifespan(app: FastAPI):
         timer = threading.Timer(30.0, boot_integrity_check, args=(app.state,))
         timer.daemon = True  # 不阻塞进程退出
         timer.start()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("integrity boot check scheduling failed: %s", e)
 
     # 企业微信智能机器人长连接(可选通道, 失败不阻断启动)
@@ -372,7 +379,7 @@ async def _application_lifespan(app: FastAPI):
         yield
     finally:
         portfolio.stop_monitor_engine_sync_retry(app)
-        repo._on_refresh_done = None  # noqa: SLF001
+        repo._on_refresh_done = None
         if not matrix_prewarm_owner.shutdown(timeout=5.0):
             logger.warning("matrix cache prewarm did not stop within 5 seconds")
         mmanager = getattr(app.state, "mining_manager", None)
@@ -519,6 +526,13 @@ app.state.extension_load_errors = extension_load_errors
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from app.tickflow.capabilities import CapabilityDenied
+
+
+@app.exception_handler(UpdateBusyError)
+@app.exception_handler(EnvironmentSourceChangedError)
+@app.exception_handler(EnrichedGenerationUnavailableError)
+async def update_conflict_handler(request: Request, exc: RuntimeError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 @app.exception_handler(CapabilityDenied)

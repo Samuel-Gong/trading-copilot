@@ -346,7 +346,6 @@ META = {{...}}，{entrypoint_requirement}。只输出完整 Python 代码。
         "numpy",
         "app.backtest.matrix",
         "app.strategy.builtin.factor_rank_research",
-        "app.strategy.market_data",   # 新增: 策略可读取指数/ETF 日K
         "datetime",
         "__future__",
     })
@@ -392,6 +391,24 @@ META = {{...}}，{entrypoint_requirement}。只输出完整 Python 代码。
             "__builtins__", "__import__", "__globals__",
         }
 
+        market_data_aliases = {
+            alias.asname
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name == "app.strategy.market_data" and alias.asname
+        }
+
+        def _attribute_path(node: ast.Attribute) -> tuple[str, ...]:
+            parts = [node.attr]
+            value = node.value
+            while isinstance(value, ast.Attribute):
+                parts.append(value.attr)
+                value = value.value
+            if isinstance(value, ast.Name):
+                parts.append(value.id)
+            return tuple(reversed(parts))
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -401,12 +418,34 @@ META = {{...}}，{entrypoint_requirement}。只输出完整 Python 代码。
                 mod = node.module or ""
                 if not _module_allowed(mod):
                     raise ValueError(f"禁止 from {node.module} import (不在策略安全白名单)")
+                if mod == "app.strategy.market_data":
+                    public_names = {
+                        "get_index_daily",
+                        "get_etf_daily",
+                        "get_daily",
+                    }
+                    invalid = [alias.name for alias in node.names if alias.name not in public_names]
+                    if invalid:
+                        raise ValueError(
+                            "策略行情模块只允许导入只读函数: " + ", ".join(invalid)
+                        )
+                private_names = [alias.name for alias in node.names if alias.name.startswith("_")]
+                if private_names:
+                    raise ValueError("禁止导入私有名称: " + ", ".join(private_names))
             if isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
                     raise ValueError(f"禁止调用 {node.func.id}()")
             # 拦截 dunder 属性访问: x.__globals__ / ().__class__ 等
             if isinstance(node, ast.Attribute) and node.attr in forbidden_dunder_attrs:
                 raise ValueError(f"禁止访问属性 {node.attr} (策略不允许 dunder 遍历逃逸)")
+            if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+                path = _attribute_path(node)
+                is_market_data_private = (
+                    (path and path[0] in market_data_aliases)
+                    or path[:-1] == ("app", "strategy", "market_data")
+                )
+                if is_market_data_private:
+                    raise ValueError(f"禁止访问私有属性 {node.attr}")
             # 拦截字符串下标访问危险名: x["__builtins__"]
             if isinstance(node, ast.Subscript):
                 sl = node.slice

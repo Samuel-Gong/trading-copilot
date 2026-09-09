@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.enriched_generation import EnrichedPublication
 from app.indicators.pipeline import ENRICHED_COLUMNS
@@ -49,6 +49,7 @@ _table_cache: dict[str, dict | None] = {
     "financials": None,
 }
 _table_cache_ts: dict[str, float] = {k: 0.0 for k in _table_cache}
+_table_cache_generation: dict[str, int] = {k: 0 for k in _table_cache}
 _table_cache_lock = threading.Lock()
 
 _last_finished_cache: dict[str, str | None] | None = None
@@ -70,9 +71,11 @@ def invalidate_data_cache(table: str | None = None) -> None:
             for k in _table_cache:
                 _table_cache[k] = None
                 _table_cache_ts[k] = 0.0
+                _table_cache_generation[k] += 1
         elif table in _table_cache:
             _table_cache[table] = None
             _table_cache_ts[table] = 0.0
+            _table_cache_generation[table] += 1
 
 
 def invalidate_storage_cache() -> None:
@@ -89,12 +92,15 @@ def _get_table_stats(name: str, fetch: Callable[[], dict | None]) -> dict | None
         cached_ts = _table_cache_ts.get(name, 0.0)
         if cached is not None and (now - cached_ts) < ttl:
             return cached
+        generation = _table_cache_generation.get(name, 0)
 
     fresh = fetch()
 
     with _table_cache_lock:
-        _table_cache[name] = fresh
-        _table_cache_ts[name] = now
+        # fetch 在锁外执行；若期间发生失效，旧快照不得重新填回缓存。
+        if _table_cache_generation.get(name, 0) == generation:
+            _table_cache[name] = fresh
+            _table_cache_ts[name] = time.time()
     return fresh
 
 
@@ -646,20 +652,44 @@ def _clear_parquet_directories(
     """清除受管理的数据目录，并维持 enriched generation 发布语义。"""
     import shutil
 
+    from app.services.financial_sync import financial_snapshot_lock
+    from app.services.market_environment_lock import market_environment_snapshot
+
     deleted = 0
+    for names, snapshot_scope in (
+        (("financials",), financial_snapshot_lock(data_dir)),
+        (("regime_history", "mainline_history"), market_environment_snapshot(data_dir)),
+    ):
+        directories = [data_dir / name for name in names]
+        parquet_files = [file for directory in directories for file in directory.rglob("*.parquet")]
+        # 扫描不占读者锁；阶段、主线及覆盖记录作为同一组清除。
+        with snapshot_scope:
+            for file_path in parquet_files:
+                file_path.unlink()
+                deleted += 1
+        for directory in directories:
+            if directory.exists():
+                for child in list(directory.iterdir()):
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
     for sub in (
         "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
         "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
-        "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
-        "backtest_results", "screener_results", "ai_cache", "regime_history", "mainline_history",
+        "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools",
+        "backtest_results", "screener_results", "ai_cache",
     ):
         directory = data_dir / sub
-        if not directory.exists():
-            continue
         publication = publications.get(sub)
-        parquet_files = list(directory.rglob("*.parquet"))
-        if publication is not None and parquet_files:
+        if publication is not None:
+            # 即使目录为空或不存在，也要接管可能遗留的 publishing marker，
+            # 并把“已清空”作为一个新的 ready generation 发布。
             publication.begin()
+        if not directory.exists():
+            if publication is not None:
+                publication.mark_changed()
+                publication.commit()
+            continue
+        parquet_files = list(directory.rglob("*.parquet"))
         try:
             for file_path in parquet_files:
                 file_path.unlink()
@@ -670,6 +700,7 @@ def _clear_parquet_directories(
                 if child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
             if publication is not None:
+                publication.mark_changed()
                 publication.commit()
         except BaseException:
             if publication is not None:
@@ -678,9 +709,7 @@ def _clear_parquet_directories(
     return deleted
 
 
-@router.post("/clear")
-@serialized_market_environment_update
-def clear_data(request: Request):
+def _clear_data_impl(request: Request):
     """清除所有本地 Parquet 数据（保留 capabilities.json 和目录结构）。"""
     from contextlib import nullcontext
 
@@ -690,8 +719,27 @@ def clear_data(request: Request):
     data_dir = repo.store.data_dir
     deleted = 0
     publications = {
-        "kline_daily_enriched": EnrichedPublication(data_dir, "stock", recover=True),
-        "kline_etf_enriched": EnrichedPublication(data_dir, "etf", recover=True),
+        "kline_daily_enriched": EnrichedPublication(
+            data_dir,
+            "stock",
+            recover=True,
+            scope="clear-all",
+            allow_scope_takeover=True,
+        ),
+        "kline_index_enriched": EnrichedPublication(
+            data_dir,
+            "index",
+            recover=True,
+            scope="clear-all",
+            allow_scope_takeover=True,
+        ),
+        "kline_etf_enriched": EnrichedPublication(
+            data_dir,
+            "etf",
+            recover=True,
+            scope="clear-all",
+            allow_scope_takeover=True,
+        ),
     }
 
     # 在整个 Parquet 删除区间阻止新挖掘任务，并先取消、等待现有 worker；避免
@@ -709,14 +757,6 @@ def clear_data(request: Request):
     # 清除同步历史（内存 + 磁盘 job_store/ 文件夹）
     from app.services.pipeline_jobs import job_store
     job_store.clear()
-
-    # 清除财务数据
-    fin_dir = data_dir / "financials"
-    for sub in ("metrics", "income", "balance_sheet", "cash_flow"):
-        fp = fin_dir / sub / "part.parquet"
-        if fp.exists():
-            fp.unlink()
-            deleted += 1
 
     # 清除监控运行数据 (user_data 下仅清运行产物, 不动 monitor_rules/preferences/secrets 等用户配置)
     # - 触发记录 alerts.jsonl
@@ -761,6 +801,55 @@ def clear_data(request: Request):
     logger.info("数据已清除: 删除 %d 个 parquet 文件", deleted)
     invalidate_data_cache(None)
     return {"deleted_files": deleted}
+
+
+@router.post("/clear")
+@serialized_market_environment_update
+def clear_data(request: Request):
+    """在数据任务、实时取数和仓库写锁三重互斥下清除本地数据。"""
+    from contextlib import nullcontext
+
+    from app.services.pipeline_jobs import release_run_slot, try_acquire_run_slot
+
+    owner = f"clear-data:{id(request)}"
+    if not try_acquire_run_slot(owner):
+        raise HTTPException(status_code=409, detail="已有数据任务在运行，请稍后再清除")
+    repo = request.app.state.repo
+    data_dir = repo.store.data_dir
+    quote_service = getattr(request.app.state, "quote_service", None)
+    financial_scheduler = getattr(request.app.state, "financial_scheduler", None)
+    quote_scope = (
+        quote_service.quiesced()
+        if quote_service is not None
+        else nullcontext()
+    )
+    repo_write_scope = getattr(repo, "_write_lock", nullcontext())
+    financial_scheduler_scope = (
+        financial_scheduler.quiesced()
+        if financial_scheduler is not None
+        else nullcontext()
+    )
+    try:
+        # 锁顺序与实时取数一致：quote fetch lock → repository write lock。
+        from app.services.update_slots import update_slot
+
+        with (
+            update_slot("财务", data_dir),
+            quote_scope,
+            repo_write_scope,
+            financial_scheduler_scope,
+        ):
+            try:
+                return _clear_data_impl(request)
+            except RuntimeError as exc:
+                if "mining worker" in str(exc):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="挖掘任务未能在限时内停止，本次未清除数据",
+                    ) from exc
+                raise
+    finally:
+        release_run_slot(owner)
 
 
 # 各表字段说明

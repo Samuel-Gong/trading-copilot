@@ -11,6 +11,9 @@ import json
 import logging
 from pathlib import Path
 
+from app.services.definition_transactions import definitions_transaction
+from app.services.fs_utils import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 # 进程内缓存: 监控引擎每轮对每条策略规则调用 load_override, 每次读盘+parse 纯重复;
@@ -35,10 +38,7 @@ def _overrides_dir(data_dir: Path) -> Path:
 def _path(data_dir: Path, strategy_id: str, *, ensure_dir: bool = True) -> Path:
     # ensure_dir=False 供热路径读取: mkdir 系统调用在 Windows 上 ~0.07ms,
     # 读缓存命中时跳过它 (目录由写路径保证存在)。
-    if ensure_dir:
-        d = _overrides_dir(data_dir)
-    else:
-        d = data_dir / "user_data" / "strategy_overrides"
+    d = _overrides_dir(data_dir) if ensure_dir else data_dir / "user_data" / "strategy_overrides"
     return d / f"{strategy_id}.json"
 
 
@@ -75,18 +75,41 @@ def load_override(data_dir: Path, strategy_id: str) -> dict:
 
 def save_override(data_dir: Path, strategy_id: str, overrides: dict) -> None:
     """保存策略的用户覆盖配置（全量覆盖写）"""
-    p = _path(data_dir, strategy_id)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(overrides, ensure_ascii=False, indent=2), encoding="utf-8")
-    _invalidate_override_cache(p)
+    with definitions_transaction(data_dir):
+        p = _path(data_dir, strategy_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(p, json.dumps(overrides, ensure_ascii=False, indent=2))
+        _invalidate_override_cache(p)
+
+
+def snapshot_override(data_dir: Path, strategy_id: str) -> bytes | None:
+    """捕获 override 原始字节，供跨层提交失败时回滚。"""
+    p = _path(data_dir, strategy_id, ensure_dir=False)
+    return p.read_bytes() if p.exists() else None
+
+
+def restore_override(
+    data_dir: Path,
+    strategy_id: str,
+    previous: bytes | None,
+) -> None:
+    """原子恢复 override 原始状态并清理读缓存。"""
+    with definitions_transaction(data_dir):
+        p = _path(data_dir, strategy_id)
+        if previous is None:
+            p.unlink(missing_ok=True)
+        else:
+            atomic_write_text(p, previous.decode("utf-8"))
+        _invalidate_override_cache(p)
 
 
 def delete_override(data_dir: Path, strategy_id: str) -> None:
     """删除策略的用户覆盖配置（重置为默认值）"""
-    p = _path(data_dir, strategy_id)
-    _invalidate_override_cache(p)
-    if p.exists():
-        p.unlink()
+    with definitions_transaction(data_dir):
+        p = _path(data_dir, strategy_id)
+        _invalidate_override_cache(p)
+        if p.exists():
+            p.unlink()
 
 
 def list_overrides(data_dir: Path) -> dict[str, dict]:

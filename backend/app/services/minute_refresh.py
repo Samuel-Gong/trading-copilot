@@ -102,6 +102,9 @@ class MinuteRefreshService:
         self._state = _RefreshState()
         self._round_lock = threading.Lock()  # 同时只允许一轮 (手动触发与定时轮互斥)
         self._empty_rounds = 0               # 连续空轮计数 (escalate 到全天修复)
+        self._manual_thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
+        self._stopping = False
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -115,17 +118,33 @@ class MinuteRefreshService:
 
     def start(self) -> bool:
         """启动后台线程 (幂等)。开关/时段/能力判断都在循环内每轮做, 热生效。"""
-        if self._thread is not None and self._thread.is_alive():
-            return True
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._loop, name="minute-refresh", daemon=True,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return True
+            self._stopping = False
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._loop, name="minute-refresh", daemon=True,
+            )
+            self._thread.start()
         return True
 
     def stop(self) -> None:
-        self._stop.set()
+        with self._lifecycle_lock:
+            self._stopping = True
+            self._stop.set()
+            threads = [self._thread, self._manual_thread]
+        current = threading.current_thread()
+        deadline = time.monotonic() + 10.0
+        for thread in threads:
+            if thread is None or thread is current:
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._lifecycle_lock:
+            if self._thread is not None and not self._thread.is_alive():
+                self._thread = None
+            if self._manual_thread is not None and not self._manual_thread.is_alive():
+                self._manual_thread = None
 
     # ------------------------------------------------------------------
     # 门控
@@ -153,15 +172,15 @@ class MinuteRefreshService:
         """全量分钟生效源名 ("tickflow" 或自定义源名, 偏好 full_minute_data_provider)。"""
         try:
             return preferences.get_full_minute_data_provider()
-        except Exception:  # noqa: BLE001 — 偏好文件异常按 TickFlow 处理
-            return "tickflow"
+        except Exception:  # 偏好不可读时禁止越界调用其他源
+            return "provider_error"
 
     def _resolve_custom(self) -> tuple[object | None, str]:
-        """解析自定义源。返回 (provider_or_None, effective_name):
+        """解析自定义源。返回 (可用标记, effective_name):
 
-        - 偏好 tickflow / 源未声明 full_minute 数据集 / 解析异常 → (None, "tickflow")
-          (与 minute 数据集同纪律: 静默降级 TickFlow, 能力门控决定能否真正运行)
-        - 成功 → (provider, name)
+        - 偏好 tickflow → (None, "tickflow")
+        - 显式自定义源不可用 / 解析异常 → (None, 原始源名)，禁止越界调用 TickFlow
+        - 成功 → (True, name)；实例只在网络调用期间租约
         """
         from app.services import kline_sync
 
@@ -170,11 +189,10 @@ class MinuteRefreshService:
             return (None, "tickflow")
         provider, use_tickflow, err = kline_sync._resolve_full_minute_provider(name)
         if use_tickflow:
-            if err is not None:
-                logger.warning(
-                    "full_minute provider %s 解析失败, 本轮降级 TickFlow: %s", name, err,
-                )
             return (None, "tickflow")
+        if provider is None:
+            logger.warning("full_minute provider %s 解析失败，本轮停止: %s", name, err)
+            return (None, name)
         return (provider, name)
 
     def _custom_supports_increment(self, provider: object) -> bool:
@@ -183,8 +201,16 @@ class MinuteRefreshService:
 
     def repair_only(self) -> bool:
         """当前生效源只能全天修复轮 (无廉价增量端点) — 节奏下限抬到 60s。"""
-        provider, name = self._resolve_custom()
-        return provider is not None and not self._custom_supports_increment(provider)
+        available, name = self._resolve_custom()
+        if available is None or name == "tickflow":
+            return False
+        try:
+            from app.data_providers import custom as custom_sources
+
+            with custom_sources.lease_provider(name) as (provider, _generation):
+                return not self._custom_supports_increment(provider)
+        except Exception:
+            return False
 
     def _effective_interval(self) -> int:
         """本轮间隔: 偏好值; 仅修复轮的自定义源下限 60s (全天批量打不住 6s 节奏)。"""
@@ -199,6 +225,9 @@ class MinuteRefreshService:
             return "disabled"
         if not self.capability_ok():
             return "capability"
+        provider, provider_name = self._resolve_custom()
+        if provider_name != "tickflow" and provider is None:
+            return "provider_error"
         if not _in_continuous_session():
             return "outside_trading_hours"
         # 节假日 (工作日但休市): 周几门控覆盖不到, 由交易日探针剔除。
@@ -280,8 +309,49 @@ class MinuteRefreshService:
     def _run_round(self) -> None:
         from app.services import kline_sync
 
+        if self._stop.is_set() or self._stopping:
+            return
         t0 = time.perf_counter()
-        custom, provider_name = self._resolve_custom()
+        available, provider_name = self._resolve_custom()
+        if provider_name != "tickflow" and available is None:
+            self._state.last_error = f"full_minute provider unavailable: {provider_name}"
+            logger.warning("全量分钟本轮中止: 数据源 %s 不可用", provider_name)
+            return
+        custom = None
+        route_generation = None
+        provider_context = None
+        if provider_name != "tickflow":
+            from app.data_providers import custom as custom_sources
+
+            provider_context = custom_sources.lease_provider(provider_name)
+            try:
+                custom, route_generation = provider_context.__enter__()
+            except Exception as exc:
+                self._state.last_error = f"full_minute provider unavailable: {provider_name}"
+                logger.warning("全量分钟数据源 %s 租约失败: %s", provider_name, exc)
+                return
+        try:
+            self._run_round_with_provider(
+                kline_sync,
+                custom,
+                provider_name,
+                route_generation,
+                t0,
+            )
+        finally:
+            if provider_context is not None:
+                provider_context.__exit__(None, None, None)
+
+    def _run_round_with_provider(
+        self,
+        kline_sync,
+        custom,
+        provider_name: str,
+        route_generation: int | None,
+        t0: float,
+    ) -> None:
+        """在自定义 Provider 租约内完成单轮取数与提交。"""
+        write_generation = kline_sync._minute_generation(self._repo)
         mode = self._select_mode()
         if mode == "increment" and custom is not None and not self._custom_supports_increment(custom):
             # 无廉价增量端点的源: 增量轮退化为修复轮 (全天批量幂等覆盖, 数据不丢)
@@ -316,6 +386,9 @@ class MinuteRefreshService:
                     df, requests = kline_sync.fetch_intraday_full_market_burst(symbols, capset)
             fetch_ms = (time.perf_counter() - fetch_started) * 1000
             self._state.last_requests = requests
+            if self._stop.is_set() or self._stopping:
+                self._state.last_error = "minute refresh stopped before commit"
+                return
             if df.is_empty():
                 self._empty_rounds += 1
                 self._state.last_error = f"intraday {mode} returned no data"
@@ -326,9 +399,21 @@ class MinuteRefreshService:
                 return
             self._empty_rounds = 0
             write_started = time.perf_counter()
-            written = kline_sync._write_minute_partition(
-                df, self._repo.store.data_dir / "kline_minute",
-            )
+            from app.services.provider_routes import provider_route_commit_guard
+
+            with provider_route_commit_guard(
+                provider_name,
+                route_generation,
+                preferences.get_full_minute_data_provider,
+                "full_minute",
+            ), self._repo._write_lock:
+                if kline_sync._minute_generation(self._repo) != write_generation:
+                    self._state.last_error = "minute data cleared while refresh was in flight"
+                    logger.info("全量分钟本轮结果因并发清空而丢弃")
+                    return
+                written = kline_sync._write_minute_partition(
+                    df, self._repo.store.data_dir / "kline_minute",
+                )
             write_ms = (time.perf_counter() - write_started) * 1000
 
         self._state.rounds += 1
@@ -365,7 +450,7 @@ class MinuteRefreshService:
         try:
             if not preferences.get_minute_refresh_enabled():
                 return False
-        except Exception:  # noqa: BLE001 — 偏好文件异常按不健康处理
+        except Exception:
             return False
         if self._thread is None or not self._thread.is_alive():
             return False
@@ -406,7 +491,29 @@ class MinuteRefreshService:
 
     def trigger_manual_round(self) -> dict[str, Any]:
         """手动触发一轮 (无视时段门控, 但仍受能力门控); 供状态页「立即刷新」。"""
+        if self._stopping or self._stop.is_set():
+            return {"ok": False, "reason": "stopping"}
         if not self.capability_ok():
             return {"ok": False, "reason": self._gate_reason() or "capability"}
-        threading.Thread(target=self._run_round, daemon=True, name="minute-refresh-manual").start()
+        provider, provider_name = self._resolve_custom()
+        if provider_name != "tickflow" and provider is None:
+            return {"ok": False, "reason": "provider_error"}
+        with self._lifecycle_lock:
+            if self._manual_thread is not None and self._manual_thread.is_alive():
+                return {"ok": False, "reason": "already_running"}
+
+            def _manual() -> None:
+                try:
+                    self._run_round()
+                finally:
+                    with self._lifecycle_lock:
+                        if self._manual_thread is threading.current_thread():
+                            self._manual_thread = None
+
+            self._manual_thread = threading.Thread(
+                target=_manual,
+                daemon=True,
+                name="minute-refresh-manual",
+            )
+            self._manual_thread.start()
         return {"ok": True}

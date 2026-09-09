@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sys
@@ -67,8 +68,12 @@ def replace_with_retry(src: Path, dst: Path, *, attempts: int = 10, delay_s: flo
 
 
 def enriched_dirname(asset_type: str) -> str:
-    """asset_type → enriched parquet 目录名。ETF 走独立目录, 其余(stock)用日K enriched。"""
-    return "kline_etf_enriched" if asset_type == "etf" else "kline_daily_enriched"
+    """asset_type → managed enriched parquet 目录名。"""
+    return {
+        "stock": "kline_daily_enriched",
+        "index": "kline_index_enriched",
+        "etf": "kline_etf_enriched",
+    }.get(asset_type, "kline_daily_enriched")
 
 
 def _last_available_rows(df: pl.DataFrame, cutoff: date) -> pl.DataFrame:
@@ -183,7 +188,7 @@ class DataStore:
             except OSError:
                 logger.warning("legacy dir %s not empty, kept", legacy_dir)
             logger.info("legacy data migration done")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("legacy data migration failed (startup continues): %s", e)
 
     def _register_views(self) -> None:
@@ -340,6 +345,9 @@ class KlineRepository:
         # 序列化 parquet 分区的读-改-写: 实时轮询线程、手动 refresh、盘后管道
         # 可能并发 merge/flush 同一分区文件, 无锁会互相覆盖丢数据
         self._write_lock = threading.Lock()
+        # 分钟数据清空代际：网络取数开始时记录，落盘前核对。清空期间已在途的
+        # 后台/手动请求不得在清空完成后把旧结果重新写回。
+        self._minute_generation = 0
         # 启动预热、同步刷新与请求懒加载必须依次安装 enriched 内存快照。
         self._enriched_refresh_lock = threading.Lock()
 
@@ -1266,6 +1274,21 @@ class KlineRepository:
         columns: list[str] | None = None,
     ) -> pl.DataFrame | None:
         """从预计算 enriched 历史缓存返回完整区间；缓存不覆盖时返回 None。"""
+        return self._read_stable_enriched(
+            "stock",
+            lambda: self._get_enriched_range_stable(
+                start, end, symbols=symbols, columns=columns
+            ),
+            None,
+        )
+
+    def _get_enriched_range_stable(
+        self,
+        start: date,
+        end: date,
+        symbols: list[str] | None = None,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame | None:
         if self._enriched_history_cache is None:
             if self._enriched_warming:
                 # 后台预热中: 返回 None (缓存不覆盖), 调用方各自走慢路径;
@@ -1293,6 +1316,28 @@ class KlineRepository:
                 existing.insert(1, "date")
             df = df.select(existing)
         return df.sort(["symbol", "date"])
+
+    def get_enriched_history_snapshot(self) -> tuple[str, pl.DataFrame]:
+        """返回 generation 一致的历史内存快照；缓存尚未就绪时明确报错。"""
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                with stable_enriched_generation(
+                    self.store.data_dir, "stock"
+                ) as generation:
+                    cache = self._current_enriched_history_cache()
+                    if cache is None or cache.is_empty() or "date" not in cache.columns:
+                        raise EnrichedGenerationUnavailableError(
+                            "enriched history cache is not ready for current generation"
+                        )
+                    return generation, cache
+            except EnrichedGenerationUnavailableError as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(0.01)
+        raise EnrichedGenerationUnavailableError(
+            "enriched history snapshot is temporarily unavailable"
+        ) from last_error
 
     def get_live_agg(self) -> pl.DataFrame:
         """返回盘中实时指标预计算聚合表。如无缓存则懒加载。
@@ -1470,11 +1515,25 @@ class KlineRepository:
         data_dir = getattr(getattr(self, "store", None), "data_dir", None)
         if data_dir is None:
             return self._get_daily_stable(symbol, start, end, columns)
-        try:
-            with stable_enriched_generation(data_dir, "stock"):
-                return self._get_daily_stable(symbol, start, end, columns)
-        except EnrichedGenerationUnavailableError:
-            return pl.DataFrame()
+        return self._read_stable_enriched(
+            "stock",
+            lambda: self._get_daily_stable(symbol, start, end, columns),
+            pl.DataFrame(),
+        )
+
+    def _read_stable_enriched(self, asset_type: str, reader, fallback):
+        """乐观读取 managed enriched 快照；换代时有限重试后 fail closed。"""
+        data_dir = getattr(getattr(self, "store", None), "data_dir", None)
+        if data_dir is None:
+            return reader()
+        for attempt in range(2):
+            try:
+                with stable_enriched_generation(data_dir, asset_type):
+                    return reader()
+            except EnrichedGenerationUnavailableError:
+                if attempt == 0:
+                    time.sleep(0.01)
+        return fallback
 
     def _get_daily_stable(
         self,
@@ -1494,13 +1553,17 @@ class KlineRepository:
             df = self._scan_daily_symbol(symbol, start, end, columns)
             if not df.is_empty() and all(c in df.columns for c in columns):
                 cached, cache_date = self.get_enriched_latest()
-                if cached is not None and not cached.is_empty() and cache_date:
-                    if start <= cache_date <= end:
-                        cached_part = self._filter_cached(cached, symbol, columns)
-                        if not cached_part.is_empty():
-                            df = df.filter(pl.col("date") != cache_date)
-                            common_cols = [c for c in df.columns if c in cached_part.columns]
-                            df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+                if (
+                    cached is not None
+                    and not cached.is_empty()
+                    and cache_date
+                    and start <= cache_date <= end
+                ):
+                    cached_part = self._filter_cached(cached, symbol, columns)
+                    if not cached_part.is_empty():
+                        df = df.filter(pl.col("date") != cache_date)
+                        common_cols = [c for c in df.columns if c in cached_part.columns]
+                        df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
                 return df
 
         # 扩展范围用于指标预热 (MA60 需要 ~60 交易日 ≈ 120 日历日)
@@ -1555,13 +1618,14 @@ class KlineRepository:
         columns: list[str] | None = None,
     ) -> pl.DataFrame:
         """批量日K查询。"""
-        cached, cache_date = self.get_enriched_latest()
-        if cached is not None and not cached.is_empty() and cache_date:
-            if start >= cache_date:
-                return self._filter_cached_batch(cached, symbols, columns)
+        def read() -> pl.DataFrame:
+            cached, cache_date = self.get_enriched_latest()
+            if cached is not None and not cached.is_empty() and cache_date:
+                if start >= cache_date:
+                    return self._filter_cached_batch(cached, symbols, columns)
+            return self._scan_daily_batch(symbols, start, end, columns)
 
-        # 回退 scan_parquet
-        return self._scan_daily_batch(symbols, start, end, columns)
+        return self._read_stable_enriched("stock", read, pl.DataFrame())
 
     def get_index_daily(
         self,
@@ -1571,6 +1635,19 @@ class KlineRepository:
         columns: list[str] | None = None,
     ) -> pl.DataFrame:
         """指数日K查询 — 从独立指数 enriched parquet 读取后即时计算通用指标。"""
+        return self._read_stable_enriched(
+            "index",
+            lambda: self._get_index_daily_stable(symbol, start, end, columns),
+            pl.DataFrame(),
+        )
+
+    def _get_index_daily_stable(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame:
         from datetime import timedelta
 
         # 快路径: 若请求的列全部是 parquet 直接存储的列 (如迷你蜡烛图只要 OHLCV),
@@ -1599,6 +1676,19 @@ class KlineRepository:
         columns: list[str] | None = None,
     ) -> pl.DataFrame:
         """ETF 日K查询 — 优先读独立 ETF enriched，兼容旧版 index enriched 中的 ETF。"""
+        return self._read_stable_enriched(
+            "etf",
+            lambda: self._get_etf_daily_stable(symbol, start, end, columns),
+            pl.DataFrame(),
+        )
+
+    def _get_etf_daily_stable(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame:
         from datetime import timedelta
 
         # 快路径: 独立 ETF 数据 + 请求列全是 parquet 存储列 → 直接 scan 列下推, 跳过 warmup + compute。
@@ -1645,6 +1735,23 @@ class KlineRepository:
         columns: list[str] | None = None,
     ) -> pl.DataFrame:
         """读取指定日期前最后一根真实日 K，不以固定自然日窗口近似。"""
+        if asset_type not in {"stock", "index", "etf"}:
+            return pl.DataFrame()
+        return self._read_stable_enriched(
+            asset_type,
+            lambda: self._get_daily_asset_before_stable(
+                asset_type, symbol, before, columns
+            ),
+            pl.DataFrame(),
+        )
+
+    def _get_daily_asset_before_stable(
+        self,
+        asset_type: str,
+        symbol: str,
+        before: date,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame:
         if asset_type == "stock":
             return self._scan_daily_before_from_glob(
                 self._enriched_glob, symbol, before, columns, "日K",
@@ -1673,6 +1780,23 @@ class KlineRepository:
         end: date,
     ) -> pl.DataFrame:
         """批量读取估值所需收盘价,不触发单标的指标即时计算。"""
+        if asset_type not in {"stock", "index", "etf"}:
+            return pl.DataFrame()
+        return self._read_stable_enriched(
+            asset_type,
+            lambda: self._get_daily_close_batch_stable(
+                asset_type, symbols, start, end
+            ),
+            pl.DataFrame(),
+        )
+
+    def _get_daily_close_batch_stable(
+        self,
+        asset_type: str,
+        symbols: list[str],
+        start: date,
+        end: date,
+    ) -> pl.DataFrame:
         unique_symbols = list(dict.fromkeys(symbols))
         if not unique_symbols:
             return pl.DataFrame()
@@ -1686,7 +1810,7 @@ class KlineRepository:
             )
             if set(columns).issubset(frame.columns):
                 frame = frame.select(columns)
-            cached = self._enriched_cache
+            cached, _cache_date = self.get_enriched_latest()
             if cached is not None and not cached.is_empty():
                 cached_snapshot = self._filter_cached_batch(
                     cached, unique_symbols, stock_columns
@@ -1955,7 +2079,7 @@ class KlineRepository:
                 existing = [column for column in columns if column in schema_names]
                 lf = lf.select(existing)
             return lf.collect()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             getattr(logger, log_level)("%s前序查询失败: %s", label, e)
             return pl.DataFrame()
 
@@ -2423,12 +2547,22 @@ class KlineRepository:
         base = self.store.data_dir / table
         generation_asset = {
             "kline_daily_enriched": "stock",
+            "kline_index_enriched": "index",
             "kline_etf_enriched": "etf",
         }.get(table)
-        # recover=True: 外部进程残留的僵死 publishing 标记不应阻塞实时/管道
-        # enriched 落盘, 首次写入即接管自愈; 活进程的发布仍会抛错保护竞态。
+        scope_digest = hashlib.sha256()
+        if generation_asset is not None:
+            for symbol, trade_date in df.select(["symbol", "date"]).unique().sort(
+                ["symbol", "date"]
+            ).iter_rows():
+                scope_digest.update(f"{symbol}\0{trade_date}\n".encode())
         publication = (
-            EnrichedPublication(self.store.data_dir, generation_asset, recover=True)
+            EnrichedPublication(
+                self.store.data_dir,
+                generation_asset,
+                recover=True,
+                scope=f"repository-batch:{table}:{scope_digest.hexdigest()}",
+            )
             if generation_asset is not None
             else None
         )
@@ -2530,8 +2664,13 @@ class KlineRepository:
         out = base / f"date={ds}" / "part.parquet"
         out.parent.mkdir(parents=True, exist_ok=True)
         publication = (
-            EnrichedPublication(self.store.data_dir, asset_type, recover=True)
-            if asset_type in {"stock", "etf"}
+            EnrichedPublication(
+                self.store.data_dir,
+                asset_type,
+                recover=True,
+                scope=f"live-merge:{asset_type}:{ds}",
+            )
+            if asset_type in {"stock", "index", "etf"}
             else None
         )
         with self._write_lock:
@@ -2615,8 +2754,13 @@ class KlineRepository:
         out = base / f"date={ds}" / "part.parquet"
         out.parent.mkdir(parents=True, exist_ok=True)
         publication = (
-            EnrichedPublication(self.store.data_dir, asset_type, recover=True)
-            if asset_type in {"stock", "etf"}
+            EnrichedPublication(
+                self.store.data_dir,
+                asset_type,
+                recover=True,
+                scope=f"live-flush:{asset_type}:{ds}",
+            )
+            if asset_type in {"stock", "index", "etf"}
             else None
         )
         with self._write_lock:
