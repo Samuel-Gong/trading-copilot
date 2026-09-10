@@ -201,6 +201,10 @@ export function Portfolio() {
     () => asOf ? trades.filter(trade => trade.trade_date <= asOf) : [],
     [asOf, trades],
   )
+  const sourceTradeDates = useMemo(
+    () => new Set(visibleTrades.filter(trade => trade.source_record_id).map(trade => trade.trade_date)),
+    [visibleTrades],
+  )
   const rows = useMemo(() => (
     snapshot?.accounts.flatMap(account => account.positions.map(position => ({
       account,
@@ -230,10 +234,10 @@ export function Portfolio() {
       group.items.push(trade)
       if (trade.side === 'buy') {
         group.buyCount += 1
-        group.netAmount += trade.quantity * trade.price + trade.fee + trade.tax
+        group.netAmount += (trade.amount ?? trade.quantity * trade.price) + trade.fee + trade.tax
       } else {
         group.sellCount += 1
-        group.netAmount -= trade.quantity * trade.price - trade.fee - trade.tax
+        group.netAmount -= (trade.amount ?? trade.quantity * trade.price) - trade.fee - trade.tax
       }
     }
     return [...byDate.values()].sort((a, b) => b.date.localeCompare(a.date))
@@ -251,11 +255,11 @@ export function Portfolio() {
       group.items.push(trade)
       if (trade.side === 'buy') {
         group.buyCount += 1
-        group.netAmount += trade.quantity * trade.price + trade.fee + trade.tax
+        group.netAmount += (trade.amount ?? trade.quantity * trade.price) + trade.fee + trade.tax
         group.netQuantity += trade.quantity
       } else {
         group.sellCount += 1
-        group.netAmount -= trade.quantity * trade.price - trade.fee - trade.tax
+        group.netAmount -= (trade.amount ?? trade.quantity * trade.price) - trade.fee - trade.tax
         group.netQuantity -= trade.quantity
       }
     }
@@ -489,6 +493,7 @@ export function Portfolio() {
   }
 
   async function reorderDayTrades(dayTradesInDisplayOrder: PortfolioTrade[]) {
+    if (dayTradesInDisplayOrder.some(trade => trade.source_record_id)) return
     // dayTradesInDisplayOrder 是展示顺序 (晚成交在前)；API 要的是执行顺序 (最早成交在前)
     const executionOrderIds = [...dayTradesInDisplayOrder].reverse().map(item => item.id)
     setReorderBusy(true)
@@ -703,7 +708,7 @@ export function Portfolio() {
 
         <section className="overflow-hidden rounded-card border border-border bg-surface">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
-            <div><h2 className="text-sm font-medium">交易流水</h2><p className="mt-0.5 text-[11px] text-muted">同一交易日内的多笔交易可拖动排序；将鼠标移到流水行，点击行下边界的加号可临时补录</p></div>
+            <div><h2 className="text-sm font-medium">交易流水</h2><p className="mt-0.5 text-[11px] text-muted">手工流水可调整日期、数量价格与顺序；来源成交保留原始事实，只支持费用校准和删除，含来源成交的日期不支持整体拖动排序</p></div>
             <div className="flex items-center gap-1">
               {(['flat', 'stock', 'date'] as const).map(v => (
                 <button
@@ -864,7 +869,7 @@ export function Portfolio() {
                         <Fragment key={trade.id}>
                           <SortableTradeRow
                             id={trade.id}
-                            busy={Boolean(reorderBusy || ledgerInteractionDisabled)}
+                            busy={Boolean(reorderBusy || ledgerInteractionDisabled || sourceTradeDates.has(trade.trade_date))}
                             trade={trade}
                             insertionTarget={flatTradeInsertionTargets[index]}
                             onInsertTrade={startLedgerInlineTrade}
@@ -1013,6 +1018,10 @@ function TradeDateCell({
 }) {
   const [editing, setEditing] = useState(false)
 
+  if (trade.source_record_id) {
+    return <span title="来源成交日期由真实成交时间确定，不支持手工修改">{trade.trade_date}</span>
+  }
+
   if (editing) {
     return (
       <span className="inline-flex items-center gap-1">
@@ -1074,6 +1083,10 @@ function TradeExecutionCell({
     setEditing(false)
   }
 
+  if (trade.source_record_id) {
+    return <span title="来源成交的数量和价格不可修改；可以校准费用或删除记录">¥ {formatPrice(trade.price)} × {formatQuantity(trade.quantity)}</span>
+  }
+
   if (editing) {
     return (
       <div className="inline-flex items-center justify-end gap-1">
@@ -1123,7 +1136,7 @@ function TradeExecutionCell({
 }
 
 function SortableTradeRow({ id, busy, children, trade, insertionTarget, onInsertTrade, insertionDisabled }: { id: string; busy: boolean; children: ReactNode; trade?: PortfolioTrade; insertionTarget?: TradeInsertionTarget; onInsertTrade?: (trade: PortfolioTrade, target: TradeInsertionTarget) => void; insertionDisabled?: boolean }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id, disabled: busy })
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id, disabled: busy || Boolean(trade?.source_record_id) })
   return (
     <tr
       ref={setNodeRef}
@@ -1134,9 +1147,9 @@ function SortableTradeRow({ id, busy, children, trade, insertionTarget, onInsert
         <button
           {...attributes}
           {...listeners}
-          disabled={busy}
+          disabled={busy || Boolean(trade?.source_record_id)}
           className="cursor-grab touch-none rounded-btn p-1 text-muted hover:bg-elevated hover:text-foreground active:cursor-grabbing disabled:opacity-40"
-          title="拖动调整当日成交顺序"
+          title={trade?.source_record_id ? '来源成交按真实成交时间排序，不支持手工重排' : '拖动调整当日成交顺序'}
         >
           <GripVertical className="h-3.5 w-3.5" />
         </button>
@@ -1333,7 +1346,7 @@ function PositionTradesDialog({
                 <div className="flex items-center justify-between gap-3 border-b border-border bg-elevated/40 px-3.5 py-2.5">
                   <div className="font-mono text-xs font-medium text-foreground">{group.date}</div>
                   <div className="text-[10px] text-muted">
-                    {group.items.length} 笔{group.items.length > 1 ? ' · 可拖动排序' : ''}
+                    {group.items.length} 笔{group.items.length > 1 && group.items.every(trade => !trade.source_record_id) ? ' · 可拖动排序' : ''}
                   </div>
                 </div>
                 <GroupedTradeTable
@@ -1372,10 +1385,10 @@ function GroupedTradeTable({ items, mode, accountNameById, onDelete, onReorderDa
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
   // byDate 卡片内 items 即当日全部交易（展示顺序），可在组内拖放排序；byStock 组跨日期不支持调整
-  const sortable = mode === 'byDate' && Boolean(onReorderDay)
+  const sortable = mode === 'byDate' && Boolean(onReorderDay) && items.every(trade => !trade.source_record_id)
 
   function handleDragEnd(event: DragEndEvent) {
-    if (!onReorderDay || interactionDisabled) return
+    if (!sortable || !onReorderDay || interactionDisabled) return
     const { active, over } = event
     if (!over || active.id === over.id) return
     const oldIndex = items.findIndex(item => item.id === active.id)
@@ -1581,6 +1594,7 @@ function InlineTradeDraftRow({ draft, mode, accountName, busy, onChange, onSave,
 }
 
 function TradeInsertionButton({ trade, target, onInsert, disabled }: { trade: PortfolioTrade; target: TradeInsertionTarget; onInsert: (trade: PortfolioTrade, target: TradeInsertionTarget) => void; disabled: boolean }) {
+  if (trade.source_record_id) return null
   return (
     <span className="pointer-events-none absolute -bottom-3 left-0 z-20 h-6 w-7">
       <button

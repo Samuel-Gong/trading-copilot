@@ -269,6 +269,45 @@ export interface PortfolioWatchItem {
   added_at: string
 }
 
+export interface ExecutionImportItem {
+  source_record_id: string
+  identity_kind: 'row_fingerprint'
+  executed_at: string
+  trade_date: string
+  stock_code: string
+  stock_name: string
+  side: 'buy' | 'sell'
+  quantity: number
+  price: number
+  amount: number
+  contract_number?: string | null
+  order_reference?: string | null
+  fee?: number | null
+  tax?: number | null
+}
+
+export interface ExecutionImportRequest {
+  schema_version: 1
+  batch_id: string
+  source: 'tonghuashun'
+  source_account_id: string
+  account_id: string
+  mode: 'preview' | 'commit'
+  items: ExecutionImportItem[]
+}
+
+export interface ExecutionImportResult {
+  schema_version: 1
+  batch_id: string
+  mode: 'preview' | 'commit'
+  items: Array<{
+    source_record_id: string
+    status: 'ready' | 'duplicate' | 'conflict' | 'unsupported' | 'inserted'
+    trade_id: string | null
+    message: string
+  }>
+}
+
 export interface PortfolioTrade {
   id: string
   account_id: string
@@ -283,6 +322,14 @@ export interface PortfolioTrade {
   tax: number
   note: string
   cost_source?: 'manual' | 'estimated' | 'imported' | 'calibrated'
+  amount?: number
+  executed_at?: string
+  source?: 'tonghuashun'
+  source_account_id?: string
+  source_record_id?: string
+  identity_kind?: 'row_fingerprint'
+  contract_number?: string | null
+  order_reference?: string | null
   migration_source?: 'legacy_position'
   seq?: number
   created_at: string

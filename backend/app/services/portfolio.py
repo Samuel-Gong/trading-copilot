@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -41,6 +42,10 @@ class PortfolioConflictError(RuntimeError):
     """请求与持仓或观察状态冲突。"""
 
 
+class PortfolioOrderingConflictError(PortfolioConflictError):
+    """缺少真实成交时间,无法把手工流水与来源成交混合排序。"""
+
+
 def _path() -> Path:
     path = settings.data_dir / "user_data" / "portfolio.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +58,7 @@ def _empty_document() -> dict:
         "accounts": [],
         "trades": [],
         "watch_pool": [],
+        "execution_imports": {"batches": {}, "bindings": {}},
     }
 
 
@@ -90,17 +96,74 @@ def _legacy_trade(item: dict) -> dict | None:
     }
 
 
-def _read() -> dict:
+def _execution_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
+
+
+def _execution_source_key(source: str, account: str, record: str) -> str:
+    return _execution_digest([source, account, record.lower()])
+
+
+def _execution_trade_hash(trade: dict) -> str:
+    # 费用可校准、排序槽位可重排;其余来源成交事实必须保持完整。
+    fields = ("id", "account_id", "symbol", "asset_type", "trade_date", "executed_at",
+              "side", "quantity", "price", "amount", "source", "source_account_id",
+              "source_record_id", "identity_kind", "contract_number", "order_reference")
+    return _execution_digest({key: trade[key] for key in fields})
+
+
+def _validate_execution_bindings(document: dict) -> None:
+    bindings = document["execution_imports"]["bindings"]
+    try:
+        by_id = {trade["id"]: trade for trade in document["trades"]}
+        source_fields = ("source", "source_account_id", "source_record_id", "identity_kind", "executed_at")
+        for trade in document["trades"]:
+            if not any(field in trade for field in source_fields):
+                continue
+            if not all(isinstance(trade.get(field), str) and trade[field] for field in source_fields):
+                raise ValueError
+            key = _execution_source_key(trade["source"], trade["source_account_id"], trade["source_record_id"])
+            binding = bindings[key]
+            if (binding["trade_id"] != trade["id"] or binding["account_id"] != trade["account_id"]
+                    or binding.get("deleted", False) is not False
+                    or binding["trade_hash"] != _execution_trade_hash(trade)):
+                raise ValueError
+        for key, binding in bindings.items():
+            if (not re.fullmatch(r"[0-9a-f]{64}", key)
+                    or any(not re.fullmatch(r"[0-9a-f]{64}", binding[field])
+                           for field in ("content_hash", "trade_hash"))):
+                raise ValueError
+            trade = by_id.get(binding["trade_id"])
+            if binding.get("deleted", False) is True:
+                if trade is not None:
+                    raise ValueError
+            elif (trade is None or key != _execution_source_key(
+                    trade["source"], trade["source_account_id"], trade["source_record_id"])):
+                raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise PortfolioConflictError("成交来源绑定缺失或损坏,请先修复本地账本") from exc
+
+
+def _read(*, strict: bool = False) -> dict:
     path = _path()
     if not path.exists():
         return _empty_document()
     try:
         raw_value = path.read_text(encoding="utf-8")
         value = json.loads(raw_value)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        if strict:
+            raise PortfolioConflictError("账本无法安全读取,请先修复本地账本") from exc
         return _empty_document()
     if not isinstance(value, dict):
+        if strict:
+            raise PortfolioConflictError("账本格式无效,请先修复本地账本")
         return _empty_document()
+    if strict and any(key in value and not isinstance(value[key], list)
+                      for key in ("accounts", "trades", "watch_pool", "positions")):
+        raise PortfolioConflictError("账本集合格式无效,请先修复本地账本")
     accounts = value.get("accounts") if isinstance(value.get("accounts"), list) else []
     trades = value.get("trades") if isinstance(value.get("trades"), list) else []
     watch_pool = (
@@ -114,11 +177,25 @@ def _read() -> dict:
         "accounts": accounts,
         "trades": [*trades, *migrated],
         "watch_pool": watch_pool,
+        "execution_imports": value.get("execution_imports", {"batches": {}, "bindings": {}}),
     }
+    import_state = document["execution_imports"]
+    if (not isinstance(import_state, dict)
+            or not isinstance(import_state.get("batches"), dict)
+            or not isinstance(import_state.get("bindings"), dict)):
+        raise PortfolioConflictError("成交来源绑定格式无效,请先修复本地账本")
+    if (any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-f]{64}", v)
+            for v in import_state["batches"].values())
+            or any(not isinstance(v, dict) or any(not isinstance(v.get(k), str) or not v[k]
+                   for k in ("trade_id", "account_id", "content_hash"))
+                   for v in import_state["bindings"].values())
+            or ("execution_imports" not in value and any(t.get("source_record_id") for t in trades))):
+        raise PortfolioConflictError("成交来源绑定缺失或损坏,请先修复本地账本")
+    _validate_execution_bindings(document)
     if "positions" in value:
         _write_legacy_backup(raw_value)
     seq_updated = _ensure_seq(document)
-    if seq_updated or value.get("schema_version") != _SCHEMA_VERSION or "positions" in value:
+    if not strict and (seq_updated or value.get("schema_version") != _SCHEMA_VERSION or "positions" in value):
         _write(document)
     return document
 
@@ -305,6 +382,7 @@ def _replay(trades: list[dict], as_of: date | None = None) -> tuple[list[dict], 
         )
         quantity = float(trade["quantity"])
         price = float(trade["price"])
+        amount = float(trade.get("amount", quantity * price))
         fee = float(trade.get("fee") or 0)
         tax = float(trade.get("tax") or 0)
         total_fee += fee
@@ -315,7 +393,7 @@ def _replay(trades: list[dict], as_of: date | None = None) -> tuple[list[dict], 
         if str(trade.get("note") or "").strip():
             state["note"] = str(trade["note"]).strip()
         if trade.get("side") == "buy":
-            unit_cost = (quantity * price + fee + tax) / quantity
+            unit_cost = (amount + fee + tax) / quantity
             state["lots"].append(
                 {
                     "quantity": quantity,
@@ -341,7 +419,7 @@ def _replay(trades: list[dict], as_of: date | None = None) -> tuple[list[dict], 
             remaining -= consumed
             if float(lot["quantity"]) <= _EPSILON:
                 state["lots"].pop(0)
-        realized_pnl += quantity * price - fee - tax - sold_cost
+        realized_pnl += amount - fee - tax - sold_cost
 
     positions: list[dict] = []
     for (account_id, symbol), state in states.items():
@@ -376,6 +454,13 @@ def _replay(trades: list[dict], as_of: date | None = None) -> tuple[list[dict], 
 
 
 def _validate_trades(trades: list[dict]) -> None:
+    timed_groups = {
+        (t["account_id"], t["symbol"], t["trade_date"])
+        for t in trades if t.get("executed_at")
+    }
+    if any(not t.get("executed_at") and
+           (t["account_id"], t["symbol"], t["trade_date"]) in timed_groups for t in trades):
+        raise PortfolioOrderingConflictError("同账户、同证券、同日不能混入缺少成交时间的手工或交割单流水,请核对原始逐笔成交")
     _replay(trades)
 
 
@@ -505,6 +590,8 @@ def record_trade(
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             if insert_before_trade_id:
                 raise PortfolioConflictError(
                     "插入后的交易顺序会导致后续卖出超过可用数量"
@@ -553,8 +640,13 @@ def delete_trade(trade_id: str) -> None:
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError("删除该交易会导致后续卖出超过可用数量") from exc
         document["trades"] = candidate
+        for binding in document["execution_imports"]["bindings"].values():
+            if binding["trade_id"] == trade_id:
+                binding["deleted"] = True
         _remove_held_watch_items(document)
         _write(document)
 
@@ -571,6 +663,8 @@ def update_trade_execution(
         target = next((item for item in document["trades"] if item.get("id") == trade_id), None)
         if target is None:
             raise PortfolioNotFoundError("交易记录不存在")
+        if target.get("source_record_id"):
+            raise PortfolioConflictError("来源成交的数量和价格不可改写,请保留来源记录并核对原始逐笔流水")
         next_quantity = float(quantity) if quantity is not None else float(target["quantity"])
         next_price = round(float(price), 3) if price is not None else float(target["price"])
         replacement = {
@@ -597,6 +691,8 @@ def update_trade_execution(
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError(
                 "修改后的交易数量会导致某笔卖出超过可用数量"
             ) from exc
@@ -624,6 +720,8 @@ def update_trade_date(trade_id: str, trade_date: date) -> dict:
         )
         if target is None:
             raise PortfolioNotFoundError("交易记录不存在")
+        if target.get("source_record_id"):
+            raise PortfolioConflictError("来源成交日期由真实成交时间确定,不支持手工改写")
         if target.get("trade_date") == next_trade_date:
             return dict(target)
         destination_trades = [
@@ -647,6 +745,8 @@ def update_trade_date(trade_id: str, trade_date: date) -> dict:
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError(
                 "修改后的交易日期会导致某笔卖出超过可用数量"
             ) from exc
@@ -671,7 +771,8 @@ def update_trade_cost(trade_id: str, fee: float | None, tax: float | None) -> di
                 symbol=str(target.get("symbol") or ""),
                 side=str(target.get("side") or "buy"),
                 quantity=float(target.get("quantity") or 0),
-                price=float(target.get("price") or 0),
+                price=(float(target["amount"]) / float(target["quantity"])
+                       if target.get("amount") is not None else float(target.get("price") or 0)),
             )
         target["fee"] = round(float(fee), 2) if fee is not None else estimated_fee
         target["tax"] = round(float(tax), 2) if tax is not None else estimated_tax
@@ -694,6 +795,8 @@ def reorder_trades(trade_ids: list[str]) -> None:
         by_id = {str(item.get("id")): item for item in document["trades"]}
         if any(value not in by_id for value in ids):
             raise PortfolioNotFoundError("交易记录不存在")
+        if any(by_id[value].get("source_record_id") for value in ids):
+            raise PortfolioConflictError("来源成交按真实成交时间排序,不支持手工重排")
         days = {str(by_id[value].get("trade_date") or "") for value in ids}
         if len(days) != 1:
             raise ValueError("只能调整同一交易日内的交易顺序")
@@ -718,6 +821,8 @@ def reorder_trades(trade_ids: list[str]) -> None:
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError("调整后的交易顺序会导致后续卖出超过可用数量") from exc
         document["trades"] = candidate
         _write(document)
