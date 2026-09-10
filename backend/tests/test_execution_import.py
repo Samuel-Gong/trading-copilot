@@ -411,3 +411,23 @@ def test_reset_cost_uses_original_amount(context):
     reset = portfolio.update_trade_cost(trade_id, None, None)
     assert reset["fee"] == original["fee"]
     assert reset["tax"] == original["tax"]
+
+
+@pytest.mark.parametrize("entrypoint", ["manual", "insert_before", "statement", "date"])
+def test_reverse_manual_writes_cannot_mix_with_source_times(context, entrypoint):
+    client, account, path = context
+    old = manual(account, trade_date=date(2026, 7, 29)) if entrypoint == "date" else None
+    source_id = post(client, batch(account, mode="commit"))["items"][0]["trade_id"]
+    before = path.read_bytes()
+    row = {"symbol": "600519.SH", "trade_date": "2026-07-30", "side": "buy",
+           "quantity": 50, "price": 5, "fee": 0, "tax": 0}
+    if entrypoint == "statement":
+        response = client.post("/api/portfolio/statement-commit", json={"account_id": account, "items": [{"mode": "insert", **row}]})
+    elif entrypoint == "date":
+        response = client.patch(f"/api/portfolio/trades/{old['id']}/date", json={"trade_date": "2026-07-30"})
+    else:
+        if entrypoint == "insert_before":
+            row["insert_before_trade_id"] = source_id
+        response = client.post("/api/portfolio/trades", json={"account_id": account, **row})
+    assert response.status_code == 409
+    assert path.read_bytes() == before

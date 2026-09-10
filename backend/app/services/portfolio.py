@@ -41,6 +41,10 @@ class PortfolioConflictError(RuntimeError):
     """请求与持仓或观察状态冲突。"""
 
 
+class PortfolioOrderingConflictError(PortfolioConflictError):
+    """缺少真实成交时间,无法把手工流水与来源成交混合排序。"""
+
+
 def _path() -> Path:
     path = settings.data_dir / "user_data" / "portfolio.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +402,13 @@ def _replay(trades: list[dict], as_of: date | None = None) -> tuple[list[dict], 
 
 
 def _validate_trades(trades: list[dict]) -> None:
+    timed_groups = {
+        (t["account_id"], t["symbol"], t["trade_date"])
+        for t in trades if t.get("executed_at")
+    }
+    if any(not t.get("executed_at") and
+           (t["account_id"], t["symbol"], t["trade_date"]) in timed_groups for t in trades):
+        raise PortfolioOrderingConflictError("同账户、同证券、同日不能混入缺少成交时间的手工或交割单流水,请核对原始逐笔成交")
     _replay(trades)
 
 
@@ -527,6 +538,8 @@ def record_trade(
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             if insert_before_trade_id:
                 raise PortfolioConflictError(
                     "插入后的交易顺序会导致后续卖出超过可用数量"
@@ -575,6 +588,8 @@ def delete_trade(trade_id: str) -> None:
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError("删除该交易会导致后续卖出超过可用数量") from exc
         document["trades"] = candidate
         _remove_held_watch_items(document)
@@ -621,6 +636,8 @@ def update_trade_execution(
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError(
                 "修改后的交易数量会导致某笔卖出超过可用数量"
             ) from exc
@@ -673,6 +690,8 @@ def update_trade_date(trade_id: str, trade_date: date) -> dict:
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError(
                 "修改后的交易日期会导致某笔卖出超过可用数量"
             ) from exc
@@ -747,6 +766,8 @@ def reorder_trades(trade_ids: list[str]) -> None:
         try:
             _validate_trades(candidate)
         except PortfolioConflictError as exc:
+            if isinstance(exc, PortfolioOrderingConflictError):
+                raise
             raise PortfolioConflictError("调整后的交易顺序会导致后续卖出超过可用数量") from exc
         document["trades"] = candidate
         _write(document)
