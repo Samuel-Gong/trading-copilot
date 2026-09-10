@@ -230,10 +230,10 @@ export function Portfolio() {
       group.items.push(trade)
       if (trade.side === 'buy') {
         group.buyCount += 1
-        group.netAmount += trade.quantity * trade.price + trade.fee + trade.tax
+        group.netAmount += (trade.amount ?? trade.quantity * trade.price) + trade.fee + trade.tax
       } else {
         group.sellCount += 1
-        group.netAmount -= trade.quantity * trade.price - trade.fee - trade.tax
+        group.netAmount -= (trade.amount ?? trade.quantity * trade.price) - trade.fee - trade.tax
       }
     }
     return [...byDate.values()].sort((a, b) => b.date.localeCompare(a.date))
@@ -251,11 +251,11 @@ export function Portfolio() {
       group.items.push(trade)
       if (trade.side === 'buy') {
         group.buyCount += 1
-        group.netAmount += trade.quantity * trade.price + trade.fee + trade.tax
+        group.netAmount += (trade.amount ?? trade.quantity * trade.price) + trade.fee + trade.tax
         group.netQuantity += trade.quantity
       } else {
         group.sellCount += 1
-        group.netAmount -= trade.quantity * trade.price - trade.fee - trade.tax
+        group.netAmount -= (trade.amount ?? trade.quantity * trade.price) - trade.fee - trade.tax
         group.netQuantity -= trade.quantity
       }
     }

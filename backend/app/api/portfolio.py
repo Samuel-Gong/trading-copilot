@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, ValidationError, field_validator
+from starlette.concurrency import run_in_threadpool
 
 from app.api.monitor_rules import sync_engine
 from app.config import settings
 from app.services import (
+    execution_import,
     portfolio,
     portfolio_price_monitors,
     preferences,
@@ -620,3 +622,36 @@ def get_snapshot(
         )
     except Exception as exc:
         raise _map_error(exc) from exc
+
+
+@router.post("/execution-imports")
+async def import_executions(request: Request):
+    # 手动收敛校验错误,避免默认 422 的 input 字段回显来源账户或完整请求。
+    try:
+        body = execution_import.ExecutionImportRequest.model_validate(await request.json())
+    except (ValidationError, ValueError):
+        raise HTTPException(status_code=422, detail="成交导入请求格式无效,请核对 v1 字段和有限数值") from None
+    return await run_in_threadpool(_receive_executions, request, body)
+
+
+def _receive_executions(request: Request, body: execution_import.ExecutionImportRequest):
+    try:
+        with portfolio.mutation_guard():
+            result = execution_import.receive(request.app.state.repo, body)
+            if body.mode == "commit":
+                # 包含 duplicate 重试,以便重启或回执丢失后再次收敛清仓监控。
+                committed_ids = {row["trade_id"] for row in result["items"]}
+                sell_symbols = {
+                    trade["symbol"] for trade in portfolio.list_trades(account_id=body.account_id)
+                    if trade["id"] in committed_ids and trade["side"] == "sell"
+                }
+                _cleanup_closed_position_rules(request, sell_symbols)
+            return result
+    except execution_import.ExecutionImportConflict as exc:
+        return JSONResponse(status_code=409, content=exc.result)
+    except portfolio.PortfolioNotFoundError:
+        raise HTTPException(status_code=404, detail="目标账户不存在") from None
+    except portfolio.PortfolioConflictError:
+        raise HTTPException(status_code=409, detail="账本无法安全导入,请在 Trading Copilot 核对并修复") from None
+    except Exception:
+        raise HTTPException(status_code=500, detail="成交导入失败,请使用原批次重试") from None
