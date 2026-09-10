@@ -697,7 +697,8 @@ def update_trade_cost(trade_id: str, fee: float | None, tax: float | None) -> di
                 symbol=str(target.get("symbol") or ""),
                 side=str(target.get("side") or "buy"),
                 quantity=float(target.get("quantity") or 0),
-                price=float(target.get("price") or 0),
+                price=(float(target["amount"]) / float(target["quantity"])
+                       if target.get("amount") is not None else float(target.get("price") or 0)),
             )
         target["fee"] = round(float(fee), 2) if fee is not None else estimated_fee
         target["tax"] = round(float(tax), 2) if tax is not None else estimated_tax

@@ -401,3 +401,13 @@ def test_cleanup_only_uses_actual_committed_market(context, monkeypatch):
     post(client, body)
     assert calls[-2:] == [{"000001.SZ"}, {"000001.SZ"}]
     assert "000001.SH" not in calls[-1]
+
+
+def test_reset_cost_uses_original_amount(context):
+    client, account, _ = context
+    body = batch(account, [item(quantity=100000, price=10.123, amount=1012340)], "commit")
+    trade_id = post(client, body)["items"][0]["trade_id"]
+    original = portfolio.list_trades()[0]
+    reset = portfolio.update_trade_cost(trade_id, None, None)
+    assert reset["fee"] == original["fee"]
+    assert reset["tax"] == original["tax"]
