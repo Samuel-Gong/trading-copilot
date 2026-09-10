@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -95,6 +96,56 @@ def _legacy_trade(item: dict) -> dict | None:
     }
 
 
+def _execution_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
+
+
+def _execution_source_key(source: str, account: str, record: str) -> str:
+    return _execution_digest([source, account, record.lower()])
+
+
+def _execution_trade_hash(trade: dict) -> str:
+    # 费用可校准、排序槽位可重排;其余来源成交事实必须保持完整。
+    fields = ("id", "account_id", "symbol", "asset_type", "trade_date", "executed_at",
+              "side", "quantity", "price", "amount", "source", "source_account_id",
+              "source_record_id", "identity_kind", "contract_number", "order_reference")
+    return _execution_digest({key: trade[key] for key in fields})
+
+
+def _validate_execution_bindings(document: dict) -> None:
+    bindings = document["execution_imports"]["bindings"]
+    try:
+        by_id = {trade["id"]: trade for trade in document["trades"]}
+        source_fields = ("source", "source_account_id", "source_record_id", "identity_kind", "executed_at")
+        for trade in document["trades"]:
+            if not any(field in trade for field in source_fields):
+                continue
+            if not all(isinstance(trade.get(field), str) and trade[field] for field in source_fields):
+                raise ValueError
+            key = _execution_source_key(trade["source"], trade["source_account_id"], trade["source_record_id"])
+            binding = bindings[key]
+            if (binding["trade_id"] != trade["id"] or binding["account_id"] != trade["account_id"]
+                    or binding.get("deleted", False) is not False
+                    or binding["trade_hash"] != _execution_trade_hash(trade)):
+                raise ValueError
+        for key, binding in bindings.items():
+            if (not re.fullmatch(r"[0-9a-f]{64}", key)
+                    or any(not re.fullmatch(r"[0-9a-f]{64}", binding[field])
+                           for field in ("content_hash", "trade_hash"))):
+                raise ValueError
+            trade = by_id.get(binding["trade_id"])
+            if binding.get("deleted", False) is True:
+                if trade is not None:
+                    raise ValueError
+            elif (trade is None or key != _execution_source_key(
+                    trade["source"], trade["source_account_id"], trade["source_record_id"])):
+                raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise PortfolioConflictError("成交来源绑定缺失或损坏,请先修复本地账本") from exc
+
+
 def _read(*, strict: bool = False) -> dict:
     path = _path()
     if not path.exists():
@@ -140,6 +191,7 @@ def _read(*, strict: bool = False) -> dict:
                    for v in import_state["bindings"].values())
             or ("execution_imports" not in value and any(t.get("source_record_id") for t in trades))):
         raise PortfolioConflictError("成交来源绑定缺失或损坏,请先修复本地账本")
+    _validate_execution_bindings(document)
     if "positions" in value:
         _write_legacy_backup(raw_value)
     seq_updated = _ensure_seq(document)
@@ -592,6 +644,9 @@ def delete_trade(trade_id: str) -> None:
                 raise
             raise PortfolioConflictError("删除该交易会导致后续卖出超过可用数量") from exc
         document["trades"] = candidate
+        for binding in document["execution_imports"]["bindings"].values():
+            if binding["trade_id"] == trade_id:
+                binding["deleted"] = True
         _remove_held_watch_items(document)
         _write(document)
 

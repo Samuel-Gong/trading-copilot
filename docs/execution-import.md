@@ -107,3 +107,7 @@ env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
 ```bash
 uv run --no-sync python -m pytest tests/test_execution_import.py tests/test_portfolio_trade_ledger.py tests/test_portfolio_api.py tests/test_portfolio_statement_import.py tests/test_trade_fees.py tests/test_portfolio_price_monitors.py -q
 ```
+
+来源交易与绑定在每次账本读取时双向校验，并保存不可编辑成交事实的摘要；字段缺失、绑定错配或事实改变时拒绝继续写入。删除来源交易会原子保留明确的删除墓碑，后续重试返回冲突，不会重新导入。费用校准与同日排序槽位变化不影响该摘要。此元数据格式属于本次首次引入的功能；既有无来源交易的账本继续兼容。
+
+`source_record_id` 的十六进制大小写视为同一身份，批次和内容摘要使用小写值，响应仍逐行返回请求中的原值；无需调整桌面端 v1 请求或响应结构。

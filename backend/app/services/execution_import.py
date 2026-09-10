@@ -76,7 +76,11 @@ def _digest(value: object) -> str:
 
 
 def _source_key(body: ExecutionImportRequest, entry: ExecutionItem) -> str:
-    return _digest([body.source, body.source_account_id, entry.source_record_id.lower()])
+    return portfolio._execution_source_key(body.source, body.source_account_id, entry.source_record_id)
+
+
+def _canonical_entry(entry: ExecutionItem) -> dict:
+    return {**entry.model_dump(mode="json"), "source_record_id": entry.source_record_id.lower()}
 
 
 def _group(trade: dict) -> tuple:
@@ -142,6 +146,7 @@ def _prepare(repo, body: ExecutionImportRequest) -> list[tuple[dict | None, str]
 def receive(repo, body: ExecutionImportRequest) -> dict:
     prepared = _prepare(repo, body)
     payload = body.model_dump(mode="json", exclude={"mode", "batch_id"})
+    payload["items"] = [_canonical_entry(entry) for entry in body.items]
     batch_hash = _digest(payload)
     result = {"schema_version": 1, "batch_id": body.batch_id, "mode": body.mode, "items": []}
     with portfolio.mutation_guard():
@@ -159,7 +164,7 @@ def receive(repo, body: ExecutionImportRequest) -> dict:
         candidates = []
         for entry, key, (trade, message) in zip(body.items, keys, prepared, strict=True):
             binding = state["bindings"].get(key)
-            entry_hash = _digest(entry.model_dump(mode="json"))
+            entry_hash = _digest(_canonical_entry(entry))
             if counts[key] > 1:
                 row = _row(entry, "conflict", "批次含重复行指纹,无法区分相同字段的两笔成交")
             elif binding is not None:
@@ -234,7 +239,10 @@ def receive(repo, body: ExecutionImportRequest) -> dict:
         if body.mode == "commit":
             document["trades"] = candidate_trades
             for trade, row, key, entry_hash in candidates:
-                state["bindings"][key] = {"trade_id": trade["id"], "account_id": body.account_id, "content_hash": entry_hash}
+                state["bindings"][key] = {
+                    "trade_id": trade["id"], "account_id": body.account_id, "content_hash": entry_hash,
+                    "trade_hash": portfolio._execution_trade_hash(trade),
+                }
                 row.update(status="inserted", trade_id=trade["id"])
             portfolio._remove_held_watch_items(document)
         # preview 仅保留批次摘要,约束后续 commit/重试;不预留交易身份。

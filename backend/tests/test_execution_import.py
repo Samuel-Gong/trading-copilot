@@ -431,3 +431,71 @@ def test_reverse_manual_writes_cannot_mix_with_source_times(context, entrypoint)
         response = client.post("/api/portfolio/trades", json={"account_id": account, **row})
     assert response.status_code == 409
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["source_record_id", "source", "source_account_id", "identity_kind", "executed_at", "amount"])
+def test_partial_source_damage_blocks_all_writes(context, field):
+    client, account, path = context
+    body = batch(account, mode="commit")
+    trade_id = post(client, body)["items"][0]["trade_id"]
+    document = json.loads(path.read_text())
+    del document["trades"][0][field]
+    path.write_text(json.dumps(document))
+    before = path.read_bytes()
+    post(client, body, 409)
+    assert client.patch(f"/api/portfolio/trades/{trade_id}", json={"quantity": 200, "price": 10.5}).status_code == 409
+    with pytest.raises(portfolio.PortfolioConflictError):
+        portfolio.create_account("合成账户")
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("damage", ["missing_trade", "manual_trade", "missing_binding", "wrong_account", "changed_amount"])
+def test_source_binding_integrity(context, damage):
+    client, account, path = context
+    body = batch(account, mode="commit")
+    post(client, body)
+    manual_trade = manual(account, trade_date=date(2026, 7, 29))
+    document = json.loads(path.read_text())
+    binding = next(iter(document["execution_imports"]["bindings"].values()))
+    if damage == "missing_trade":
+        document["trades"] = [manual_trade]
+    elif damage == "manual_trade":
+        binding["trade_id"] = manual_trade["id"]
+    elif damage == "missing_binding":
+        document["execution_imports"]["bindings"].clear()
+    elif damage == "wrong_account":
+        binding["account_id"] = "other-synthetic-account"
+    else:
+        document["trades"][0]["amount"] += 1
+    path.write_text(json.dumps(document))
+    before = path.read_bytes()
+    post(client, body, 409)
+    with pytest.raises(portfolio.PortfolioConflictError):
+        portfolio.create_account("合成账户")
+    assert path.read_bytes() == before
+
+
+def test_deleted_source_allows_other_ledger_operations(context):
+    client, account, _ = context
+    body = batch(account, mode="commit")
+    trade_id = post(client, body)["items"][0]["trade_id"]
+    portfolio.delete_trade(trade_id)
+    portfolio.create_account("另一个合成账户")
+    manual(account)
+    post(client, body, 409)
+    assert len(portfolio.list_trades()) == 1
+
+
+def test_fingerprint_case_preserves_identity_and_response(context):
+    client, account, _ = context
+    body = batch(account, [item(source_record_id=item()["source_record_id"].upper())])
+    post(client, body)
+    body["mode"] = "commit"
+    body["items"][0]["source_record_id"] = item()["source_record_id"]
+    trade_id = post(client, body)["items"][0]["trade_id"]
+    body["items"][0]["source_record_id"] = item()["source_record_id"].upper()
+    for _ in range(2):
+        result = post(client, body)["items"][0]
+        assert result["status"] == "duplicate" and result["trade_id"] == trade_id
+        assert result["source_record_id"] == body["items"][0]["source_record_id"]
+        body["batch_id"] = str(uuid.uuid4())
