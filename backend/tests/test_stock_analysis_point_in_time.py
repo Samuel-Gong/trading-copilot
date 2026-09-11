@@ -53,8 +53,8 @@ def test_historical_analysis_uses_announcement_date_and_excludes_future_financia
     }
     monkeypatch.setattr(
         stock_analyzer,
-        "get_financial_df",
-        lambda data_dir, table: tables[table],
+        "get_financial_snapshot",
+        lambda data_dir: tables,
     )
 
     result = stock_analyzer.build_stock_analysis_input(
@@ -74,14 +74,17 @@ def test_historical_analysis_omits_financial_table_without_announcement_time(
 ):
     monkeypatch.setattr(
         stock_analyzer,
-        "get_financial_df",
-        lambda data_dir, table: pl.DataFrame(
-            {
-                "symbol": ["600519.SH"],
-                "period_end": ["2026-03-31"],
-                "fact": ["UNPROVEN_TIME_SENTINEL"],
-            }
-        ),
+        "get_financial_snapshot",
+        lambda data_dir: {
+            table: pl.DataFrame(
+                {
+                    "symbol": ["600519.SH"],
+                    "period_end": ["2026-03-31"],
+                    "fact": ["UNPROVEN_TIME_SENTINEL"],
+                }
+            )
+            for table in ("metrics", "income")
+        },
     )
 
     result = stock_analyzer.build_stock_analysis_input(

@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { RefreshCw, ChevronDown, Flame, Settings2, X, Bell, BellOff, AlertCircle } from 'lucide-react'
 import { DatePicker } from '@/components/DatePicker'
 import { api, type LimitLadderTier, type LimitLadderStock, type MonitorRule } from '@/lib/api'
-import { StockPreviewDialog } from '@/components/StockPreviewDialog'
+import { StockPreviewDialog, toNavItems, type NavItem } from '@/components/StockPreviewDialog'
 import { DimensionMembersDialog, type DimensionKind, type DimensionMembersTarget } from '@/components/DimensionMembersDialog'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
@@ -220,7 +220,7 @@ function useSealedDegrade(asOf: string, latestDate: string | undefined, sealedRe
 
 // ===== 单只股票卡片 =====
 
-const StockCard = React.memo(function StockCard({ stock, extFields, direction, sealMode, monitored, monitorRule, onMonitorChange, hasDepth, onClick, onDimensionClick }: {
+const StockCard = React.memo(function StockCard({ stock, extFields, direction, sealMode, monitored, monitorRule, onMonitorChange, hasDepth, onClick, onDimensionClick, active }: {
   stock: LimitLadderStock
   extFields: ExtFieldConfig
   direction: Direction
@@ -231,6 +231,8 @@ const StockCard = React.memo(function StockCard({ stock, extFields, direction, s
   hasDepth: boolean
   onClick: (symbol: string, name?: string) => void
   onDimensionClick: (kind: DimensionKind, value: string, sourceField?: string) => void
+  /** 正在 K 线弹窗预览中 → 高亮卡片 */
+  active?: boolean
 }) {
   const [showMonitorMenu, setShowMonitorMenu] = useState(false)
   const [menuAnchor, setMenuAnchor] = useState<DOMRect | null>(null)
@@ -259,7 +261,7 @@ const StockCard = React.memo(function StockCard({ stock, extFields, direction, s
   const hasTags = conceptTags.length > 0 || industryTags.length > 0
 
   // 齿轮始终可见: 让免费用户也能看到功能入口, 点开后在菜单内提示权限不足。
-  // Pro+ 用户正常设置; 免费用户保存按钮禁用 + 显示升级提示。
+  // 有五档盘口能力的用户正常设置; 无能力时保存按钮禁用 + 显示能力提示。
   return (
     <div className="relative group w-full">
       {/* 监控设置按钮 (右上角): 不能嵌在卡片 button 内 */}
@@ -298,7 +300,7 @@ const StockCard = React.memo(function StockCard({ stock, extFields, direction, s
         event.preventDefault()
         onClick(stock.symbol, stock.name ?? undefined)
       }}
-      className={`w-full flex flex-col items-start gap-1 px-2.5 py-2 rounded-md transition-all duration-200 cursor-pointer hover:opacity-100 ${style.bg} ${style.bar} ${monitored ? 'ring-1 ring-amber-400/50 ring-inset' : ''}`}
+      className={`w-full flex flex-col items-start gap-1 px-2.5 py-2 rounded-md transition-all duration-200 cursor-pointer hover:opacity-100 ${style.bg} ${style.bar} ${monitored ? 'ring-1 ring-amber-400/50 ring-inset' : ''} ${active ? 'ring-1 ring-accent/60 ring-inset' : ''}`}
       style={style.cardStyle ? { ...style.cardStyle } : undefined}
       onMouseEnter={e => {
         if (!style.cardStyle || !style.hoverShadow) return
@@ -421,7 +423,9 @@ function MonitorMenu({ stock, direction, sealMode, monitorRule, anchorRect, hasD
     { key: '100000000', label: '亿元', mult: 100000000 },
   ]
 
-  const [metric, setMetric] = useState<'sealed_vol' | 'sealed_amount'>(existing?.metric ?? (sealMode === 'amount' ? 'sealed_amount' : 'sealed_vol'))
+  const [metric, setMetric] = useState<'sealed_vol' | 'sealed_amount'>(
+    existing?.metric === 'sealed_amount' || (!existing && sealMode === 'amount') ? 'sealed_amount' : 'sealed_vol'
+  )
   const units = metric === 'sealed_amount' ? AMT_UNITS : VOL_UNITS
   // 已有规则: 反算到最大便捷单位 (选能整除的最大倍率); 新建: 额默认亿元, 量默认万手
   const initUnit = (() => {
@@ -615,10 +619,10 @@ function MonitorMenu({ stock, direction, sealMode, monitorRule, anchorRect, hasD
           <button
             onClick={handleSave}
             disabled={saving || !threshold || !hasDepth}
-            title={!hasDepth ? '需 Pro+ 套餐 (批量五档能力)' : ''}
+            title={!hasDepth ? '五档盘口(批量)数据不可用' : ''}
             className="flex-1 h-7 rounded text-[11px] font-medium transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed bg-accent text-white hover:bg-accent/90 active:scale-[0.98] disabled:active:scale-100"
           >
-            {saving ? '保存中…' : !hasDepth ? '需 Pro+ 套餐' : existing ? '更新监控' : '开启监控'}
+            {saving ? '保存中…' : !hasDepth ? '五档盘口不可用' : existing ? '更新监控' : '开启监控'}
           </button>
         </div>
       </div>
@@ -924,7 +928,53 @@ function TagStats({ title, tiers, extFields, fieldKey, color, selectedTag, onSel
 
 // ===== 梯队分组 =====
 
-function TierGroup({ tier, defaultOpen, extFields, filterKeys, bf, onStockClick, selectedTag, onSelectTag, onDimensionClick, direction, sealMode, monitoredSymbols, ladderRules, onMonitorChange, hasDepth }: {
+/** 与 TierGroup 卡片展示一致的过滤+排序 (监控优先 → 状态 → 封单量), 供切股导航列表复用 */
+function sortLadderStocks(
+  stocks: LimitLadderStock[],
+  opts: {
+    monitoredSymbols: Set<string>
+    sealMode: 'vol' | 'amount'
+    selectedTag: { fieldKey: 'concept' | 'industry'; tag: string } | null
+    extFields: ExtFieldConfig
+  },
+): LimitLadderStock[] {
+  return [...stocks]
+    .filter(s => {
+      if (!opts.selectedTag) return true
+      const item = opts.extFields[opts.selectedTag.fieldKey]
+      if (!item) return true
+      const tags = getExtTags(s, item)
+      return tags.includes(opts.selectedTag.tag)
+    })
+    .sort((a, b) => {
+      // 开启监控的卡片排到分组最前
+      const ma = opts.monitoredSymbols.has(a.symbol) ? 0 : 1
+      const mb = opts.monitoredSymbols.has(b.symbol) ? 0 : 1
+      if (ma !== mb) return ma - mb
+      const ord = (s: string) => {
+        if (s === 'limit_up' || s === 'limit_down' || !s) return 0
+        if (s === 'broken' || s === 'recovery') return 1
+        return 2
+      }
+      const oa = ord(a.status ?? '')
+      const ob = ord(b.status ?? '')
+      if (oa !== ob) return oa - ob
+      // 同状态(主状态=涨停/跌停)内: 按封单从高到低排, 无封单排末尾。
+      // 封单额 = sealed_vol(手) × 100 × close, 与展示口径一致。
+      if (oa === 0) {
+        const sealVal = (s: LimitLadderStock) => {
+          if (s.sealed_vol == null) return -1
+          return opts.sealMode === 'amount' && s.close
+            ? s.sealed_vol * 100 * s.close
+            : s.sealed_vol
+        }
+        return sealVal(b) - sealVal(a)
+      }
+      return 0
+    })
+}
+
+function TierGroup({ tier, defaultOpen, extFields, filterKeys, bf, onStockClick, selectedTag, onSelectTag, onDimensionClick, direction, sealMode, monitoredSymbols, ladderRules, onMonitorChange, hasDepth, activeSymbol }: {
   tier: LimitLadderTier
   defaultOpen: boolean
   extFields: ExtFieldConfig
@@ -940,6 +990,8 @@ function TierGroup({ tier, defaultOpen, extFields, filterKeys, bf, onStockClick,
   ladderRules: Map<string, MonitorRule>
   onMonitorChange: () => void
   hasDepth: boolean
+  /** 正在 K 线弹窗预览中 → 高亮对应卡片 */
+  activeSymbol?: string | null
 }) {
   const isDarkTheme = useTheme() === 'dark'
   const [open, setOpen] = useState(defaultOpen)
@@ -1083,40 +1135,7 @@ function TierGroup({ tier, defaultOpen, extFields, filterKeys, bf, onStockClick,
               </div>
             )}
             <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-3 px-3 pb-3">
-              {[...tier.stocks]
-                .filter(s => {
-                  if (!selectedTag) return true
-                  const item = extFields[selectedTag.fieldKey]
-                  if (!item) return true
-                  const tags = getExtTags(s, item)
-                  return tags.includes(selectedTag.tag)
-                })
-                .sort((a, b) => {
-                  // 开启监控的卡片排到分组最前
-                  const ma = monitoredSymbols.has(a.symbol) ? 0 : 1
-                  const mb = monitoredSymbols.has(b.symbol) ? 0 : 1
-                  if (ma !== mb) return ma - mb
-                  const ord = (s: string) => {
-                    if (s === 'limit_up' || s === 'limit_down' || !s) return 0
-                    if (s === 'broken' || s === 'recovery') return 1
-                    return 2
-                  }
-                  const oa = ord(a.status ?? '')
-                  const ob = ord(b.status ?? '')
-                  if (oa !== ob) return oa - ob
-                  // 同状态(主状态=涨停/跌停)内: 按封单从高到低排, 无封单排末尾。
-                  // 封单额 = sealed_vol(手) × 100 × close, 与展示口径一致。
-                  if (oa === 0) {
-                    const sealVal = (s: typeof a) => {
-                      if (s.sealed_vol == null) return -1
-                      return sealMode === 'amount' && s.close
-                        ? s.sealed_vol * 100 * s.close
-                        : s.sealed_vol
-                    }
-                    return sealVal(b) - sealVal(a)
-                  }
-                  return 0
-                }).map(s => (
+              {tier.stocks.map(s => (
                 <StockCard
                   key={`${s.symbol}-${s.status}`}
                   stock={s}
@@ -1129,6 +1148,7 @@ function TierGroup({ tier, defaultOpen, extFields, filterKeys, bf, onStockClick,
                   hasDepth={hasDepth}
                   onClick={onStockClick}
                   onDimensionClick={onDimensionClick}
+                  active={activeSymbol === s.symbol}
                 />
               ))}
             </div>
@@ -1488,6 +1508,7 @@ export function LimitUpLadder() {
   }, [showConcept])
   const [previewSymbol, setPreviewSymbol] = useState<string | null>(null)
   const [previewName, setPreviewName] = useState('')
+  const [previewNavList, setPreviewNavList] = useState<NavItem[]>([])
   const [selectedTag, setSelectedTag] = useState<{ fieldKey: 'concept' | 'industry'; tag: string } | null>(null)
   const [dimensionTarget, setDimensionTarget] = useState<DimensionMembersTarget | null>(null)
   const handleSelectTag = useCallback((sel: { fieldKey: 'concept' | 'industry'; tag: string } | null) => {
@@ -1509,15 +1530,13 @@ export function LimitUpLadder() {
     storage.limitLadderExtFields.set(f)
   }, [])
 
-  const handleStockClick = useCallback((symbol: string, name?: string) => {
-    setPreviewSymbol(symbol)
-    setPreviewName(name ?? '')
-  }, [])
-
   const extColumnsParam = useMemo(() => buildExtColumnsParam(extFields), [extFields])
 
   const { data, isLoading, refetch, isFetching } = useQuery({
-    queryKey: [QK.limitLadder(asOf || undefined), extColumnsParam, direction],
+    // key 必须拍平 (spread 展开): key[0] 为字符串 'limit-ladder' 才能被 SSE 前缀失效
+    // 命中实现实时刷新, depth_updated 事件 (invalidate ['limit-ladder']) 也才能匹配本查询。
+    // 嵌套数组 key 会导致前者靠 String() 侥幸命中、后者永远失配。
+    queryKey: [...QK.limitLadder(asOf || undefined), extColumnsParam, direction],
     queryFn: () => api.limitLadder(asOf || undefined, extColumnsParam, direction),
     staleTime: 5 * 60_000,
   })
@@ -1527,8 +1546,32 @@ export function LimitUpLadder() {
   }, [asOf, data?.as_of])
 
   const rawTiers = data?.tiers ?? []
-  const tiers = filterTiers(rawTiers, filterKeys, extFields.bf)
+  // filterTiers 每次返回新数组, 不 memo 会破坏 React.memo(StockCard) 且全梯队二次排序
+  const tiers = useMemo(() => filterTiers(rawTiers, filterKeys, extFields.bf), [rawTiers, filterKeys, extFields.bf])
   const displayDate = data?.as_of ?? asOf
+
+  // 单源: 梯队按展示同款过滤+排序一次 (监控优先 → 状态 → 封单量),
+  // 卡片渲染(TierGroup)与切股导航(ladderNavItems)共用, 避免每 tick 二次排序。
+  const resolvedExtFields = useMemo(
+    () => resolveExtFields(extFields, showConcept, showIndustry),
+    [extFields, showConcept, showIndustry],
+  )
+  const sortedTiers = useMemo(
+    () => tiers.map(t => ({ ...t, stocks: sortLadderStocks(t.stocks, { monitoredSymbols, sealMode, selectedTag, extFields: resolvedExtFields }) })),
+    [tiers, monitoredSymbols, sealMode, selectedTag, resolvedExtFields],
+  )
+
+  // 切股导航列表: 由 sortedTiers 展平 (顺序 = 卡片展示顺序)
+  const ladderNavItems = useMemo(
+    () => toNavItems(sortedTiers.flatMap(t => t.stocks)),
+    [sortedTiers],
+  )
+
+  const handleStockClick = useCallback((symbol: string, name?: string, navList?: NavItem[]) => {
+    setPreviewSymbol(symbol)
+    setPreviewName(name ?? '')
+    setPreviewNavList(navList ?? ladderNavItems)
+  }, [ladderNavItems])
 
   // sealed 降级判定
   const sealedDegrade = useSealedDegrade(asOf, data?.as_of, data?.sealed_ready, data?.sealed_counts)
@@ -1705,7 +1748,7 @@ export function LimitUpLadder() {
         <TagStats
           title="概念分布"
           tiers={tiers}
-          extFields={resolveExtFields(extFields, showConcept, showIndustry)}
+          extFields={resolvedExtFields}
           fieldKey="concept"
           color={{ text: [250, 204, 21], textLight: [161, 98, 7], bg: [234, 179, 8] }}
           selectedTag={selectedTag}
@@ -1719,7 +1762,7 @@ export function LimitUpLadder() {
         <TagStats
           title="行业分布"
           tiers={tiers}
-          extFields={resolveExtFields(extFields, showConcept, showIndustry)}
+          extFields={resolvedExtFields}
           fieldKey="industry"
           color={{ text: [96, 165, 250], textLight: [29, 78, 216], bg: [59, 130, 246] }}
           selectedTag={selectedTag}
@@ -1731,12 +1774,12 @@ export function LimitUpLadder() {
 
       {/* 梯队列表 */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
-        {tiers.map(t => (
+        {sortedTiers.map(t => (
           <TierGroup
             key={t.boards}
             tier={t}
             defaultOpen={t.boards >= 1 || t.count <= 8}
-            extFields={resolveExtFields(extFields, showConcept, showIndustry)}
+            extFields={resolvedExtFields}
             filterKeys={filterKeys}
             bf={extFields.bf}
             onStockClick={handleStockClick}
@@ -1749,6 +1792,7 @@ export function LimitUpLadder() {
             ladderRules={ladderRules}
             onMonitorChange={refetchMonitorRules}
             hasDepth={sealedDegrade.hasDepth}
+            activeSymbol={previewSymbol}
           />
         ))}
       </div>
@@ -1756,9 +1800,9 @@ export function LimitUpLadder() {
       <DimensionMembersDialog
         target={dimensionTarget}
         onClose={() => setDimensionTarget(null)}
-        onStockClick={(symbol, name) => {
+        onStockClick={(symbol, name, navList) => {
           setDimensionTarget(null)
-          handleStockClick(symbol, name)
+          handleStockClick(symbol, name, navList)
         }}
       />
 
@@ -1766,7 +1810,9 @@ export function LimitUpLadder() {
       <StockPreviewDialog
         symbol={previewSymbol}
         name={previewName}
-        onClose={() => setPreviewSymbol(null)}
+        onClose={() => { setPreviewSymbol(null); setPreviewNavList([]) }}
+        navList={previewNavList}
+        onNavigate={(sym, n) => { setPreviewSymbol(sym); setPreviewName(n ?? '') }}
       />
 
       {/* 字段配置弹窗 */}

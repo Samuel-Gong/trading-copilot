@@ -18,20 +18,14 @@ from typing import Any
 
 import polars as pl
 
+from app.market_time import cn_today
 from app.services.ext_data import ExtConfig, ExtConfigStore
+from app.services.index_const import CORE_INDEX_NAMES, CORE_INDEX_SYMBOLS
 from app.services.screener import ScreenerService
 
 # ================================================================
-# 常量(与 overview.py 保持同步;复盘复盘仅 A 股核心指数)
+# 常量(核心指数清单单一权威: app.services.index_const)
 # ================================================================
-
-CORE_INDEX_NAMES = {
-    "000001.SH": "上证指数",
-    "399001.SZ": "深证成指",
-    "399006.SZ": "创业板指",
-    "000680.SH": "科创综指",
-}
-CORE_INDEX_SYMBOLS = tuple(CORE_INDEX_NAMES.keys())
 
 _DIMENSION_SEP = re.compile(r"[、,，;；|/\s]+")
 
@@ -278,10 +272,12 @@ def _dimension_rank(
 
     store = ExtConfigStore(repo.store.data_dir)
     groups: dict[str, dict[str, dict]] = {}
+    group_source: dict[str, str] = {}  # 组名 → 首个命中的扩展字段 "configId.field" (看板成分股弹窗用)
     for config in store.load_all():
         field = _dimension_field(config, kind)
         if not field:
             continue
+        source_field = f"{config.id}.{field}"
         for ext_row in _read_ext_rows(repo.store.data_dir, config, field, as_of):
             quote = None
             for key in _symbol_keys(ext_row, config):
@@ -297,6 +293,7 @@ def _dimension_rank(
                     parts = value.split("-")
                     value = parts[level - 1] if level <= len(parts) else parts[-1]
                 groups.setdefault(value, {})[symbol] = quote
+                group_source.setdefault(value, source_field)
 
     items = []
     for name, by_symbol in groups.items():
@@ -313,6 +310,7 @@ def _dimension_rank(
             "up_count": sum(1 for v in changes if v > 0),
             "down_count": sum(1 for v in changes if v < 0),
             "amount": sum(_finite(s.get("amount")) or 0 for s in stocks),
+            "source_field": group_source.get(name),
             "leader": {
                 "symbol": leader.get("symbol"),
                 "name": leader.get("name"),
@@ -391,12 +389,17 @@ def build_market_overview(
         as_of: 指定日期,None 则取最新有数据日。
     """
     svc = ScreenerService(repo)
-    # 调用方未指定日期时视为"最新"请求: 指数行情走实时缓存 (quote_service),
-    # 其余装配仍以解析出的真实日期为准。显式指定日期(历史复盘)时才回退数据库。
+    # 未指定日期时仍先解析实际业务日；只有该业务日确为北京时间今天，才允许
+    # 使用实时指数与无生效日期的 snapshot 维表。日线滞后时必须保持同一时点。
     explicit_as_of = as_of is not None
     as_of = as_of or svc.latest_date()
+    allow_current_snapshot = not explicit_as_of and as_of == cn_today()
     status = _quote_status(quote_service)
-    indices = _index_quotes(repo, quote_service, None if not explicit_as_of else as_of)
+    indices = _index_quotes(
+        repo,
+        quote_service,
+        None if allow_current_snapshot else as_of,
+    )
 
     if not as_of:
         return {
@@ -539,7 +542,7 @@ def build_market_overview(
     avg_vol_ratio = sum(vol_ratios) / len(vol_ratios) if vol_ratios else 1
     high_vol_ratio = sum(1 for v in vol_ratios if v >= 1.5)
 
-    dimension_as_of = as_of if explicit_as_of else None
+    dimension_as_of = None if allow_current_snapshot else as_of
     concept_rank = _dimension_rank(rows, repo, "concept", as_of=dimension_as_of)
     industry_rank = _dimension_rank(
         rows, repo, "industry", level=2, as_of=dimension_as_of

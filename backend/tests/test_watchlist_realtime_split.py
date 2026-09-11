@@ -12,7 +12,7 @@ def test_split_records_by_asset():
     assert [r["symbol"] for r in index] == ["000001.SH"]
     assert [r["symbol"] for r in etf] == ["510300.SH"]
     assert [r["symbol"] for r in stock] == ["600000.SH"]
-    # etf 优先于 index (与 resolve_asset_type 判定顺序一致)
+    # ETF 优先于指数, 与 resolve_asset_type 判定顺序一致。
     index2, etf2, stock2 = QuoteService._split_records_by_asset(
         [{"symbol": "X"}], {"X"}, {"X"},
     )

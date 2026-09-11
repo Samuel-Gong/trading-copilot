@@ -1,4 +1,4 @@
-"""指数 API。"""
+"""指数 API (核心四只固定清单, 浏览/搜索全量指数已下线; 仅保留详情读数与同步)。"""
 from __future__ import annotations
 
 import logging
@@ -27,47 +27,6 @@ def _index_info(repo, symbol: str) -> dict:
     return hit.to_dicts()[0]
 
 
-@router.get("/list")
-def list_indices(request: Request):
-    """返回已缓存的 CN_Index 指数列表。"""
-    repo = request.app.state.repo
-    df = repo.get_index_instruments()
-    if df.is_empty():
-        return {"results": [], "count": 0}
-    cols = [c for c in ["symbol", "name", "code", "asset_type"] if c in df.columns]
-    rows = df.select(cols).sort("symbol").to_dicts()
-    return {"results": rows, "count": len(rows)}
-
-
-@router.get("/search")
-def search_indices(
-    request: Request,
-    q: str = Query("", min_length=0, max_length=50, description="搜索关键词"),
-    limit: int = Query(20, ge=1, le=100),
-):
-    """模糊搜索指数。"""
-    repo = request.app.state.repo
-    df = repo.get_index_instruments()
-    if df.is_empty():
-        return {"results": []}
-    if not q.strip():
-        rows = df.head(limit).to_dicts()
-        return {"results": rows}
-
-    keyword = q.strip().upper()
-    masks = []
-    if "code" in df.columns:
-        masks.append(pl.col("code").cast(pl.Utf8).str.contains(keyword, literal=True))
-    masks.append(pl.col("symbol").cast(pl.Utf8).str.to_uppercase().str.contains(keyword, literal=True))
-    if "name" in df.columns:
-        masks.append(pl.col("name").cast(pl.Utf8).str.contains(q.strip(), literal=True))
-
-    mask = masks[0]
-    for m in masks[1:]:
-        mask = mask | m
-    rows = df.filter(mask).head(limit).to_dicts()
-    return {"results": rows}
-
 
 @router.get("/daily")
 def get_index_daily(
@@ -92,9 +51,11 @@ def get_index_daily(
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 
     try:
-        raw = kline_sync.sync_daily_batch([symbol], count=days + 150)
+        raw = kline_sync.fetch_daily_routed(
+            [symbol], capset, count=days + 150, asset_type="index",
+        )
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"TickFlow fetch failed: {e}") from e
+        raise HTTPException(status_code=502, detail=f"指数日 K 拉取失败: {e}") from e
     if raw.is_empty():
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 

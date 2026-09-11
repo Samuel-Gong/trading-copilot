@@ -20,10 +20,12 @@ from app import secrets_store
 from app.config import settings
 
 OPENAI_COMPAT_PROVIDER = "openai_compat"
+OPENAI_PROVIDER = "openai"
 CODEX_CLI_PROVIDER = "codex_cli"
 CODEX_DEFAULT_COMMAND = "codex"
 CODEX_SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 CODEX_NO_PROXY = "127.0.0.1,localhost,::1,host.docker.internal"
+OPENAI_DEFAULT_REASONING_EFFORT = "high"
 
 _CODEX_PROXY_ENV_NAMES = (
     "HTTP_PROXY",
@@ -32,6 +34,26 @@ _CODEX_PROXY_ENV_NAMES = (
     "http_proxy",
     "https_proxy",
     "all_proxy",
+)
+
+# Codex CLI 在这里用于文本生成，关闭当前版本可识别的执行、联网与扩展能力。
+# 工具清单不一定为空；只读沙箱的实际写入拒绝由 canary 测试验证，
+# 不把这份禁用列表当作任意本机文件读取已被隔离的证明。
+_CODEX_DISABLED_LOCAL_FEATURES = (
+    "apps",
+    "browser_use",
+    "code_mode",
+    "computer_use",
+    "deferred_executor",
+    "image_generation",
+    "goals",
+    "multi_agent",
+    "plugins",
+    "shell_snapshot",
+    "shell_tool",
+    "skill_search",
+    "unified_exec",
+    "view_image",
 )
 
 _CODEX_ENV_ALLOWLIST = (
@@ -72,8 +94,8 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 # ----------------------------------------------------------------
-# 用户 focus 输入净化 — 防止通过"特别关注"绕过红线诱导 AI 给出买卖建议
-# 命中任一敏感词时,整个 focus 被丢弃(返回空串),由各 analyzer 据此跳过注入。
+# 用户 focus 输入规范化。交易建议类表达不会被静默丢弃,而是由统一提示词
+# 转换成客观价位、风险和情景分析,避免历史报告显示了 focus、模型却没有收到。
 # ----------------------------------------------------------------
 _FOCUS_BLOCKLIST = re.compile(
     r"买入|卖出|加仓|减仓|轻仓|重仓|半仓|全仓|仓位|止损|止盈|"
@@ -87,29 +109,118 @@ _FOCUS_BLOCKLIST = re.compile(
 
 
 def sanitize_focus(focus: str) -> str:
-    """净化用户输入的 focus 文本。
-
-    命中交易指令/投资建议类敏感词时返回空串,阻止其注入 AI 提示词。
-    这是对系统提示词红线的兜底:即便用户试图通过 focus 绕过,也不会生效。
-    """
+    """规范化 focus 中的首尾空白与连续换行。"""
     if not focus:
         return ""
-    text = focus.strip()
+    text = re.sub(r"\s+", " ", focus).strip()
+    return text
+
+
+def build_focus_instruction(focus: str, *, report_name: str = "分析报告") -> str:
+    """构建所有报告共用的关注重点指令。
+
+    有关注点时要求模型在固定报告结构之前先直接回应。若原问题涉及交易
+    建议,保留问题语义但要求转换成中立的数据分析,不再无提示地整段丢弃。
+    """
+    text = sanitize_focus(focus)
     if not text:
         return ""
+
+    lines = [
+        "## 用户关注重点(必须优先回应)",
+        f"用户关注: {text}",
+        f"请在完整{report_name}最前面先输出 `### 0. 🔎 关注重点回应`,"
+        "用 2-4 条带具体数据的结论直接回应;随后继续完成既定报告结构,"
+        "并在相关章节加深分析。不要只复述问题。",
+    ]
     if _FOCUS_BLOCKLIST.search(text):
-        return ""
-    return text
+        lines.append(
+            "该关注点含有买卖、仓位、目标价或预测类表达。不得给出相应操作结论;"
+            "请将其转换为客观的技术/财务状态、关键价位、风险因素和条件情景后回应。"
+        )
+    return "\n".join(lines)
 
 
 def current_ai_provider() -> str:
     return secrets_store.get_ai_config("ai_provider", settings.ai_provider) or OPENAI_COMPAT_PROVIDER
 
 
+def current_openai_model() -> str:
+    return secrets_store.get_ai_config("ai_model", settings.ai_model)
+
+
+def current_codex_model() -> str:
+    stored = secrets_store.load()
+    model = stored.get("ai_codex_model")
+    # 旧版本的两种 provider 共用 ai_model。仅在旧配置仍启用 Codex 时回退读取,
+    # 避免把正常的 OpenAI-compatible 模型误当作 Codex 模型。
+    if model is None and current_ai_provider() == CODEX_CLI_PROVIDER:
+        model = stored.get("ai_model")
+    return normalize_codex_model(str(model or ""))
+
+
 def current_ai_model() -> str:
     if current_ai_provider() == CODEX_CLI_PROVIDER:
-        return normalize_codex_model(str(secrets_store.load().get("ai_model") or ""))
-    return secrets_store.get_ai_config("ai_model", settings.ai_model)
+        return current_codex_model()
+    return current_openai_model()
+
+
+def current_openai_reasoning_effort() -> str:
+    stored = secrets_store.load()
+    if "ai_reasoning_effort" not in stored:
+        return OPENAI_DEFAULT_REASONING_EFFORT
+    return str(stored.get("ai_reasoning_effort") or "").strip()
+
+
+def current_ai_max_output_tokens() -> int:
+    """当前 AI 输出上限 (max_tokens): secrets.json 优先, 否则 config 默认。"""
+    return secrets_store.get_ai_config_int("ai_max_output_tokens", settings.ai_max_output_tokens)
+
+
+def current_ai_context_window() -> int:
+    """当前 AI 输入上下文窗口上限 (约 token): secrets.json 优先, 否则 config 默认。"""
+    return secrets_store.get_ai_config_int("ai_context_window", settings.ai_context_window)
+
+
+def _resolve_max_tokens(max_tokens: int | None) -> int | None:
+    """显式传入的 max_tokens 钳制到配置输出上限; None 保持 None。
+
+    None = 不传该参数(推理型模型的思考 token 计入 max_tokens 预算,
+    显式限制会挤占正文, 语义见 generate_ai_text), 不能映射成配置上限。
+    """
+    if max_tokens is None:
+        return None
+    cap = current_ai_max_output_tokens()
+    return max(1, min(int(max_tokens), cap))
+
+
+def _estimate_input_tokens(messages: Sequence[Message]) -> int:
+    """粗略估算输入 token 数: 中文按 1 字 1 token, 其余按 4 字符 1 token。"""
+    total = 0
+    for m in messages:
+        text = str(m.get("content") or "")
+        cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+        total += cjk + (len(text) - cjk) // 4 + 1
+    return max(1, total)
+
+
+def _check_input_budget(messages: Sequence[Message], *, max_tokens: int | None) -> None:
+    """输入估算超出上下文窗口时给出明确报错, 避免上游 400 或静默截断。
+
+    token 计数不精确, 仅作安全网: 用中/英文混合估算, 只有明显超窗才拒绝;
+    用户可在 AI 设置里调大『上下文窗口』。max_tokens=None(输出放开)时用
+    配置上限作输出预留估计。
+    """
+    context_window = current_ai_context_window()
+    if context_window <= 0:
+        return
+    output_reserve = max_tokens if max_tokens is not None else current_ai_max_output_tokens()
+    est = _estimate_input_tokens(messages)
+    if est + output_reserve > context_window:
+        raise ValueError(
+            f"输入过长: 估算输入约 {est} tokens, 加上输出预算 {max_tokens} tokens, "
+            f"超过上下文窗口 {context_window}。请缩短输入, 或在 AI 设置中调大『上下文窗口』。"
+        )
 
 
 def current_codex_command() -> str:
@@ -177,11 +288,25 @@ def normalize_openai_base_url(url: str) -> str:
 
 
 def codex_cli_available() -> bool:
+    """Codex CLI 是否真正可用: 解析命令后实跑一次 --version。
+
+    仅 which 到二进制不够 — npm 壳缺平台原生二进制时同样存在于 PATH,
+    但一运行就报错(如 "Codex CLI not available"), 状态页会误报已连接。
+    """
     try:
-        _codex_base_command()
-        return True
+        base = _codex_base_command()
     except RuntimeError:
         return False
+    try:
+        proc = subprocess.run(
+            [*base, "--version"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
 
 
 def ai_configured(provider: str | None = None) -> bool:
@@ -195,10 +320,18 @@ async def generate_ai_text(
     messages: Sequence[Message],
     *,
     temperature: float | None = 0.3,
-    max_tokens: int = 3000,
+    max_tokens: int | None = 3000,
     timeout: float = 180.0,
 ) -> str:
-    """Return a complete AI response from the currently configured provider."""
+    """Return a complete AI response from the currently configured provider.
+
+    max_tokens=None 表示不传该参数(输出上限交给服务端默认) — 推理型模型
+    (如 deepseek reasoner 系)的思考 token 计入 max_tokens 预算, 显式限制
+    会挤占正文甚至全部吃光(正文 0 字 + finish=length), 长分析类调用应放开。
+    显式传入的数值会被钳制到配置的输出上限 (AI 设置可调)。
+    """
+    max_tokens = _resolve_max_tokens(max_tokens)
+    _check_input_budget(messages, max_tokens=max_tokens)
     if is_codex_cli_provider():
         return await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
     return await _run_openai_once(
@@ -213,14 +346,20 @@ async def stream_ai_text(
     messages: Sequence[Message],
     *,
     temperature: float | None = 0.5,
-    max_tokens: int = 4000,
+    max_tokens: int | None = 4000,
     timeout: float = 180.0,
+    prefer_final_answer: bool = False,
 ) -> AsyncIterator[str]:
     """Yield text deltas from the configured provider.
 
     Codex CLI only exposes the final assistant message for this use case, so it
-    yields one complete chunk after the command exits.
+    yields one complete chunk after the command exits. ``prefer_final_answer``
+    lets compatible providers prioritize visible content over hidden reasoning.
+
+    max_tokens=None 表示不限制输出(同 generate_ai_text 的说明)。
     """
+    max_tokens = _resolve_max_tokens(max_tokens)
+    _check_input_budget(messages, max_tokens=max_tokens)
     if is_codex_cli_provider():
         yield await _run_codex_cli(messages, max_tokens=max_tokens, timeout=max(timeout, 600.0))
         return
@@ -230,6 +369,7 @@ async def stream_ai_text(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
+        prefer_final_answer=prefer_final_answer,
     ):
         yield chunk
 
@@ -238,7 +378,7 @@ async def _run_openai_once(
     messages: Sequence[Message],
     *,
     temperature: float | None,
-    max_tokens: int,
+    max_tokens: int | None,
     timeout: float,
 ) -> str:
     ai_key = secrets_store.get_ai_key()
@@ -248,23 +388,20 @@ async def _run_openai_once(
     client = _openai_client(ai_key, timeout)
     model = current_ai_model()
     req_messages = list(messages)
-    try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=req_messages,
-            **_openai_kwargs(temperature=temperature, max_tokens=max_tokens),
-        )
-    except Exception as exc:
-        # Reasoning 类模型 (如 kimi-k2.7-code, deepseek-r1, o 系列) 拒绝非约定
-        # temperature (Moonshot 报 "only 1 is allowed for this model")。不再靠
-        # 模型名猜测, 而是捕获该错误后去掉 temperature 重试一次 —— 对所有此类模型都稳。
-        if temperature is not None and _is_temperature_rejected(exc):
+    kwargs = _openai_kwargs(temperature=temperature, max_tokens=max_tokens)
+    while True:
+        try:
             resp = await client.chat.completions.create(
                 model=model,
                 messages=req_messages,
-                **_openai_kwargs(temperature=None, max_tokens=max_tokens),
+                **kwargs,
             )
-        else:
+            break
+        except Exception as exc:
+            retry_kwargs = _openai_retry_kwargs(exc, kwargs)
+            if retry_kwargs is not None:
+                kwargs = retry_kwargs
+                continue
             if _is_openai_transport_error(exc):
                 raise RuntimeError(_format_openai_error(exc)) from exc
             raise
@@ -277,8 +414,9 @@ async def _stream_openai(
     messages: Sequence[Message],
     *,
     temperature: float | None,
-    max_tokens: int,
+    max_tokens: int | None,
     timeout: float,
+    prefer_final_answer: bool,
 ) -> AsyncIterator[str]:
     ai_key = secrets_store.get_ai_key()
     if not ai_key:
@@ -286,42 +424,89 @@ async def _stream_openai(
 
     client = _openai_client(ai_key, timeout)
     model = current_ai_model()
+    base_url = secrets_store.get_ai_config("ai_base_url", settings.ai_base_url)
     req_messages = list(messages)
 
-    async def _iter(stream):
-        async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta and delta.content:
-                yield delta.content
-
-    try:
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=req_messages,
-            **_openai_kwargs(temperature=temperature, max_tokens=max_tokens),
-            stream=True,
-        )
-    except Exception as exc:
-        # 流尚未开始 yield, 可安全重建: 去掉 temperature 后重开 stream。
-        if temperature is not None and _is_temperature_rejected(exc):
+    kwargs = _openai_kwargs(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        model=model,
+        base_url=base_url,
+        prefer_final_answer=prefer_final_answer,
+    )
+    while True:
+        try:
             stream = await client.chat.completions.create(
                 model=model,
                 messages=req_messages,
-                **_openai_kwargs(temperature=None, max_tokens=max_tokens),
+                **kwargs,
                 stream=True,
             )
-        else:
+            break
+        except Exception as exc:
+            # 流尚未开始 yield, 可安全移除被拒绝的可选参数后重建。
+            retry_kwargs = _openai_retry_kwargs(exc, kwargs)
+            if retry_kwargs is not None:
+                kwargs = retry_kwargs
+                continue
             if _is_openai_transport_error(exc):
                 raise RuntimeError(_format_openai_error(exc)) from exc
             raise
 
     try:
-        async for piece in _iter(stream):
+        async for piece in _iter_openai_text(stream):
             yield piece
     except Exception as exc:
         if _is_openai_transport_error(exc):
             raise RuntimeError(_format_openai_error(exc)) from exc
         raise
+
+
+_LENGTH_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
+
+
+async def _iter_openai_text(stream) -> AsyncIterator[str]:
+    """Normalize an OpenAI-compatible stream into complete text deltas.
+
+    Reasoning models may spend the entire completion budget on
+    ``reasoning_content`` and finish with HTTP 200 but no user-visible text.
+    Treat that response, and any length-truncated partial response, as a
+    terminal generation error instead of silently reporting success.
+    """
+    content_seen = False
+    reasoning_seen = False
+    finish_reason = ""
+
+    async for chunk in stream:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice = choices[0]
+        reason = getattr(choice, "finish_reason", None)
+        if reason:
+            finish_reason = str(reason)
+
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        if getattr(delta, "reasoning_content", None):
+            reasoning_seen = True
+        content = getattr(delta, "content", None)
+        if content:
+            content_seen = True
+            yield content
+
+    if finish_reason in _LENGTH_FINISH_REASONS:
+        if reasoning_seen and not content_seen:
+            raise RuntimeError(
+                "AI 推理达到输出长度上限, 未生成正文; 请提高输出 Token 上限或改用非推理模型"
+            )
+        raise RuntimeError("AI 输出达到长度上限, 内容不完整; 请提高输出 Token 上限后重试")
+
+    if not content_seen:
+        if reasoning_seen:
+            raise RuntimeError("AI 仅返回推理内容, 未生成正文; 请检查模型配置或改用非推理模型")
+        raise RuntimeError("AI 服务未返回正文内容; 请检查模型配置或稍后重试")
 
 
 def _openai_client(api_key: str, timeout: float):
@@ -337,11 +522,11 @@ def _openai_client(api_key: str, timeout: float):
     )
 
 
-# Reasoning / thinking 类模型 (kimi-k2.7-code, deepseek-r1, OpenAI o 系列等) 不接受
-# 任意 temperature, 上游会以 400 拒绝 (如 Moonshot: "only 1 is allowed for this model")。
-# 这里不靠模型名猜测, 而是在真正命中该错误后自动去掉 temperature 重试 (见
-# _run_openai_once / _stream_openai), 对任意 reasoning 模型都稳健。
-_TEMP_REJECT_HINTS = ("temperature", "only 1 is allowed", "unsupported parameter")
+# 不同模型可能拒绝 temperature 或 reasoning_effort。这里不靠模型名猜测,
+# 只在 400 明确指出对应参数时移除该参数并重试; 每个参数最多移除一次。
+_TEMP_REJECT_HINTS = ("temperature", "only 1 is allowed")
+_REASONING_EFFORT_REJECT_HINTS = ("reasoning_effort", "reasoning effort")
+_THINKING_BODY_REJECT_HINTS = ("thinking",)
 
 
 def _is_temperature_rejected(exc: Exception) -> bool:
@@ -349,14 +534,92 @@ def _is_temperature_rejected(exc: Exception) -> bool:
     if getattr(exc, "status_code", None) != 400:
         return False
     text = _openai_error_detail(exc) or str(exc)
-    return any(h in text.lower() for h in _TEMP_REJECT_HINTS)
+    return _openai_error_param(exc) == "temperature" or any(
+        h in text.lower() for h in _TEMP_REJECT_HINTS
+    )
 
 
-def _openai_kwargs(*, temperature: float | None, max_tokens: int) -> dict:
-    """Build OpenAI create() kwargs; temperature omitted when None."""
-    kwargs: dict = {"max_tokens": max_tokens}
+def _is_reasoning_effort_rejected(exc: Exception) -> bool:
+    """True if the upstream 400 specifically rejects reasoning_effort."""
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    text = _openai_error_detail(exc) or str(exc)
+    return _openai_error_param(exc) == "reasoning_effort" or any(
+        h in text.lower() for h in _REASONING_EFFORT_REJECT_HINTS
+    )
+
+
+def _is_thinking_body_rejected(exc: Exception) -> bool:
+    """True if the upstream 400 specifically rejects the thinking extra_body."""
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    text = _openai_error_detail(exc) or str(exc)
+    return _openai_error_param(exc) == "thinking" or any(
+        h in text.lower() for h in _THINKING_BODY_REJECT_HINTS
+    )
+
+
+def _openai_error_param(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return ""
+    error = body.get("error")
+    if isinstance(error, dict):
+        body = error
+    return str(body.get("param") or "").strip().lower()
+
+
+def _openai_retry_kwargs(exc: Exception, kwargs: dict) -> dict | None:
+    """Remove one explicitly rejected optional argument for a bounded retry."""
+    retry_kwargs = dict(kwargs)
+    if "temperature" in retry_kwargs and _is_temperature_rejected(exc):
+        retry_kwargs.pop("temperature")
+        return retry_kwargs
+    if "reasoning_effort" in retry_kwargs and _is_reasoning_effort_rejected(exc):
+        retry_kwargs.pop("reasoning_effort")
+        return retry_kwargs
+    if "extra_body" in retry_kwargs and _is_thinking_body_rejected(exc):
+        # DeepSeek thinking 禁用参数被拒 (模型/API 版本差异): 回退默认思考模式
+        # 重试; 报告若因此被推理挤占正文, 由 _iter_openai_text 显式报错。
+        retry_kwargs.pop("extra_body")
+        return retry_kwargs
+    return None
+
+
+_DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+
+
+def _openai_kwargs(
+    *,
+    temperature: float | None,
+    max_tokens: int | None,
+    model: str = "",
+    base_url: str = "",
+    prefer_final_answer: bool = False,
+) -> dict:
+    """Build OpenAI create() kwargs and map supported provider capabilities.
+
+    max_tokens=None 时不传 — 由服务端默认上限管理(推理模型的思考 token 也
+    计入该参数预算, 限制会挤占正文, 见 stream_ai_text 文档)。
+    """
+    kwargs: dict = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if current_ai_provider() == OPENAI_PROVIDER:
+        reasoning_effort = current_openai_reasoning_effort()
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+    if (
+        prefer_final_answer
+        and model.strip().lower() in _DEEPSEEK_V4_MODELS
+        and urlsplit(base_url.strip()).hostname == "api.deepseek.com"
+    ):
+        # DeepSeek V4 defaults to thinking mode. For report-style tasks the
+        # hidden reasoning shares max_tokens with the final answer and can
+        # exhaust the budget before any visible content is emitted.
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     return kwargs
 
 
@@ -453,7 +716,7 @@ def _compact_error_text(text: str) -> str:
 async def _run_codex_cli(
     messages: Sequence[Message],
     *,
-    max_tokens: int,
+    max_tokens: int | None,
     timeout: float,
 ) -> str:
     prompt = _codex_prompt(messages, max_tokens=max_tokens)
@@ -465,11 +728,20 @@ async def _run_codex_cli(
         workspace_path.mkdir()
         output_path = codex_home_path / "last-message.txt"
         _prepare_codex_home(codex_home_path)
+        base_command = _codex_base_command()
+        env = _codex_process_env(codex_home_path)
+        disabled_features = _supported_codex_features(
+            base_command,
+            env,
+            _CODEX_DISABLED_LOCAL_FEATURES,
+        )
 
+        # 不传 --ephemeral: 老版本 codex(如 0.58)无此参数, 传了直接报
+        # unexpected argument; 会话隔离已由一次性临时 CODEX_HOME 保证(跑完即删)。
         args = [
-            *_codex_base_command(),
+            *base_command,
             "exec",
-            "--ephemeral",
+            "--strict-config",
             "--sandbox",
             "read-only",
             "--skip-git-repo-check",
@@ -477,13 +749,15 @@ async def _run_codex_cli(
             "never",
             "--output-last-message",
             str(output_path),
+            "-c",
+            'web_search="disabled"',
         ]
+        for feature in disabled_features:
+            args.extend(["--disable", feature])
         model = current_ai_model().strip()
         if model:
             args.extend(["--model", model])
         args.extend(["--cd", str(workspace_path), "-"])
-
-        env = _codex_process_env(codex_home_path)
 
         returncode, stdout, stderr = await asyncio.to_thread(
             _run_codex_process,
@@ -525,6 +799,33 @@ def _run_codex_process(
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Codex CLI 调用超时, 请稍后重试或检查本机 Codex 登录状态") from exc
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _supported_codex_features(
+    base_command: Sequence[str],
+    env: dict[str, str],
+    required_disabled: Sequence[str],
+) -> tuple[str, ...]:
+    """只传当前 CLI 认识的禁用项；能力清单探测失败时拒绝继续。"""
+    try:
+        completed = subprocess.run(
+            [*base_command, "features", "list"],
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Codex CLI 能力清单探测失败") from exc
+    if completed.returncode != 0:
+        detail = _clean_process_text(completed.stderr) or _clean_process_text(completed.stdout)
+        raise RuntimeError(f"Codex CLI 能力清单探测失败: {detail[-600:]}")
+    available = {
+        line.split(maxsplit=1)[0]
+        for line in _clean_process_text(completed.stdout).splitlines()
+        if line.strip()
+    }
+    return tuple(feature for feature in required_disabled if feature in available)
 
 
 def _codex_process_env(codex_home_path: Path) -> dict[str, str]:
@@ -599,14 +900,14 @@ def _make_writable_and_retry(
         raise exc_info[1] from None
 
 
-def _codex_prompt(messages: Sequence[Message], *, max_tokens: int) -> str:
+def _codex_prompt(messages: Sequence[Message], *, max_tokens: int | None) -> str:
     parts = [
-        "You are TickFlow Stock Panel's local AI provider.",
+        "You are Tick Stock Panel's local AI provider.",
         "This is a text-generation task. The working directory is intentionally empty.",
         "Use only the user-provided prompt content below; do not inspect or modify local files.",
         "Return only the final requested content; do not include execution logs.",
     ]
-    if max_tokens > 0:
+    if max_tokens:
         parts.append(f"Keep the final answer within about {max_tokens} output tokens.")
     for message in messages:
         role = message.get("role", "user")
@@ -715,10 +1016,14 @@ def _codex_home() -> Path:
 def _write_compatible_codex_config(path: Path) -> None:
     config = _read_codex_config()
     lines: list[str] = []
-    local_provider = _docker_codex_local_provider(config)
+    active_provider = _active_codex_provider(config)
 
-    if local_provider:
-        lines.append(_toml_string("model_provider", "codex_local_access"))
+    if active_provider:
+        lines.append(_toml_string("model_provider", active_provider[0]))
+
+    openai_base_url = config.get("openai_base_url")
+    if isinstance(openai_base_url, str) and openai_base_url:
+        lines.append(_toml_string("openai_base_url", openai_base_url))
 
     model = current_ai_model() or normalize_codex_model(str(config.get("model") or ""))
     if model:
@@ -733,41 +1038,43 @@ def _write_compatible_codex_config(path: Path) -> None:
     lines.append(_toml_string("approval_policy", "never"))
     lines.append(_toml_string("sandbox_mode", "read-only"))
 
-    if local_provider:
+    if active_provider:
+        provider_name, provider = active_provider
         lines.append("")
-        lines.append("[model_providers.codex_local_access]")
+        lines.append(f"[model_providers.{_toml_key(provider_name)}]")
         for key in ("name", "base_url", "wire_api", "experimental_bearer_token"):
-            value = local_provider.get(key)
+            value = provider.get(key)
             if isinstance(value, str) and value:
                 lines.append(_toml_string(key, value))
         for key in ("requires_openai_auth", "supports_websockets"):
-            value = local_provider.get(key)
+            value = provider.get(key)
             if isinstance(value, bool):
                 lines.append(f"{key} = {'true' if value else 'false'}")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _docker_codex_local_provider(config: dict) -> dict | None:
-    """Return the local-access provider adapted to Docker's host gateway."""
-    docker_host = os.environ.get("CODEX_DOCKER_HOST", "").strip()
-    if not docker_host or config.get("model_provider") != "codex_local_access":
+def _active_codex_provider(config: dict) -> tuple[str, dict] | None:
+    """Return the active custom provider, adapting loopback URLs for Docker."""
+    provider_name = config.get("model_provider")
+    if not isinstance(provider_name, str) or not provider_name:
         return None
 
     providers = config.get("model_providers")
     if not isinstance(providers, dict):
         return None
-    source = providers.get("codex_local_access")
+    source = providers.get(provider_name)
     if not isinstance(source, dict):
         return None
 
     provider = dict(source)
     base_url = str(provider.get("base_url") or "").strip()
     parsed = urlsplit(base_url)
-    if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+    docker_host = os.environ.get("CODEX_DOCKER_HOST", "").strip()
+    if docker_host and parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
         port = f":{parsed.port}" if parsed.port else ""
         provider["base_url"] = urlunsplit(parsed._replace(netloc=f"{docker_host}{port}"))
-    return provider
+    return provider_name, provider
 
 
 def _read_codex_config() -> dict:
@@ -799,6 +1106,13 @@ def _read_codex_config_lenient(path: Path) -> dict:
 def _toml_string(key: str, value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'{key} = "{escaped}"'
+
+
+def _toml_key(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _clean_process_text(raw: bytes) -> str:

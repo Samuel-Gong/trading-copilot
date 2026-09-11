@@ -153,7 +153,7 @@ def test_capability_recovery_waits_for_blocked_poll_thread_to_exit(monkeypatch):
     fetch_count_lock = threading.Lock()
     allowed = {"value": True}
 
-    def fetch_quotes(*, final=False):  # noqa: ARG001
+    def fetch_quotes(*, final=False, final_boundary_ms=None):
         nonlocal fetch_count
         with fetch_count_lock:
             fetch_count += 1

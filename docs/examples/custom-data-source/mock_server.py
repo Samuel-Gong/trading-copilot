@@ -56,6 +56,15 @@ def _parse_date(value: Any, fallback: date) -> date:
         return fallback
 
 
+@app.get("/instruments")
+async def instruments():
+    """与模拟日K使用同一个标的集合，不提供虚构历史股本。"""
+    return {
+        "code": 0,
+        "data": [{"ts_code": symbol, "name": name} for symbol, name in SYMBOLS.items()],
+    }
+
+
 @app.api_route("/daily", methods=["GET", "POST"])
 async def daily(request: Request):
     body = await _payload(request)

@@ -1,9 +1,11 @@
 import { useState, type ReactNode } from 'react'
-import { Settings2, RadioTower, Star } from 'lucide-react'
+import { Settings2, RadioTower, Star, ExternalLink } from 'lucide-react'
 import type { KlineRow, FinancialMetricRecord } from '@/lib/api'
 import { fmtPrice, fmtBigNum, fmtVolume } from '@/lib/format'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
+import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { INFO_GROUPS, type ColumnConfig } from '@/lib/stock-info-fields'
+import { buildStockExternalUrl, loadStockExternalTemplate } from '@/lib/stock-external-link'
 
 const BULL = '#C74040'
 const BEAR = '#2D9B65'
@@ -20,9 +22,11 @@ interface Props {
   financialMetrics?: FinancialMetricRecord
   /** 加监控回调 (个股弹窗传入, 有值时渲染 RadioTower 图标) */
   onMonitor?: () => void
-  /** 加自选回调 + 是否已自选 (有 onToggle 时渲染 Star 图标) */
+  /** 自选状态与操作（传入对应回调时渲染 Star 图标） */
   inWatchlist?: boolean
-  onToggleWatchlist?: () => void
+  onAddToWatchlist?: (groupId: string | null) => void
+  onRemoveFromWatchlist?: () => void
+  watchlistPending?: boolean
 }
 
 /**
@@ -91,7 +95,20 @@ function renderExtInline(
   )
 }
 
-export function StockInfoBar({ symbol, name, stockInfo, rows, fields, onFieldsChange, financialMetrics, onMonitor, inWatchlist, onToggleWatchlist }: Props) {
+export function StockInfoBar({
+  symbol,
+  name,
+  stockInfo,
+  rows,
+  fields,
+  onFieldsChange,
+  financialMetrics,
+  onMonitor,
+  inWatchlist,
+  onAddToWatchlist,
+  onRemoveFromWatchlist,
+  watchlistPending,
+}: Props) {
   // 弹窗开关：纯本地状态，与数据/配置无关，放早期 return 之前
   const [customizerOpen, setCustomizerOpen] = useState(false)
   // ext 标签展开状态：按 symbol::colId，切股/切字段时互不干扰
@@ -106,7 +123,32 @@ export function StockInfoBar({ symbol, name, stockInfo, rows, fields, onFieldsCh
     })
   }
 
-  if (rows.length === 0) return null
+  // 字段分组: 加载态预留高度与完整态渲染共用同一规则
+  const visibleFields = fields.filter(f => f.visible)
+  const inlineFields = visibleFields.filter(f => !f.standalone)
+  const standaloneFields = visibleFields.filter(f => f.standalone)
+
+  // 无数据时保持信息条挂载 (切股/首次加载): 只留 symbol+名称+小 spinner 作为加载态,
+  // 不渲染假占位值; 数据到位后价格/市值等原位填充, 避免整行消失造成布局跳动。
+  // 同时按字段配置预留与完整态相同的行数, 切股瞬间弹窗整体高度不塌陷 (不抖动)。
+  if (rows.length === 0) {
+    const reserveLines = (inlineFields.length > 0 ? 1 : 0) + standaloneFields.length
+    return (
+      <div className="px-2 pb-3 font-mono text-[12px] select-none space-y-1">
+        {/* 首行 min-h-7 对齐完整态的 text-lg 价格行高, 加载中不整体变矮 */}
+        <div className="flex min-h-7 items-baseline gap-x-3 flex-wrap">
+          <span className="text-foreground font-bold text-sm tracking-wide">{symbol}</span>
+          {name && <span className="text-secondary font-medium">{name}</span>}
+          <span className="ml-auto self-center text-muted">
+            <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-[1.5px] border-current border-t-transparent" />
+          </span>
+        </div>
+        {Array.from({ length: reserveLines }).map((_, i) => (
+          <div key={i} className="h-4" />
+        ))}
+      </div>
+    )
+  }
 
   const latest = rows[rows.length - 1]
   const prev = rows.length >= 2 ? rows[rows.length - 2] : null
@@ -167,11 +209,6 @@ export function StockInfoBar({ symbol, name, stockInfo, rows, fields, onFieldsCh
     }
   }
 
-  const visibleFields = fields.filter(f => f.visible)
-  // 按是否单独显示分组：普通列共一行，standalone 列各占一行
-  const inlineFields = visibleFields.filter(f => !f.standalone)
-  const standaloneFields = visibleFields.filter(f => f.standalone)
-
   // 渲染单个字段（builtin / ext 通用）
   const renderField = (f: ColumnConfig): ReactNode => {
     if (f.source.type === 'ext') {
@@ -199,6 +236,8 @@ export function StockInfoBar({ symbol, name, stockInfo, rows, fields, onFieldsCh
     )
   }
 
+  const extUrl = buildStockExternalUrl(loadStockExternalTemplate(), symbol)
+
   return (
     <div className="px-2 pb-3 font-mono text-[12px] select-none space-y-1">
       {/* Row 1: code, name, price, change, change% */}
@@ -214,17 +253,40 @@ export function StockInfoBar({ symbol, name, stockInfo, rows, fields, onFieldsCh
         <span style={{ color: clr }} className="tabular-nums">
           {isUp ? '+' : ''}{fmtPrice(chgPct)}%
         </span>
-        {/* 右侧操作按钮：加自选 + 加监控 + 信息条配置 */}
+        {/* 右侧操作按钮：外链 + 加自选 + 加监控 + 信息条配置 */}
         <div className="ml-auto self-center flex items-center gap-1">
-          {onToggleWatchlist && (
+          {extUrl && (
+            <a
+              href={extUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={extUrl}
+              className="p-1 rounded-btn text-muted hover:text-foreground hover:bg-elevated transition-colors"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          )}
+          {inWatchlist && onRemoveFromWatchlist ? (
             <button
-              onClick={onToggleWatchlist}
-              className={`p-1 rounded-btn transition-colors cursor-pointer ${inWatchlist ? 'text-[#FACC15]' : 'text-muted hover:text-foreground hover:bg-elevated'}`}
-              title={inWatchlist ? '移出自选' : '加自选'}
+              type="button"
+              onClick={onRemoveFromWatchlist}
+              disabled={watchlistPending}
+              className="rounded-btn p-1 text-[#FACC15] transition-colors cursor-pointer hover:bg-elevated disabled:opacity-50"
+              title="移出自选"
+              aria-label={`将 ${symbol} 移出自选`}
             >
               <Star className="h-3.5 w-3.5" />
             </button>
-          )}
+          ) : !inWatchlist && onAddToWatchlist ? (
+            <WatchlistAddMenu
+              onSelect={onAddToWatchlist}
+              disabled={watchlistPending}
+              triggerClassName="rounded-btn p-1 text-muted transition-colors cursor-pointer hover:bg-elevated hover:text-foreground disabled:opacity-50"
+              ariaLabel={`将 ${symbol} 加入自选`}
+            >
+              <Star className="h-3.5 w-3.5" />
+            </WatchlistAddMenu>
+          ) : null}
           {onMonitor && (
             <button
               onClick={onMonitor}
@@ -272,6 +334,7 @@ export function StockInfoBar({ symbol, name, stockInfo, rows, fields, onFieldsCh
         builtinSectionLabel="可选指标"
         extColumnAlign="left"
         showStandaloneToggle
+        disableBackdropBlur
       />
     </div>
   )

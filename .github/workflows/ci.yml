@@ -34,6 +34,9 @@ jobs:
         working-directory: backend
         run: uv sync --frozen --no-install-project --extra dev --extra backtest
 
+      - name: 安装容器固定版本 Codex CLI
+        run: npm install --global @openai/codex@0.144.3
+
       # 仓库仍有历史 lint 债务；CI 先阻断语法与无效代码，完整规则按改动范围本地执行。
       - name: Ruff 阻断级检查
         working-directory: backend

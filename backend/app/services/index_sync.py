@@ -6,15 +6,17 @@ quotes.get_by_universes 作为补充来源。日K统一走 klines.batch。
 """
 from __future__ import annotations
 
-import logging
 import gc
+import logging
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import polars as pl
 
-from app.indicators.pipeline import compute_enriched
+from app.indicators.pipeline import compute_enriched, invalidate_benchmark_momentum_cache
 from app.services import kline_sync, preferences
+from app.services.provider_routes import provider_route_commit_guard
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
 from app.tickflow.rate_limits import chunked, min_batch, resolve_limit, sleep_between_batches
@@ -24,6 +26,47 @@ logger = logging.getLogger(__name__)
 
 # exchanges.get_instruments 查询的交易所(沪深京)
 _EXCHANGES = ["SH", "SZ", "BJ"]
+
+
+def _daily_outer_limits(
+    capset: CapabilitySet,
+    symbol_count: int,
+    provider_name: str | None = None,
+) -> tuple[int, int | None] | None:
+    """返回指数/ETF 同步层的外部分块参数。
+
+    TickFlow 路径沿用套餐能力及限速；自定义 Provider 已在内部按自身配置分块、
+    限速，因此同步层一次性交给 Provider，避免用 TickFlow 能力误拦或重复限速。
+    """
+    provider_name = provider_name or preferences.get_daily_data_provider()
+    if provider_name == "tickflow":
+        if not capset.has(Cap.KLINE_DAILY_BATCH):
+            return None
+        limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH)
+        return min_batch(preferences.get_index_daily_batch_size(), limit), limit.rpm
+
+    from app.data_providers import custom as custom_sources
+
+    try:
+        if not custom_sources.provider_has_dataset(provider_name, "daily"):
+            logger.error("selected daily provider '%s' is unavailable", provider_name)
+            return None
+    except Exception as exc:
+        logger.error("selected daily provider '%s' is unavailable: %s", provider_name, exc)
+        return None
+    return max(1, symbol_count), None
+
+
+@contextmanager
+def _daily_route_lease(provider_name: str):
+    """固定一次指数/ETF 同步所用的自定义日 K Provider 与注册表代际。"""
+    if provider_name == "tickflow":
+        yield None, None
+        return
+    from app.data_providers import custom as custom_sources
+
+    with custom_sources.lease_provider(provider_name) as (provider, generation):
+        yield provider, generation
 
 
 def _quotes_to_index_instruments(resp) -> pl.DataFrame:
@@ -204,9 +247,6 @@ def sync_and_persist_index_daily(
     否则取 index_instruments 表全量(指数+ETF 合并存储)。
     on_chunk_done(current, total) 每个批次完成后回调。
     """
-    if not capset.has(Cap.KLINE_DAILY_BATCH):
-        return 0
-
     if symbols_override:
         symbols = sorted(set(s for s in symbols_override if s))
         if not symbols:
@@ -221,37 +261,59 @@ def sync_and_persist_index_daily(
         if instruments.is_empty() or "symbol" not in instruments.columns:
             return 0
         symbols = sorted(set(instruments["symbol"].to_list()))
-    limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH)
-    batch_size = min_batch(preferences.get_index_daily_batch_size(), limit)
+    provider_name = preferences.get_daily_data_provider()
+    outer_limits = _daily_outer_limits(capset, len(symbols), provider_name)
+    if outer_limits is None:
+        return 0
+    batch_size, rpm = outer_limits
 
     end_time = end_date or datetime.now()
     start_time = start_date or (end_time - timedelta(days=365))
 
-    total_rows = 0
+    frames: list[pl.DataFrame] = []
+    failures: list[str] = []
     chunks = chunked(symbols, batch_size)
-    for i, chunk in enumerate(chunks):
-        sleep_between_batches(i, limit.rpm)
-        raw = kline_sync.sync_daily_batch(
-            chunk,
-            count=count,
-            batch_size=None,
-            start_time=start_time,
-            end_time=end_time,
-        )
-        if raw.is_empty():
-            continue
-
-        repo.append_index_daily(raw)
-        enriched = compute_enriched(raw, factors=None, instruments=None)
-        repo.append_index_enriched(enriched)
-        total_rows += raw.height
-        logger.info("index/etf daily synced: %d/%d chunks, +%d rows", i + 1, len(chunks), raw.height)
-        if on_chunk_done:
-            on_chunk_done(i + 1, len(chunks))
-        del raw, enriched
-        gc.collect()
-    repo.refresh_index_views()
-    return total_rows
+    with _daily_route_lease(provider_name) as (custom_provider, generation):
+        for i, chunk in enumerate(chunks):
+            sleep_between_batches(i, rpm)
+            chunk_failures: list[str] = []
+            raw = kline_sync.fetch_daily_routed(
+                chunk,
+                capset,
+                count=count,
+                start_date=start_time,
+                end_date=end_time,
+                asset_type="index",
+                failed_out=chunk_failures,
+                provider_name=provider_name,
+                custom_provider=custom_provider,
+            )
+            failures.extend(chunk_failures)
+            if not raw.is_empty():
+                frames.append(raw)
+            if on_chunk_done:
+                on_chunk_done(i + 1, len(chunks))
+            del raw
+            gc.collect()
+        if failures:
+            raise RuntimeError(
+                f"指数日K同步不完整: {len(set(failures))} 只标的所在批次失败"
+            )
+        if not frames:
+            return 0
+        raw = pl.concat(frames, how="diagonal_relaxed")
+        with provider_route_commit_guard(
+            provider_name,
+            generation,
+            preferences.get_daily_data_provider,
+            "daily",
+        ):
+            repo.append_index_daily(raw)
+            invalidate_benchmark_momentum_cache(repo.store.data_dir)
+            enriched = compute_enriched(raw, factors=None, instruments=None)
+            repo.append_index_enriched(enriched)
+            repo.refresh_index_views()
+        return raw.height
 
 
 def _load_etf_factors(repo: KlineRepository) -> pl.DataFrame:
@@ -297,9 +359,6 @@ def sync_and_persist_etf_daily(
     """同步 ETF 日K到独立 kline_etf_* parquet,并计算 ETF enriched。
     on_chunk_done(current, total) 每个批次完成后回调。
     """
-    if not capset.has(Cap.KLINE_DAILY_BATCH):
-        return 0
-
     if symbols_override:
         symbols = sorted(set(s for s in symbols_override if s))
     else:
@@ -313,37 +372,62 @@ def sync_and_persist_etf_daily(
     if not symbols:
         return 0
 
-    limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH)
-    batch_size = min_batch(preferences.get_index_daily_batch_size(), limit)
+    provider_name = preferences.get_daily_data_provider()
+    outer_limits = _daily_outer_limits(capset, len(symbols), provider_name)
+    if outer_limits is None:
+        return 0
+    batch_size, rpm = outer_limits
 
     end_time = end_date or datetime.now()
     start_time = start_date or (end_time - timedelta(days=365))
 
-    total_rows = 0
+    frames: list[pl.DataFrame] = []
+    failures: list[str] = []
     chunks = chunked(symbols, batch_size)
     factors = _load_etf_factors(repo)
-    for i, chunk in enumerate(chunks):
-        sleep_between_batches(i, limit.rpm)
-        raw = kline_sync.sync_daily_batch(
-            chunk,
-            count=count,
-            batch_size=None,
-            start_time=start_time,
-            end_time=end_time,
+    with _daily_route_lease(provider_name) as (custom_provider, generation):
+        for i, chunk in enumerate(chunks):
+            sleep_between_batches(i, rpm)
+            chunk_failures: list[str] = []
+            raw = kline_sync.fetch_daily_routed(
+                chunk,
+                capset,
+                count=count,
+                start_date=start_time,
+                end_date=end_time,
+                asset_type="etf",
+                failed_out=chunk_failures,
+                provider_name=provider_name,
+                custom_provider=custom_provider,
+            )
+            failures.extend(chunk_failures)
+            if not raw.is_empty():
+                frames.append(raw)
+            if on_chunk_done:
+                on_chunk_done(i + 1, len(chunks))
+            del raw
+            gc.collect()
+        if failures:
+            raise RuntimeError(
+                f"ETF日K同步不完整: {len(set(failures))} 只标的所在批次失败"
+            )
+        if not frames:
+            return 0
+        raw = pl.concat(frames, how="diagonal_relaxed")
+        batch_factors = (
+            factors.filter(pl.col("symbol").is_in(symbols))
+            if not factors.is_empty()
+            else factors
         )
-        if raw.is_empty():
-            continue
-
-        repo.append_etf_daily(raw)
-        batch_factors = factors.filter(pl.col("symbol").is_in(chunk)) if not factors.is_empty() else factors
-        # ETF 使用复权和通用技术指标；不传 instruments，避免套用 A股涨跌停/连板逻辑。
-        enriched = compute_enriched(raw, factors=batch_factors, instruments=None)
-        repo.append_etf_enriched(enriched)
-        total_rows += raw.height
-        logger.info("etf daily synced: %d/%d chunks, +%d rows", i + 1, len(chunks), raw.height)
-        if on_chunk_done:
-            on_chunk_done(i + 1, len(chunks))
-        del raw, enriched
-        gc.collect()
-    repo.refresh_index_views()
-    return total_rows
+        with provider_route_commit_guard(
+            provider_name,
+            generation,
+            preferences.get_daily_data_provider,
+            "daily",
+        ):
+            repo.append_etf_daily(raw)
+            # ETF 使用复权和通用技术指标；不传 instruments，避免套用 A股涨跌停/连板逻辑。
+            enriched = compute_enriched(raw, factors=batch_factors, instruments=None)
+            repo.append_etf_enriched(enriched)
+            repo.refresh_index_views()
+        return raw.height

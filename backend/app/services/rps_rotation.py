@@ -14,25 +14,32 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
-from datetime import date, timedelta
+from contextlib import suppress
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import polars as pl
 
+from app.market_time import CN_TZ, cn_today
+from app.services.ext_data import EXT_DATA_GENERATION_FILE, ExtConfigStore
+from app.services.market_mainline import _join_point_in_time_membership
 from app.services.market_overview_builder import (
     _dimension_field,
     _dimension_values,
+    _ext_files,
     _read_ext_rows,
     _symbol_keys,
 )
-from app.services.ext_data import ExtConfigStore
 
 logger = logging.getLogger(__name__)
 
 # 进程级结果缓存 (照搬 overview.py:18 的模式, TTL 拉长到 120s —— 轮动矩阵
 # 不像看板那样需要近实时, 盘后数据稳定, 缓存久一点无妨)
 _CACHE_TTL = 120.0
+_CACHE_MAX_ENTRIES = 16
 _cache: dict[str, dict] = {}
 _cache_ts: dict[str, float] = {}
 
@@ -41,68 +48,173 @@ def invalidate_cache() -> None:
     """清空轮动矩阵结果缓存(数据管道完成后调用, 避免返回旧数据)。"""
     _cache.clear()
     _cache_ts.clear()
+    _map_cache.clear()
 
 
-def _latest_enriched_date(repo) -> date | None:
-    """取 enriched 缓存里的最新交易日(矩阵的右端=最新日期)。"""
-    cache = repo._enriched_history_cache  # noqa: SLF001 —— 缓存字段无公开 getter
-    if cache is None or cache.is_empty() or "date" not in cache.columns:
-        return None
-    return cache["date"].max()
+def _ext_generation_signature(repo, kind: str) -> str:
+    """返回影响指定维度的配置、generation 与文件签名。"""
+    data_dir = repo.store.data_dir
+    digest = hashlib.sha256()
+    for config in ExtConfigStore(data_dir).load_all():
+        if not _dimension_field(config, kind):
+            continue
+        digest.update(str(config.id).encode())
+        digest.update(str(getattr(config, "mode", "snapshot")).encode())
+        for field in getattr(config, "fields", []):
+            digest.update(
+                f"{field.name}\0{field.label}\0{field.dtype}".encode()
+            )
+        marker = data_dir / "ext_data" / config.id / EXT_DATA_GENERATION_FILE
+        with suppress(OSError):
+            digest.update(marker.read_bytes())
+        for raw_path in _ext_files(data_dir, config):
+            path = Path(raw_path)
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            digest.update(str(path).encode())
+            digest.update(f"{stat.st_mtime_ns}\0{stat.st_size}".encode())
+    return digest.hexdigest()
+
+
+def _effective_date_from_path(path: Path) -> date | None:
+    for parent in path.parents:
+        if parent.name.startswith("date="):
+            try:
+                return date.fromisoformat(parent.name.removeprefix("date="))
+            except ValueError:
+                return None
+    return None
 
 
 def _load_concept_map_df(repo, kind: str = "concept") -> tuple[pl.DataFrame, int]:
-    """构建并缓存 {symbol_upper → 维度成员} 的已展开 polars 映射表。
+    """构建并缓存带生效日期的维度成员映射。
 
     kind: "concept"(概念) 或 "industry"(行业)。复用 market_overview_builder 的
     _dimension_field(config, kind) 识别维度 —— 该函数两种维度都支持。
 
     返回 (map_df, member_count):
-      - map_df: 两列 (_sym_up: 大写 symbol, <kind>: 维度成员名), 已 explode。
+      - map_df: 来源、生效日、symbol 与维度成员四列，已展开。
         无数据时返回空 DataFrame。
       - member_count: 去重维度成员总数。
 
-    缓存: 维度成分股是 snapshot, 进程内不变, 缓存 600s。按 kind 分别缓存。
+    timeseries 按分区日期生效；snapshot 只能从当前文件修改日开始生效，绝不回填
+    更早交易日。缓存 key 包含扩展数据 generation，写入后立即换代。
     """
-    now = time.time()
-    cached = _map_cache.get(kind)
-    if cached is not None and (now - _map_ts.get(kind, 0)) < 600:
+    signature = _ext_generation_signature(repo, kind)
+    cache_key = (kind, signature)
+    for old_key in tuple(_map_cache):
+        if old_key[0] == kind and old_key != cache_key:
+            _map_cache.pop(old_key, None)
+    cached = _map_cache.get(cache_key)
+    if cached is not None:
         return cached
 
     data_dir = repo.store.data_dir
     store = ExtConfigStore(data_dir)
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, date, str, str]] = []
     members_seen: set[str] = set()
 
     for config in store.load_all():
         field = _dimension_field(config, kind)
         if not field:
             continue
-        for ext_row in _read_ext_rows(data_dir, config, field):
-            members = _dimension_values(ext_row.get(field))
-            if not members:
-                continue
-            keys = _symbol_keys(ext_row, config)
-            for key in keys:
-                for m in members:
-                    pairs.append((key, m))
-                    members_seen.add(m)
+        mode = getattr(config, "mode", "snapshot")
+        dated_rows: list[tuple[date, list[dict]]] = []
+        if mode == "timeseries":
+            effective_dates = {
+                effective
+                for raw_path in _ext_files(data_dir, config)
+                if (effective := _effective_date_from_path(Path(raw_path))) is not None
+            }
+            for effective in sorted(effective_dates):
+                dated_rows.append((
+                    effective,
+                    _read_ext_rows(data_dir, config, field, as_of=effective),
+                ))
+        else:
+            snapshot_path = data_dir / "ext_data" / config.id / "part.parquet"
+            try:
+                effective = datetime.fromtimestamp(
+                    snapshot_path.stat().st_mtime,
+                    tz=CN_TZ,
+                ).date()
+            except OSError:
+                effective = cn_today()
+            dated_rows.append((
+                effective,
+                _read_ext_rows(data_dir, config, field),
+            ))
+
+        for effective, rows in dated_rows:
+            for ext_row in rows:
+                members = _dimension_values(ext_row.get(field))
+                if not members:
+                    continue
+                keys = _symbol_keys(ext_row, config)
+                for key in keys:
+                    for member in members:
+                        pairs.append((config.id, effective, key, member))
+                        members_seen.add(member)
 
     if pairs:
         map_df = pl.DataFrame(
-            {"_sym_up": [p[0] for p in pairs], kind: [p[1] for p in pairs]},
-            schema={"_sym_up": pl.Utf8, kind: pl.Utf8},
+            {
+                "_source_id": [p[0] for p in pairs],
+                "_effective_date": [p[1] for p in pairs],
+                "_sym_up": [p[2] for p in pairs],
+                kind: [p[3] for p in pairs],
+            },
+            schema={
+                "_source_id": pl.Utf8,
+                "_effective_date": pl.Date,
+                "_sym_up": pl.Utf8,
+                kind: pl.Utf8,
+            },
         ).unique()
     else:
-        map_df = pl.DataFrame(schema={"_sym_up": pl.Utf8, kind: pl.Utf8})
-    _map_cache[kind] = map_df
-    _map_ts[kind] = now
-    return map_df, len(members_seen)
+        map_df = pl.DataFrame(schema={
+            "_source_id": pl.Utf8,
+            "_effective_date": pl.Date,
+            "_sym_up": pl.Utf8,
+            kind: pl.Utf8,
+        })
+    payload = (map_df, len(members_seen))
+    _map_cache[cache_key] = payload
+    return payload
 
 
 # 维度映射缓存: {kind: (map_df, count)}。按 kind 隔离(概念/行业分别缓存)。
-_map_cache: dict[str, pl.DataFrame] = {}
-_map_ts: dict[str, float] = {}
+_map_cache: dict[tuple[str, str], tuple[pl.DataFrame, int]] = {}
+
+_MEMBERSHIP_NOTE = (
+    "历史轮动按交易日使用当时最新的 timeseries 成分快照；"
+    "无历史版本的 snapshot 仅从当前文件生效日开始计算"
+)
+
+
+def _prune_result_cache(now: float) -> None:
+    """淘汰过期结果，并限制进程级缓存的常驻条目数。"""
+    for key, created_at in tuple(_cache_ts.items()):
+        if now - created_at >= _CACHE_TTL:
+            _cache.pop(key, None)
+            _cache_ts.pop(key, None)
+    overflow = len(_cache) - _CACHE_MAX_ENTRIES
+    if overflow > 0:
+        oldest = sorted(_cache_ts, key=_cache_ts.get)[:overflow]
+        for key in oldest:
+            _cache.pop(key, None)
+            _cache_ts.pop(key, None)
+
+
+def _empty_result() -> dict:
+    return {
+        "dates": [],
+        "columns": {},
+        "concept_count": 0,
+        "membership_note": _MEMBERSHIP_NOTE,
+    }
 
 
 def build_rps_rotation(repo, days: int = 12, kind: str = "concept", level: int | None = None) -> dict:
@@ -128,37 +240,43 @@ def build_rps_rotation(repo, days: int = 12, kind: str = "concept", level: int |
     days = max(7, min(30, days))
 
     # 结果缓存: 同 (kind, level, latest) 的请求在 TTL 内直接返回。
-    latest = _latest_enriched_date(repo)
-    if latest is None:
-        return {"dates": [], "columns": {}, "concept_count": 0}
+    enriched_generation, history = repo.get_enriched_history_snapshot()
+    latest = history["date"].max()
 
-    cache_key = f"{kind}|{level}|{latest.isoformat()}"
+    ext_generation = _ext_generation_signature(repo, kind)
+    cache_key = (
+        f"{kind}|{level}|{latest.isoformat()}|"
+        f"{ext_generation}|{enriched_generation}"
+    )
     now = time.time()
+    _prune_result_cache(now)
     cached = _cache.get(cache_key)
     if cached and (now - _cache_ts.get(cache_key, 0)) < _CACHE_TTL:
         return _slice_cached(cached, days)
 
-    # 1. 维度映射(symbol → 维度成员), 已按 kind 缓存为 polars DataFrame
+    # 1. 维度映射(symbol → 维度成员), 已按 kind 缓存为 (map_df, count) 元组 (#186)。
     map_df, member_count = _load_concept_map_df(repo, kind)
     if map_df.is_empty():
         logger.info("rps_rotation: no %s data (ext dimension not fetched yet)", kind)
-        return {"dates": [], "columns": {}, "concept_count": 0}
+        return _empty_result()
 
     # 2. 取最近 N 交易日的个股 change_pct(命中内存缓存)
     start = latest - timedelta(days=days * 2 + 10)  # 日历天 ≈ 2/3 交易日, 多取余量
-    df = repo.get_enriched_range(
-        start, latest, columns=["symbol", "date", "change_pct"]
-    )
-    if df is None or df.is_empty():
-        return {"dates": [], "columns": {}, "concept_count": 0}
+    df = history.filter(
+        (pl.col("date") >= start) & (pl.col("date") <= latest)
+    ).select(["symbol", "date", "change_pct"])
+    if df.is_empty():
+        return _empty_result()
 
     # 3. 把个股 symbol 映射到维度成员, 一只股票拆成多行(每个成员一行)
     #    symbol 大写匹配(map_df 的 _sym_up 已大写)
     df = df.with_columns(pl.col("symbol").str.to_uppercase().alias("_sym_up"))
-    joined = df.join(map_df, on="_sym_up", how="inner").drop("_sym_up")
+    joined = _join_point_in_time_membership(df, map_df, kind)
+    if not joined.is_empty():
+        joined = joined.drop("_sym_up")
 
     if joined.is_empty():
-        return {"dates": [], "columns": {}, "concept_count": 0}
+        return _empty_result()
 
     # 行业层级聚合: kind=industry 且指定 level 时, 把 "一级行业-二级行业-三级行业"
     # 拆分取对应层级(level=2 → "二级行业"), 同级下多个三级会合并。
@@ -196,11 +314,13 @@ def build_rps_rotation(repo, days: int = 12, kind: str = "concept", level: int |
         "dates": [str(d) for d in all_dates_sorted],
         "columns": columns,
         "concept_count": member_count,
+        "membership_note": _MEMBERSHIP_NOTE,
     }
 
     # 写缓存(存全量, 按需 slice)
     _cache[cache_key] = full
     _cache_ts[cache_key] = now
+    _prune_result_cache(now)
 
     return _slice_cached(full, days)
 
@@ -215,4 +335,5 @@ def _slice_cached(full: dict, days: int) -> dict:
         "dates": keep_dates,
         "columns": {d: full["columns"][d] for d in keep_dates},
         "concept_count": full["concept_count"],
+        "membership_note": full["membership_note"],
     }

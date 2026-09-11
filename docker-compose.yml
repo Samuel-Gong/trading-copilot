@@ -10,11 +10,14 @@ services:
         CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.144.3}
     container_name: TickFlow_Stock_Panel
     ports:
-      - "${PORT:-3018}:3018"
+      - "${HOST:-0.0.0.0}:${PORT:-3018}:3018"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Compose 2.30+ 的 raw 模式按字面值注入变量，密码中的 $VAR 不会被展开；
+    # 不再把含全部凭据的宿主 .env 挂进应用容器。
     env_file:
-      - .env
+      - path: .env
+        format: raw
     environment:
       # 强制固定为容器内绝对路径, 防止 .env 里的 DATA_DIR=./data(开发模式用)
       # 被 env_file 原样传入容器后按错误的相对路径解析, 写到未挂载卷的目录,

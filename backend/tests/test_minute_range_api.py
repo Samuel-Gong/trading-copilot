@@ -1,0 +1,239 @@
+"""多日分时 API 契约。"""
+
+import asyncio
+from datetime import date, datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import polars as pl
+import pytest
+from fastapi import HTTPException
+
+from app.api import kline as kline_api
+from app.tickflow.repository import KlineRepository
+
+
+def _request(repo=None, capset=None):
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                repo=repo or MagicMock(),
+                capabilities=capset or MagicMock(),
+            )
+        )
+    )
+
+
+def test_minute_range_returns_latest_sessions_with_previous_closes():
+    repo = MagicMock()
+    repo.resolve_asset_type.return_value = "stock"
+    # _get_stock_info 走 instruments 内存缓存 (不再走 execute_one DuckDB 查询)
+    repo.get_instruments.return_value = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "name": ["浦发银行"],
+        "total_shares": [1.0],
+        "float_shares": [1.0],
+    })
+    minute_dates = [date(2026, 8, 6), date(2026, 8, 7)]
+    repo.latest_minute_dates.return_value = minute_dates
+    repo.get_minute_by_dates.return_value = pl.DataFrame({
+        "symbol": ["600000.SH"] * 3,
+        "datetime": [
+            datetime(2026, 8, 5, 1, 30),
+            datetime(2026, 8, 6, 1, 30),
+            datetime(2026, 8, 7, 1, 30),
+        ],
+        "open": [10.0, 11.0, 12.0],
+        "high": [10.2, 11.2, 12.2],
+        "low": [9.8, 10.8, 11.8],
+        "close": [10.1, 11.1, 12.1],
+        "volume": [100.0, 110.0, 120.0],
+        "amount": [101_000.0, 122_100.0, 145_200.0],
+    })
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [
+            date(2026, 8, 4),
+            date(2026, 8, 5),
+            date(2026, 8, 6),
+            date(2026, 8, 7),
+        ],
+        "close": [9.9, 10.1, 11.1, 12.1],
+        # 模拟除权后价格减半；分时昨收必须保持未复权口径。
+        "raw_close": [19.8, 20.2, 22.2, 24.2],
+    })
+
+    result = kline_api.get_minute_range(_request(repo), "600000.SH", 2)
+
+    assert result["name"] == "浦发银行"
+    assert result["requested_days"] == 2
+    assert result["source"] == "local"
+    assert [session["date"] for session in result["sessions"]] == [
+        "2026-08-06",
+        "2026-08-07",
+    ]
+    assert [session["prev_close"] for session in result["sessions"]] == [
+        20.2,
+        22.2,
+    ]
+    assert result["sessions"][0]["rows"][0]["close"] == 11.1
+    repo.latest_minute_dates.assert_called_once_with("600000.SH", 2, asset_type="stock")
+    repo.get_minute_by_dates.assert_called_once_with(
+        ["600000.SH"], minute_dates, asset_type="stock",
+    )
+    repo.get_minute_range.assert_not_called()
+    assert repo.get_daily_asset.call_args.kwargs["columns"] == ["date", "raw_close"]
+
+
+def test_minute_range_uses_actual_dates_across_long_suspension():
+    repo = MagicMock()
+    repo.resolve_asset_type.return_value = "stock"
+    repo.get_instruments.return_value = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "name": ["浦发银行"],
+        "total_shares": [1.0],
+        "float_shares": [1.0],
+    })
+    actual_dates = [date(2026, 5, 20), date(2026, 8, 24)]
+    repo.latest_minute_dates.return_value = actual_dates
+    repo.get_minute_by_dates.return_value = pl.DataFrame({
+        "symbol": ["600000.SH", "600000.SH"],
+        "datetime": [datetime(2026, 5, 20, 9, 30), datetime(2026, 8, 24, 9, 30)],
+        "open": [9.8, 10.0],
+        "high": [9.9, 10.1],
+        "low": [9.7, 9.9],
+        "close": [9.8, 10.0],
+        "volume": [100.0, 120.0],
+        "amount": [98_000.0, 120_000.0],
+    })
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 5, 19), date(2026, 5, 20), date(2026, 8, 24)],
+        "raw_close": [9.7, 9.8, 10.0],
+    })
+
+    result = kline_api.get_minute_range(_request(repo), "600000.SH", 2)
+
+    assert [session["date"] for session in result["sessions"]] == [
+        "2026-05-20", "2026-08-24",
+    ]
+    repo.get_minute_by_dates.assert_called_once_with(
+        ["600000.SH"], actual_dates, asset_type="stock",
+    )
+
+
+def test_repository_latest_minute_dates_returns_sorted_distinct_days():
+    repo = MagicMock()
+    repo.execute_all.return_value = [
+        (date(2026, 8, 24),),
+        (date(2026, 5, 20),),
+    ]
+
+    result = KlineRepository.latest_minute_dates(
+        repo,
+        "600000.SH",
+        2,
+        asset_type="stock",
+    )
+
+    assert result == [date(2026, 5, 20), date(2026, 8, 24)]
+    sql, params = repo.execute_all.call_args.args
+    assert "FROM kline_minute" in sql
+    assert "SELECT DISTINCT CAST(datetime AS DATE)" in sql
+    assert params == ["600000.SH", 2]
+
+
+def test_previous_closes_fail_closed_without_raw_close():
+    repo = MagicMock()
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 8, 5)],
+        "close": [10.1],
+    })
+
+    assert kline_api._get_previous_closes(
+        repo,
+        "600000.SH",
+        [date(2026, 8, 6)],
+        "stock",
+    ) == {date(2026, 8, 6): None}
+
+
+def test_previous_closes_use_index_close_column():
+    """指数日线没有 raw_close，昨收应直接使用 close。"""
+    repo = MagicMock()
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 8, 5), date(2026, 8, 6)],
+        "close": [3500.0, 3520.0],
+    })
+
+    assert kline_api._get_previous_closes(
+        repo,
+        "000001.SH",
+        [date(2026, 8, 6)],
+        "index",
+    ) == {date(2026, 8, 6): 3500.0}
+    assert repo.get_daily_asset.call_args.kwargs["columns"] == ["date", "close"]
+
+
+def test_previous_closes_use_actual_row_before_long_suspension():
+    """停牌超过固定自然日窗口时，仍应取复牌前最后一个真实收盘价。"""
+    repo = MagicMock()
+    repo.get_daily_asset.return_value = pl.DataFrame({
+        "date": [date(2026, 8, 10)],
+        "raw_close": [10.2],
+    })
+    repo.get_daily_asset_before.return_value = pl.DataFrame({
+        "date": [date(2026, 5, 20)],
+        "raw_close": [9.8],
+    })
+
+    assert kline_api._get_previous_closes(
+        repo,
+        "600000.SH",
+        [date(2026, 8, 10)],
+        "stock",
+    ) == {date(2026, 8, 10): 9.8}
+    repo.get_daily_asset_before.assert_called_once_with(
+        "stock",
+        "600000.SH",
+        date(2026, 8, 10),
+        columns=["date", "raw_close"],
+    )
+
+
+def test_minute_range_does_not_read_stock_store_for_index():
+    repo = MagicMock()
+    repo.resolve_asset_type.return_value = "index"
+    repo.get_instruments_asset.return_value = pl.DataFrame()
+
+    result = kline_api.get_minute_range(_request(repo), "000001.SH", 10)
+
+    assert result["asset_type"] == "index"
+    assert result["sessions"] == []
+    repo.get_minute_range.assert_not_called()
+
+
+def test_sync_minute_single_uses_requested_days(monkeypatch):
+    repo = MagicMock()
+    repo.resolve_asset_type.return_value = "stock"
+    capset = MagicMock()
+    sync = MagicMock(return_value=2400)
+    refresh = MagicMock()
+    monkeypatch.setattr(kline_api, "_minute_allowed", lambda _: True)
+    monkeypatch.setattr(kline_api.kline_sync, "sync_and_persist_minute", sync)
+    monkeypatch.setattr("app.jobs.daily_pipeline._refresh_single_view", refresh)
+
+    result = asyncio.run(kline_api.sync_minute_single(
+        _request(repo, capset),
+        {"symbol": "600000.SH", "days": 10},
+    ))
+
+    assert result["rows"] == 2400
+    sync.assert_called_once_with(["600000.SH"], repo, capset, days=10, force_full_days=True)
+    refresh.assert_called_once_with(repo, "kline_minute")
+
+
+def test_sync_minute_single_rejects_invalid_days():
+    with pytest.raises(HTTPException, match="days 必须在 1 到 30 之间"):
+        asyncio.run(kline_api.sync_minute_single(
+            _request(),
+            {"symbol": "600000.SH", "days": 0},
+        ))

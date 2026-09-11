@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
 from pathlib import Path
+
+from app.services.definition_transactions import definitions_transaction
 
 import polars as pl
 
@@ -51,6 +55,8 @@ ALLOWED_FIELDS: frozenset[str] = frozenset({
     "momentum_5d", "momentum_10d", "momentum_20d", "momentum_30d", "momentum_60d",
     "annual_vol_20d",
     "rsi_6", "rsi_14", "rsi_24",
+    # 异动偏离 (交易所异动规则口径, 运行时列)
+    "deviate_3d", "deviate_10d", "deviate_30d",
 })
 
 # 运算符 → Polars 表达式构造器（输入 col_expr, value）
@@ -62,6 +68,76 @@ _OP_BUILDERS = {
     "==":  lambda c, v: c == v,
     "!=":  lambda c, v: c != v,
 }
+
+
+def allowed_fields() -> frozenset[str]:
+    """条件可引用字段 = 物化列白名单 并入 注册表因子 (虚拟/自定义/复合)。
+
+    因子列在历史路径 (compute_signals) 由 materialize_factor_columns 复用
+    评分物化管线补算; 盘中单日快照无滚动窗口, 依赖因子的信号被 inject 以
+    缺列告警跳过 (与日期偏移条件同样的优雅降级)。
+    """
+    from app.factors.registry import all_factors
+
+    runtime_factor_ids = {
+        spec.id
+        for spec in all_factors()
+        if not spec.pit and {"stock", "etf"}.issubset(spec.asset_types)
+    }
+    return frozenset(ALLOWED_FIELDS | runtime_factor_ids)
+
+
+def materialize_factor_columns(
+    df: pl.DataFrame,
+    exprs: dict[str, pl.Expr],
+    needed: set[str] | None = None,
+) -> pl.DataFrame:
+    """把信号表达式引用、且 df 缺失的注册表因子列补算出来。
+
+    复用评分物化路径 (materialize_scoring_columns) — 与检验/评分同一条计算
+    逻辑, 不引入第二套实现。非注册表列不在此处理 (缺列仍由 inject 告警跳过)。
+    """
+    if df.is_empty() or not exprs:
+        return df
+    cols = set(df.columns)
+    missing: set[str] = set()
+    for name, roots in expression_dependencies(exprs).items():
+        if needed is not None and name not in needed:
+            continue
+        missing.update(root for root in roots if root not in cols)
+    if not missing:
+        return df
+    from app.factors.registry import all_factors
+
+    factor_ids = {spec.id for spec in all_factors()}
+    to_compute = missing & factor_ids
+    if not to_compute:
+        return df
+    from app.strategy.scoring import materialize_scoring_columns
+
+    try:
+        return materialize_scoring_columns(df, sorted(to_compute))
+    except ValueError as exc:
+        logger.warning("custom signal factor materialization partially failed: %s", exc)
+
+    # 历史遗留定义可能引用现已不支持的 PIT/单资产因子。逐信号隔离补算,
+    # 让可计算信号继续工作; 缺列的表达式随后由 inject 自身跳过。
+    result = df
+    for signal_name, expression in exprs.items():
+        if needed is not None and signal_name not in needed:
+            continue
+        dependencies = expression_dependencies({signal_name: expression})[signal_name]
+        signal_factors = {
+            name for name in dependencies
+            if name not in result.columns and name in factor_ids
+        }
+        if not signal_factors:
+            continue
+        try:
+            result = materialize_scoring_columns(result, sorted(signal_factors))
+        except ValueError as exc:
+            logger.warning("custom signal %s skipped: %s", signal_name, exc)
+    return result
 
 
 # ── 持久化（镜像 strategy/config.py 的写法）──────────────
@@ -88,17 +164,35 @@ def load_all(data_dir: Path) -> list[dict]:
 
 
 def save_one(data_dir: Path, sig: dict) -> None:
-    p = _path(data_dir, sig["id"])
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(sig, ensure_ascii=False, indent=2), encoding="utf-8")
+    with definitions_transaction(data_dir):
+        p = _path(data_dir, sig["id"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                fd = -1
+                json.dump(sig, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, p)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            temporary.unlink(missing_ok=True)
 
 
 def delete_one(data_dir: Path, signal_id: str) -> bool:
-    p = _path(data_dir, signal_id)
-    if p.exists():
-        p.unlink()
-        return True
-    return False
+    with definitions_transaction(data_dir):
+        p = _path(data_dir, signal_id)
+        if p.exists():
+            p.unlink()
+            return True
+        return False
 
 
 # ── 校验 ────────────────────────────────────────────────
@@ -119,21 +213,33 @@ def _parse_days(c: dict, key: str, i: int) -> int:
 
 
 def _parse_right(right: str) -> tuple[str, object]:
-    """解析右值。返回 ('field', colname) 或 ('const', float)。"""
+    """解析右值。返回 ('field', colname) 或 ('const', float)。
+
+    接受三种形式:
+      - 数字 (int / float / 数字字符串) → 常量
+      - "field:字段名" → 字段引用
+      - 裸字段名 (在白名单内) → 自动视为字段引用
+        (AI 生成偶尔漏写 field: 前缀; 白名单字段名不可能是数字, 无歧义)
+    """
     if isinstance(right, (int, float)):
         return ("const", float(right))
     if not isinstance(right, str):
         raise ValueError(f"非法右值: {right!r}")
+    allowed = allowed_fields()
     if right.startswith("field:"):
         col = right[len("field:"):]
-        if col not in ALLOWED_FIELDS:
+        if col not in allowed:
             raise ValueError(f"右值字段不在白名单: {col}")
         return ("field", col)
     # 纯数字
     try:
         return ("const", float(right))
     except ValueError:
-        raise ValueError(f"非法右值（应为 field:xxx 或数字）: {right!r}")
+        pass
+    # 裸字段名 — 兜底容错, 仍受白名单约束
+    if right in allowed:
+        return ("field", right)
+    raise ValueError(f"非法右值（应为 field:xxx 或数字）: {right!r}")
 
 
 def validate(sig: dict) -> None:
@@ -154,7 +260,7 @@ def validate(sig: dict) -> None:
         if not isinstance(c, dict):
             raise ValueError(f"第 {i+1} 个条件格式错误")
         left = c.get("left", "")
-        if left not in ALLOWED_FIELDS:
+        if left not in allowed_fields():
             raise ValueError(f"第 {i+1} 个条件: 字段 {left!r} 不在白名单")
         if c.get("op") not in OPS:
             raise ValueError(f"第 {i+1} 个条件: 运算符 {c.get('op')!r} 非法")

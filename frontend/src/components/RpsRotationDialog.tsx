@@ -221,6 +221,11 @@ export function RpsRotationDialog({ onClose, kind = 'concept' }: Props) {
               <span className="text-[11px] text-muted">
                 {conceptCount > 0 ? `${dates.length} 天 · ${conceptCount} 个${dimLabel}` : '暂无数据'}
               </span>
+              {data?.membership_note && (
+                <span className="hidden lg:inline text-[9px] text-muted truncate max-w-[360px]">
+                  {data.membership_note}
+                </span>
+              )}
               {/* 行业层级选择器: 1/2/3 级, 默认 2 级。仅 kind=industry 显示 */}
               {kind === 'industry' && (
                 <div className="ml-1 flex items-center rounded-btn border border-border bg-base/60 p-0.5">

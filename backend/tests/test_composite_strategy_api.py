@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from app.api import strategy as strategy_api
 from app.api.strategy import (
     CompositeChildItem,
     StrategyCompositeSaveRequest,
@@ -153,6 +154,35 @@ def test_save_composite_update_mode(tmp_path):
     assert {c.strategy_id for c in blend.composite.children} == {"child_a", "child_b"}
 
 
+def test_save_composite_write_failure_preserves_file_and_registry(tmp_path, monkeypatch):
+    engine, request, custom_dir, _ = _setup_engine(tmp_path)
+    (custom_dir / "child_a.py").write_text(_filter_code("child_a"), encoding="utf-8")
+    (custom_dir / "child_b.py").write_text(_filter_code("child_b"), encoding="utf-8")
+    engine.reload()
+    _save_composite_strategy(
+        _composite_req("composite_atomic", [("child_a", 1.0)]), request
+    )
+    path = tmp_path / "strategies" / "composite" / "composite_atomic.py"
+    previous = path.read_bytes()
+
+    def fail_write(_path, _text):
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(strategy_api, "atomic_write_text", fail_write)
+    with pytest.raises(ValueError, match="synthetic write failure"):
+        _save_composite_strategy(
+            _composite_req(
+                "composite_atomic",
+                [("child_b", 1.0)],
+                mode="update",
+            ),
+            request,
+        )
+
+    assert path.read_bytes() == previous
+    assert engine.get("composite_atomic").composite.children[0].strategy_id == "child_a"
+
+
 def test_save_composite_update_rejects_non_composite(tmp_path):
     engine, request, custom_dir, _ = _setup_engine(tmp_path)
     # 一个普通(polars_expr)策略, 用 composite_ 前缀以通过 id 校验进入后续检查
@@ -228,3 +258,53 @@ def test_delete_composite_itself_succeeds(tmp_path):
     result = delete_strategy("composite_blend", request)
     assert result["ok"] is True
     assert not engine.has("composite_blend")
+
+
+def test_delete_child_serializes_concurrent_composite_creation(tmp_path, monkeypatch):
+    """删除扫描与新建引用不可交错留下孤儿叠加策略。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from app.api.strategy import delete_strategy
+
+    engine, request, custom_dir, comp_dir = _setup_engine(tmp_path)
+    (custom_dir / "child_a.py").write_text(_filter_code("child_a"), encoding="utf-8")
+    engine.reload()
+
+    scan_started = Event()
+    release_scan = Event()
+    create_started = Event()
+    create_finished = Event()
+    real_find_dependents = engine.find_dependents
+
+    def blocking_find_dependents(strategy_id):
+        if strategy_id == "child_a":
+            scan_started.set()
+            assert release_scan.wait(timeout=2)
+        return real_find_dependents(strategy_id)
+
+    def create_composite():
+        create_started.set()
+        try:
+            return _save_composite_strategy(
+                _composite_req("composite_race", [("child_a", 1.0)]),
+                request,
+            )
+        finally:
+            create_finished.set()
+
+    monkeypatch.setattr(engine, "find_dependents", blocking_find_dependents)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        deleting = pool.submit(delete_strategy, "child_a", request)
+        assert scan_started.wait(timeout=1)
+        creating = pool.submit(create_composite)
+        assert create_started.wait(timeout=1)
+        assert not create_finished.is_set()
+        release_scan.set()
+        assert deleting.result(timeout=2)["ok"] is True
+        with pytest.raises(ValueError, match="不存在"):
+            creating.result(timeout=2)
+
+    assert not engine.has("child_a")
+    assert not engine.has("composite_race")
+    assert not (comp_dir / "composite_race.py").exists()

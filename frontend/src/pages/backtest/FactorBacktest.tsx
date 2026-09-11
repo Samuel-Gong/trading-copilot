@@ -1,13 +1,17 @@
-import { useState, useMemo } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useEffect, useMemo, useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { Play, BarChart3, Clock } from 'lucide-react'
+import { Play, BarChart3, BookmarkPlus, Clock } from 'lucide-react'
 import { api, type FactorColumn, type FactorBacktestResult, type GroupStat } from '@/lib/api'
 import { fmtPct, priceColorClass } from '@/lib/format'
 import { EmptyState } from '@/components/EmptyState'
 import { DatePicker } from '@/components/DatePicker'
+import { toast } from '@/components/Toast'
+import { QK } from '@/lib/queryKeys'
 import { FactorICChart } from './charts/FactorICChart'
 import { FactorGroupNavChart } from './charts/FactorGroupNavChart'
+import { factorColumnsForAsset } from './factorCatalog'
+import { factorResultCandidate } from './researchCandidates'
 
 const formatDate = (date: Date) => date.toISOString().slice(0, 10)
 const monthsAgo = (months: number) => {
@@ -80,36 +84,56 @@ function LoadingPanel({ symbolsText }: { symbolsText: string }) {
   )
 }
 
-export function FactorBacktest() {
-  const [factorName, setFactorName] = useState('momentum_20d')
+export function FactorBacktest({ initialFactorName = 'momentum_20d' }: { initialFactorName?: string }) {
+  const queryClient = useQueryClient()
+  const [factorName, setFactorName] = useState(initialFactorName)
   const [symbols, setSymbols] = useState('')
   const [assetType, setAssetType] = useState<'stock' | 'etf'>('stock')
   const [start, setStart] = useState(THREE_MONTHS_AGO)
   const [end, setEnd] = useState(TODAY)
   const [nGroups, setNGroups] = useState(5)
   const [weight, setWeight] = useState<'equal' | 'factor_weight'>('equal')
+  const [rebalance, setRebalance] = useState<'daily' | 'weekly' | 'monthly'>('daily')
   const [fees, setFees] = useState('2')
+  const [slippage, setSlippage] = useState('5')
   const [result, setResult] = useState<FactorBacktestResult | null>(null)
 
   const columns = useQuery({
-    queryKey: ['backtest-factor-columns'],
+    queryKey: QK.factorColumns,
     queryFn: api.factorColumns,
   })
+  const availableColumns = useMemo(
+    () => factorColumnsForAsset(columns.data?.columns ?? [], assetType),
+    [assetType, columns.data],
+  )
+
+  useEffect(() => {
+    if (
+      availableColumns.length
+      && !availableColumns.some(column => column.id === factorName)
+    ) {
+      setFactorName(availableColumns[0].id)
+    }
+  }, [availableColumns, factorName])
 
   // 按 group 分类的因子
   const factorGroups = useMemo(() => {
-    const cols = columns.data?.columns ?? []
     const groups: Record<string, FactorColumn[]> = {}
-    for (const c of cols) {
+    for (const c of availableColumns) {
       ;(groups[c.group] ??= []).push(c)
     }
     return groups
-  }, [columns.data])
+  }, [availableColumns])
 
   // 当前因子描述
   const factorDesc = useMemo(() => {
     return columns.data?.columns.find(c => c.id === factorName)?.desc ?? ''
   }, [columns.data, factorName])
+
+  const resultFactorLabel = useMemo(() => {
+    const resultFactorName = String(result?.config.factor_name ?? factorName)
+    return columns.data?.columns.find(c => c.id === resultFactorName)?.label ?? resultFactorName
+  }, [columns.data, factorName, result])
 
   const run = useMutation({
     mutationFn: () =>
@@ -120,9 +144,10 @@ export function FactorBacktest() {
         start: start || null,
         end: end || undefined,
         n_groups: nGroups,
-        rebalance: 'daily',
+        rebalance,
         weight,
         fees_pct: Number(fees) / 10000,
+        slippage_bps: Number(slippage),
       }),
     onSuccess: (data) => {
       if (data.error) {
@@ -131,6 +156,18 @@ export function FactorBacktest() {
         setResult(data)
       }
     },
+  })
+
+  const saveCandidate = useMutation({
+    mutationFn: () => {
+      if (!result) throw new Error('暂无因子结果')
+      return api.researchCandidateCreate(factorResultCandidate(result, resultFactorLabel))
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: QK.researchCandidates })
+      toast('已保存到候选方案', 'success')
+    },
+    onError: error => toast(`保存失败 · ${String((error as Error).message || error)}`, 'error'),
   })
 
   const applyRange = (months: number) => {
@@ -202,7 +239,7 @@ export function FactorBacktest() {
               <button
                 key={t}
                 type="button"
-                onClick={() => { setAssetType(t); setSymbols('') }}
+                onClick={() => { setAssetType(t); setSymbols(''); setResult(null) }}
                 className={`h-full px-3 text-xs font-medium transition-colors cursor-pointer
                   ${assetType === t ? 'bg-accent/10 text-accent' : 'text-muted hover:text-foreground'}`}
               >
@@ -281,8 +318,21 @@ export function FactorBacktest() {
             </select>
           </div>
           <div>
-            <label className="text-xs font-medium text-secondary block mb-1.5">佣金(万分之)</label>
-            <input type="number" value={fees} onChange={e => setFees(e.target.value)}
+            <label className="text-[11px] text-secondary block mb-1">调仓频率</label>
+            <select value={rebalance} onChange={e => setRebalance(e.target.value as any)} className={INPUT_CLS}>
+              <option value="daily">日度</option>
+              <option value="weekly">周度</option>
+              <option value="monthly">月度</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-[11px] text-secondary block mb-1">佣金(万分之)</label>
+            <input type="number" min="0" value={fees} onChange={e => setFees(e.target.value)}
+              className={INPUT_CLS} />
+          </div>
+          <div>
+            <label className="text-[11px] text-secondary block mb-1">滑点(bp)</label>
+            <input type="number" min="0" value={slippage} onChange={e => setSlippage(e.target.value)}
               className={INPUT_CLS} />
           </div>
         </div>
@@ -291,7 +341,7 @@ export function FactorBacktest() {
           onClick={() => run.mutate()}
           disabled={run.isPending}
           className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-btn
-            bg-accent text-sm font-medium hover:bg-accent/90
+            bg-accent text-sm font-medium text-white hover:bg-accent/90
             transition-colors duration-150 ease-smooth disabled:opacity-50"
         >
           <Play className="h-3.5 w-3.5" />
@@ -301,7 +351,7 @@ export function FactorBacktest() {
 
       {/* 结果面板 */}
       <section className="min-w-0 space-y-3 bg-base/15 px-3 py-3 xl:overflow-y-auto">
-        {result?.error && !result.ic_mean && (
+        {result?.error && (
           <div className="text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">
             {result.error}
           </div>
@@ -331,7 +381,7 @@ export function FactorBacktest() {
           <LoadingPanel symbolsText={symbols ? `${symbols.split(',').length} 只标的` : '全市场 · 当前区间'} />
         )}
 
-        {result && result.ic_mean != null && (
+        {result && !result.error && (
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -343,8 +393,17 @@ export function FactorBacktest() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-medium text-foreground">因子预测能力</h3>
                 <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => saveCandidate.mutate()}
+                    disabled={saveCandidate.isPending}
+                    className="inline-flex items-center gap-1 rounded-btn border border-border bg-base/50 px-2 py-1 text-[11px] text-secondary transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                  >
+                    <BookmarkPlus className="h-3 w-3" />
+                    {saveCandidate.isPending ? '保存中' : '保存候选'}
+                  </button>
                   <span className="text-[11px] text-muted">
-                    Rank IC · 日度调仓
+                    Rank IC · {rebalance === 'daily' ? '日度' : rebalance === 'weekly' ? '周度' : '月度'}调仓
                   </span>
                   {result.elapsed_ms > 0 && (
                     <span className="flex items-center gap-1 text-[11px] text-muted">
@@ -354,24 +413,28 @@ export function FactorBacktest() {
                   )}
                 </div>
               </div>
-              <div className="grid grid-cols-4 gap-4">
-                <StatCard
-                  label="IC 均值"
-                  value={result.ic_mean != null ? fmtPct(result.ic_mean) : null}
-                  highlight={result.ic_mean != null
-                    ? result.ic_mean > 0.03 ? 'bull' : result.ic_mean < -0.03 ? 'bear' : 'neutral'
-                    : undefined}
-                />
-                <StatCard label="IC 标准差" value={result.ic_std != null ? fmtPct(result.ic_std) : null} />
-                <StatCard
-                  label="ICIR"
-                  value={result.ir != null ? result.ir.toFixed(2) : null}
-                  highlight={result.ir != null
-                    ? Math.abs(result.ir) > 0.5 ? (result.ir > 0 ? 'bull' : 'bear') : 'neutral'
-                    : undefined}
-                />
-                <StatCard label="IC 胜率" value={result.ic_win_rate != null ? fmtPct(result.ic_win_rate) : null} />
-              </div>
+              {result.ic_mean != null ? (
+                <div className="grid grid-cols-4 gap-4">
+                  <StatCard
+                    label="IC 均值"
+                    value={fmtPct(result.ic_mean)}
+                    highlight={result.ic_mean > 0.03 ? 'bull' : result.ic_mean < -0.03 ? 'bear' : 'neutral'}
+                  />
+                  <StatCard label="IC 标准差" value={result.ic_std != null ? fmtPct(result.ic_std) : null} />
+                  <StatCard
+                    label="ICIR"
+                    value={result.ir != null ? result.ir.toFixed(2) : null}
+                    highlight={result.ir != null
+                      ? Math.abs(result.ir) > 0.5 ? (result.ir > 0 ? 'bull' : 'bear') : 'neutral'
+                      : undefined}
+                  />
+                  <StatCard label="IC 胜率" value={result.ic_win_rate != null ? fmtPct(result.ic_win_rate) : null} />
+                </div>
+              ) : (
+                <div className="rounded-btn border border-border bg-base/40 px-3 py-3 text-xs text-muted">
+                  标的数量过少，无法计算 IC/IR（需 ≥2 只）。可清空标的使用全市场，或补充更多标的。
+                </div>
+              )}
             </div>
 
             {/* IC 时序图 */}

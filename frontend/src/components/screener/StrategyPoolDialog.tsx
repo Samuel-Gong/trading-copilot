@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence, Reorder } from 'framer-motion'
-import { X, Plus, GripVertical, Upload, Loader2 } from 'lucide-react'
+import { X, Plus, GripVertical, Upload, Loader2, Trash2, ListPlus } from 'lucide-react'
 import { api, type StrategyDetail } from '@/lib/api'
 import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 
@@ -23,6 +23,8 @@ const SOURCE_LABEL: Record<string, string> = {
   ai: 'AI',
   invalid: '失效',
 }
+
+const TF_BADGE_CLS = 'text-[8px] px-1 py-px rounded border leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400'
 
 type SourceTab = 'all' | 'builtin' | 'custom' | 'ai'
 
@@ -57,7 +59,8 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
   const loadStrategies = useCallback(async () => {
     setLoading(true)
     try {
-      const d = await api.strategyList()
+      // 不按周期过滤: 日线+分钟策略合并展示, 分钟策略以徽章区分
+      const d = await api.strategyList(undefined, 'all')
       setAllStrategies(d.strategies)
     } catch {
       setAllStrategies([])
@@ -104,6 +107,22 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
   const handleReorder = useCallback((newOrder: string[]) => {
     setDraftPool(newOrder)
   }, [])
+
+  // 一键清空已选池 (草稿态, 误点可用「取消」恢复)
+  const handleClearAll = useCallback(() => {
+    setDraftPool([])
+  }, [])
+
+  // 一键加入当前 Tab 分组的全部待选策略
+  const handleAddGroup = useCallback(() => {
+    setDraftPool(prev => {
+      const next = [...prev]
+      for (const s of filteredAvailable) {
+        if (!next.includes(s.id)) next.push(s.id)
+      }
+      return next
+    })
+  }, [filteredAvailable])
 
   const handleImportFile = useCallback(async (file: File) => {
     setImporting(true); setImportError(''); setImportMsg('')
@@ -214,6 +233,15 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                       </button>
                     )
                   })}
+                  <button
+                    onClick={handleAddGroup}
+                    disabled={filteredAvailable.length === 0}
+                    title="把当前分组剩余的策略全部加入策略池"
+                    className="ml-auto inline-flex items-center gap-1 px-2 py-1 rounded-btn text-[10px] text-accent border border-accent/25 bg-accent/8 hover:bg-accent/15 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer shrink-0"
+                  >
+                    <ListPlus className="h-3 w-3" />
+                    本组全加
+                  </button>
                 </div>
                 <div className="flex-1 overflow-y-auto px-2 py-2 space-y-0.5">
                   {filteredAvailable.length === 0 ? (
@@ -236,6 +264,9 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                       <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[s.source] ?? SOURCE_CLS.builtin}`}>
                         {SOURCE_LABEL[s.source] ?? '内置'}
                       </span>
+                      {s.timeframes?.includes('1m') && (
+                        <span className={TF_BADGE_CLS}>分钟</span>
+                      )}
                       <Plus className="h-3.5 w-3.5 text-muted/40 group-hover:text-accent shrink-0" />
                     </button>
                   ))}
@@ -247,6 +278,15 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                 <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border/60 shrink-0">
                   <GripVertical className="h-3 w-3 text-muted/50" />
                   <span className="text-[10px] text-muted">已选 · 上下拖拽排序</span>
+                  <button
+                    onClick={handleClearAll}
+                    disabled={draftPool.length === 0}
+                    title="清空已选策略池 (未点确定前可用「取消」恢复)"
+                    className="ml-auto inline-flex items-center gap-1 px-2 py-1 rounded-btn text-[10px] text-muted border border-border/60 hover:text-danger hover:border-danger/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer shrink-0"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    清空
+                  </button>
                 </div>
                 <div className="flex-1 overflow-y-auto px-2 py-2">
                   {draftPool.length === 0 ? (
@@ -280,6 +320,9 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                             <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[src] ?? SOURCE_CLS.builtin}`}>
                               {SOURCE_LABEL[src] ?? '内置'}
                             </span>
+                            {s?.timeframes?.includes('1m') && (
+                              <span className={TF_BADGE_CLS}>分钟</span>
+                            )}
                             <button
                               onClick={(e) => { e.stopPropagation(); handleRemove(id) }}
                               className="text-muted/40 hover:text-danger transition-colors cursor-pointer leading-none shrink-0"
