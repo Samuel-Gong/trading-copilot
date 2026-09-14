@@ -25,6 +25,7 @@ from app.services import (
     statement_import,
     watchlist,
 )
+from app.services.definition_transactions import definitions_transaction
 from app.services.stock_analyzer import analyze_stock_stream
 from app.strategy import monitor_rules
 
@@ -42,6 +43,7 @@ class _MonitorEngineSyncRetryState:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.generation = 0
+        self.pending_cleanup_symbols: set[str] = set()
         self.worker: threading.Thread | None = None
 
 
@@ -182,8 +184,19 @@ def _retry_monitor_engine_sync(
                 if state.stop_event.is_set():
                     return
                 generation = state.generation
+                pending_cleanup = set(state.pending_cleanup_symbols)
             try:
-                sync_engine(request)
+                # 与正常交易写入使用同一外层锁：持仓复检、规则删除及运行态同步
+                # 是一个线性化步骤，重新买入不能插入复检与删除之间。
+                with portfolio.mutation_guard():
+                    cleanup_targets = pending_cleanup - portfolio.held_symbols()
+                    if cleanup_targets:
+                        data_dir = request.app.state.repo.store.data_dir
+                        with definitions_transaction(data_dir), monitor_rules.locked():
+                            monitor_rules.delete_for_symbols(data_dir, cleanup_targets)
+                            sync_engine(request)
+                    else:
+                        sync_engine(request)
             except Exception:
                 if state.stop_event.is_set():
                     return
@@ -192,6 +205,7 @@ def _retry_monitor_engine_sync(
                 continue
             with state.lock:
                 if state.generation == generation:
+                    state.pending_cleanup_symbols.difference_update(pending_cleanup)
                     if state.worker is worker:
                         state.worker = None
                     released = True
@@ -230,13 +244,17 @@ def _start_monitor_engine_sync_retry_worker(
         raise
 
 
-def _schedule_monitor_engine_sync_retry(request: Request) -> None:
+def _schedule_monitor_engine_sync_retry(
+    request: Request,
+    cleanup_symbols: set[str] | None = None,
+) -> None:
     """每个应用仅保留一个重试线程,并确保新一代变更不会丢失。"""
     state = _monitor_engine_sync_retry_state(request)
     with state.lock:
         if state.stop_event.is_set():
             return
         state.generation += 1
+        state.pending_cleanup_symbols.update(cleanup_symbols or set())
         if state.worker is not None:
             return
         _start_monitor_engine_sync_retry_worker(request, state)
@@ -271,6 +289,7 @@ def stop_monitor_engine_sync_retry(app) -> None:
 def _cleanup_closed_position_rules(request: Request, held_before: set[str]) -> None:
     """交易落盘后清理规则,失败不得把已成功交易报告为失败。"""
     rules_changed = False
+    closed_symbols: set[str] = set()
     try:
         if not held_before:
             return
@@ -279,7 +298,7 @@ def _cleanup_closed_position_rules(request: Request, held_before: set[str]) -> N
             return
         store = getattr(request.app.state.repo, "store", None)
         data_dir = getattr(store, "data_dir", settings.data_dir)
-        with monitor_rules.locked():
+        with definitions_transaction(data_dir), monitor_rules.locked():
             rules_changed = bool(
                 monitor_rules.delete_for_symbols(data_dir, closed_symbols)
             )
@@ -287,11 +306,11 @@ def _cleanup_closed_position_rules(request: Request, held_before: set[str]) -> N
                 sync_engine(request)
     except Exception:
         logger.exception("closed position monitor rule cleanup failed")
-        if rules_changed:
+        if closed_symbols:
             try:
-                _schedule_monitor_engine_sync_retry(request)
+                _schedule_monitor_engine_sync_retry(request, closed_symbols)
             except Exception:
-                logger.exception("closed position monitor engine sync retry scheduling failed")
+                logger.exception("closed position monitor cleanup retry scheduling failed")
 
 
 @router.get("/accounts")
@@ -592,18 +611,24 @@ def list_price_monitors(request: Request):
 def save_price_monitor(symbol: str, body: PositionPriceMonitorRequest, request: Request):
     data_dir = request.app.state.repo.store.data_dir
     try:
-        with monitor_rules.locked():
-            item = portfolio_price_monitors.save_monitor(
-                data_dir,
-                symbol=symbol,
-                name=body.name,
-                asset_type=body.asset_type,
-                stop_loss_price=body.stop_loss_price,
-                add_position_price=body.add_position_price,
-                webhook_channels=list(body.webhook_channels),
-            )
-            sync_engine(request)
-        return item
+        asset_type = request.app.state.repo.resolve_asset_type(symbol)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="资产类型解析失败，请稍后重试") from exc
+    if asset_type not in {"stock", "etf"}:
+        raise HTTPException(status_code=422, detail=f"持仓价格监控不支持资产类型: {asset_type}")
+    if body.asset_type != asset_type:
+        raise HTTPException(status_code=422, detail="资产类型与证券代码不匹配")
+    try:
+        return portfolio_price_monitors.save_monitor(
+            data_dir,
+            symbol=symbol,
+            name=body.name,
+            asset_type=asset_type,
+            stop_loss_price=body.stop_loss_price,
+            add_position_price=body.add_position_price,
+            webhook_channels=list(body.webhook_channels),
+            reload_rules=lambda: sync_engine(request),
+        )
     except Exception as exc:
         raise _map_error(exc) from exc
 

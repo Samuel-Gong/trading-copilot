@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
+
+from app.enriched_generation import EnrichedGenerationUnavailableError
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -29,7 +31,15 @@ def get_rotation(
         columns: {日期: [[成员名, 涨幅小数], ...]} 每列各自降序
         concept_count: 去重维度成员总数
     """
-    return rps_rotation.build_rps_rotation(request.app.state.repo, days, kind, level)
+    try:
+        return rps_rotation.build_rps_rotation(request.app.state.repo, days, kind, level)
+    except EnrichedGenerationUnavailableError as exc:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=503,
+            detail="enriched 快照正在换代，请稍后重试",
+        ) from exc
 
 
 class AnalyzeRequest(BaseModel):

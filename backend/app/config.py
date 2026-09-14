@@ -1,6 +1,7 @@
 """全局配置 — 从环境变量 / .env 读取。"""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -63,11 +64,17 @@ def _project_root() -> Path:
 
 _PROJECT_ROOT = _project_root()
 _RESOURCE_ROOT = _resource_root()
+_ENV_FILE = Path(
+    os.environ.get(
+        "TICKFLOW_ENV_FILE",
+        str(_RESOURCE_ROOT / ".env") if not _IS_FROZEN else ".env",
+    )
+)
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(_RESOURCE_ROOT / ".env") if not _IS_FROZEN else ".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -91,6 +98,11 @@ class Settings(BaseSettings):
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     )
+    # AI 输出上限 (max_tokens) 与输入上下文窗口上限 (约 token)。
+    # 任务级 max_tokens 会被钳制到 ai_max_output_tokens; 输入估算超出上下文窗口时给出明确报错。
+    # 默认 8192 高于所有现有任务 (最多 4500), 避免默认配置反而截断长报告; 可在 AI 设置里调整。
+    ai_max_output_tokens: int = 8192
+    ai_context_window: int = 64000
 
     # 每日复盘新闻证据。采用 trading-copilot-bak / daily_stock_analysis 中的
     # NewsNow 默认源组合；抓取失败时复用本地归档并 fail-open。
@@ -141,6 +153,10 @@ class Settings(BaseSettings):
             raise ValueError("backtest_matrix_cache_max_mb must be positive")
         if self.backtest_matrix_cache_prewarm_years <= 0:
             raise ValueError("backtest_matrix_cache_prewarm_years must be positive")
+        if self.ai_max_output_tokens <= 0:
+            raise ValueError("ai_max_output_tokens must be positive")
+        if self.ai_context_window <= 0:
+            raise ValueError("ai_context_window must be positive")
         return self
 
     @property

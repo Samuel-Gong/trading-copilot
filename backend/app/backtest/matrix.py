@@ -34,6 +34,7 @@ from app.price_limits import (
     numpy_limit_price,
     write_numpy_price_limit_matrix,
 )
+from app.strategy.scoring import SCORING_DIRECTION_LOW
 
 try:
     from numba import njit, prange
@@ -50,7 +51,7 @@ except ImportError:
     prange = range
 
 _MATRIX_CACHE_VERSION = 1
-_DIRECT_MATRIX_LOADER_VERSION = 4
+_DIRECT_MATRIX_LOADER_VERSION = 5
 _MATRIX_AXIS_INDEX_VERSION = 1
 _ARROW_BATCH_SIZE = 131_072
 _SCORE_ASSET_CHUNK_SIZE = 256
@@ -58,6 +59,17 @@ _ROLLING_MATERIALIZED_WINDOW_BUDGET_BYTES = 32 * 1024 * 1024
 _MATRIX_DISK_CACHE_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
+
+
+class MatrixPrewarmCancelledError(RuntimeError):
+    """A matrix cache prewarm was cancelled during application shutdown."""
+
+
+def _raise_if_matrix_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise MatrixPrewarmCancelledError("matrix cache prewarm cancelled")
+
+
 _MATRIX_DISK_CACHE_LOCK = threading.RLock()
 _MATRIX_DISK_CACHE_LEASES: dict[str, int] = {}
 _MATRIX_DISK_CACHE_PENDING_DELETE: set[str] = set()
@@ -431,6 +443,8 @@ class MarketDataMatrix:
     cache_path: str | None = None
     cache_lease: Any | None = field(default=None, compare=False, repr=False)
     vector_fields: frozenset[str] = field(default_factory=frozenset)
+    # 由输入面板或 Parquet 直接提供的字段，不含兼容性合成字段。
+    source_fields: frozenset[str] = field(default_factory=frozenset)
     cache_timing_ms: Mapping[str, float] = field(default_factory=dict)
     _valid_bars: ValidBarIndex | None = field(
         default=None,
@@ -539,6 +553,9 @@ class MarketMatrix:
     exit_signal_code: np.ndarray
     entry_signal_ids: tuple[str, ...]
     exit_signal_ids: tuple[str, ...]
+    # 逐格入场价覆盖 (time x asset, NaN=回退 open/close 惯例)。分钟策略回测用:
+    # 信号在盘中第 m 根触发, 入场价 = 触发分钟收盘价, 而非当日开盘/收盘。
+    entry_price: np.ndarray | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -659,6 +676,7 @@ def build_market_data_matrix(
         limit_up_locked=limit_up_locked,
         limit_down_locked=limit_down_locked,
         fields=MappingProxyType(fields),
+        source_fields=frozenset(panel.columns),
     )
 
 
@@ -678,8 +696,10 @@ def load_market_data_matrix_from_parquet(
     cache_max_bytes: int = _MATRIX_DISK_CACHE_DEFAULT_MAX_BYTES,
     profile_generation: str = "default",
     source_generation: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> MarketDataMatrix:
     """Load a daily market matrix, reusing a covering read-only mmap when possible."""
+    _raise_if_matrix_cancelled(cancel_event)
     if start > end:
         raise ValueError("matrix parquet range start must not exceed end")
     root = Path(parquet_root)
@@ -728,6 +748,7 @@ def load_market_data_matrix_from_parquet(
             instruments,
             batch_size=batch_size,
             cache_status="disabled",
+            cancel_event=cancel_event,
         )
 
     cache_dir = Path(cache_root)
@@ -806,7 +827,9 @@ def load_market_data_matrix_from_parquet(
         source_generation,
         batch_size=batch_size,
         axis_cache_root=cache_dir,
+        cancel_event=cancel_event,
     )
+    _raise_if_matrix_cancelled(cancel_event)
     _prune_matrix_disk_cache(
         cache_dir,
         keep=cache_path,
@@ -915,12 +938,15 @@ def _build_market_data_matrix_from_dataset(
     *,
     batch_size: int,
     cache_status: str,
+    cancel_event: threading.Event | None = None,
 ) -> MarketDataMatrix:
+    _raise_if_matrix_cancelled(cancel_event)
     filter_expr = _matrix_filter_expression(start, end, symbols)
     actual_dates, actual_symbols = _collect_parquet_axes(
         dataset,
         filter_expr,
         batch_size=batch_size,
+        cancel_event=cancel_event,
     )
     if not actual_dates or not actual_symbols:
         raise ValueError("matrix parquet range contains no market data")
@@ -952,7 +978,9 @@ def _build_market_data_matrix_from_dataset(
         parquet_fields,
         seen,
         batch_size=batch_size,
+        cancel_event=cancel_event,
     )
+    _raise_if_matrix_cancelled(cancel_event)
     names, latest_limits = _populate_matrix_derived_arrays(
         actual_symbols,
         arrays,
@@ -1017,6 +1045,7 @@ def _build_market_data_matrix_from_dataset(
         limit_down_locked=limit_down_locked,
         fields=MappingProxyType(fields),
         cache_status=cache_status,
+        source_fields=frozenset(parquet_fields),
     )
 
 
@@ -1036,7 +1065,9 @@ def _build_market_data_matrix_cache_from_dataset(
     *,
     batch_size: int,
     axis_cache_root: Path,
+    cancel_event: threading.Event | None = None,
 ) -> None:
+    _raise_if_matrix_cancelled(cancel_event)
     build_started = time.perf_counter()
     timing_ms: dict[str, float] = {}
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1056,7 +1087,9 @@ def _build_market_data_matrix_cache_from_dataset(
             filter_expr,
             batch_size=batch_size,
             cache_root=axis_cache_root,
+            cancel_event=cancel_event,
         )
+        _raise_if_matrix_cancelled(cancel_event)
         if not actual_dates or not actual_symbols:
             raise ValueError("matrix parquet range contains no market data")
         timing_ms["axes"] = round((time.perf_counter() - stage_started) * 1000, 1)
@@ -1100,7 +1133,9 @@ def _build_market_data_matrix_cache_from_dataset(
             parquet_fields,
             seen,
             batch_size=batch_size,
+            cancel_event=cancel_event,
         )
+        _raise_if_matrix_cancelled(cancel_event)
         if not seen.any():
             raise ValueError("matrix parquet range contains no requested market data")
         timing_ms["scan"] = round((time.perf_counter() - stage_started) * 1000, 1)
@@ -1117,6 +1152,7 @@ def _build_market_data_matrix_cache_from_dataset(
             vector_fields=vector_fields,
         )
         _mask_unseen_staging_fields(fields, seen)
+        _raise_if_matrix_cancelled(cancel_event)
         if "price_limit_pct" in fields:
             write_numpy_price_limit_matrix(
                 fields["price_limit_pct"],
@@ -1146,6 +1182,7 @@ def _build_market_data_matrix_cache_from_dataset(
             apply_latest_limits=actual_dates[-1] == _latest_partition_date(root),
         )
         timing_ms["derived"] = round((time.perf_counter() - stage_started) * 1000, 1)
+        _raise_if_matrix_cancelled(cancel_event)
         stage_started = time.perf_counter()
         for values in mapped:
             values.flush()
@@ -1175,11 +1212,13 @@ def _build_market_data_matrix_cache_from_dataset(
             "names": list(names),
             "arrays": array_specs,
             "fields": field_specs,
+            "source_fields": sorted(parquet_fields),
         }
         (temporary / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
+        _raise_if_matrix_cancelled(cancel_event)
         try:
             os.replace(temporary, cache_path)
         except OSError:
@@ -1312,6 +1351,7 @@ def _scan_matrix_values(
     seen: np.ndarray,
     *,
     batch_size: int,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     date_to_id = {value: index for index, value in enumerate(actual_dates)}
     symbol_to_id = {value: index for index, value in enumerate(actual_symbols)}
@@ -1342,6 +1382,7 @@ def _scan_matrix_values(
         **{name: fields[name] for name in parquet_fields},
     }
     for batch in scanner.to_batches():
+        _raise_if_matrix_cancelled(cancel_event)
         time_ids = _arrow_axis_ids(_batch_column(batch, "date"), date_to_id)
         asset_ids = _arrow_axis_ids(_batch_column(batch, "symbol"), symbol_to_id)
         flat_ids = time_ids.astype(np.int64) * asset_count + asset_ids
@@ -1391,12 +1432,23 @@ def _populate_matrix_derived_arrays(
     if "turnover_rate" in wanted_fields and "turnover_rate" not in parquet_fields:
         float_shares = fields.get("float_shares")
         if float_shares is None:
-            raise ValueError("matrix turnover_rate requires float_shares")
-        _write_turnover_rate_matrix(
-            fields["turnover_rate"],
-            arrays["volume"],
-            float_shares,
-        )
+            # 非股票资产 (etf/index) 无股本数据: instruments 无 float_shares 列,
+            # 也无法从 parquet 读到 turnover_rate (数据源不提供, ETF 无换手率口径)。
+            # 此时矩阵中该字段保持全 NaN 列 (matrix_fields 已占位), 与运行期
+            # _optional_field 的降级语义一致, 供不需要换手率的策略正常回测。
+            # 若本应有股本 (vector_fields 含 float_shares) 却取不到值, 才是数据
+            # 异常, 由 _resolve_matrix_storage_fields 的 vector 装载路径显式失败。
+            if "float_shares" in vector_fields:
+                raise ValueError("matrix turnover_rate requires float_shares")
+            logger.debug(
+                "turnover_rate unavailable (asset has no float_shares); keeping NaN column"
+            )
+        else:
+            _write_turnover_rate_matrix(
+                fields["turnover_rate"],
+                arrays["volume"],
+                float_shares,
+            )
     return names, latest_limits
 
 
@@ -1728,6 +1780,7 @@ def _load_market_data_matrix_cache(
         cache_path=str(path),
         cache_lease=_MatrixDiskCacheLease(path),
         vector_fields=vector_field_names,
+        source_fields=frozenset(str(name) for name in manifest["source_fields"]),
         cache_timing_ms=MappingProxyType({
             str(name): float(value)
             for name, value in manifest.get("build_timing_ms", {}).items()
@@ -1786,6 +1839,7 @@ def _slice_and_project_market_data_matrix(
         cache_path=sliced.cache_path,
         cache_lease=sliced.cache_lease,
         vector_fields=frozenset(),
+        source_fields=sliced.source_fields & requested_fields,
         cache_timing_ms=sliced.cache_timing_ms,
     )
 
@@ -1897,7 +1951,9 @@ def _load_or_build_matrix_axes(
     *,
     batch_size: int,
     cache_root: Path,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[date], list[str]]:
+    _raise_if_matrix_cancelled(cancel_event)
     path = _matrix_axis_cache_path(cache_root, parquet_root, start, end, symbols)
     previous: dict[str, Any] | None = None
     if path.exists():
@@ -1930,6 +1986,7 @@ def _load_or_build_matrix_axes(
                 dataset,
                 filter_expr,
                 batch_size=batch_size,
+                cancel_event=cancel_event,
             )
             changed_labels = set()
             retained_dates = {value.isoformat() for value in actual_dates}
@@ -1955,6 +2012,7 @@ def _load_or_build_matrix_axes(
             )
             symbols_set = set(actual_symbols)
             for batch in scanner.to_batches():
+                _raise_if_matrix_cancelled(cancel_event)
                 retained_dates.update(
                     value.isoformat()
                     for value in pc.unique(_batch_column(batch, "date")).to_pylist()
@@ -1970,8 +2028,10 @@ def _load_or_build_matrix_axes(
             dataset,
             filter_expr,
             batch_size=batch_size,
+            cancel_event=cancel_event,
         )
 
+    _raise_if_matrix_cancelled(cancel_event)
     payload = {
         "version": _MATRIX_AXIS_INDEX_VERSION,
         "source_partitions": dict(source_partitions),
@@ -1992,6 +2052,7 @@ def _collect_parquet_axes(
     filter_expr,
     *,
     batch_size: int,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[date], list[str]]:
     dates: set[date] = set()
     symbols: set[str] = set()
@@ -2002,6 +2063,7 @@ def _collect_parquet_axes(
         use_threads=True,
     )
     for batch in scanner.to_batches():
+        _raise_if_matrix_cancelled(cancel_event)
         dates.update(pc.unique(_batch_column(batch, "date")).to_pylist())
         symbols.update(
             str(value)
@@ -2261,11 +2323,14 @@ def build_market_matrix_from_signals(
     exit_delay_bars: int = 0,
     reference_price: np.ndarray | None = None,
     minute_exit_trigger: bool = False,
+    entry_price_override: np.ndarray | None = None,
 ) -> MarketMatrix:
     """Combine base data and strategy signals into the matcher input matrix."""
     if entry_delay_bars not in (0, 1) or exit_delay_bars not in (0, 1):
         raise ValueError("phase-two MarketMatrix supports only zero or one bar delay")
     validate_signal_matrix(signals, market.shape)
+    if entry_price_override is not None and entry_price_override.shape != market.shape:
+        raise ValueError("entry_price_override shape does not match MarketDataMatrix")
 
     present = _present_matrix(market.open, market.high, market.low, market.close, market.volume)
     entry, entry_signal_time, entry_signal_code = _delay_signal_matrix(
@@ -2338,6 +2403,11 @@ def build_market_matrix_from_signals(
         exit_signal_code=exit_signal_code,
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
+        entry_price=(
+            np.array(entry_price_override, dtype=np.float32, copy=True)
+            if entry_price_override is not None
+            else None
+        ),
     )
 
 
@@ -2420,6 +2490,7 @@ def slice_market_data_matrix(market: MarketDataMatrix, start: int, stop: int) ->
         cache_path=market.cache_path,
         cache_lease=market.cache_lease,
         vector_fields=market.vector_fields,
+        source_fields=market.source_fields,
         cache_timing_ms=market.cache_timing_ms,
     )
     _make_read_only(
@@ -2546,6 +2617,7 @@ def _writable_market_copy(market: MarketDataMatrix) -> MarketDataMatrix:
         limit_up_locked=np.array(market.limit_up_locked, copy=True),
         limit_down_locked=np.array(market.limit_down_locked, copy=True),
         fields=MappingProxyType(fields),
+        source_fields=market.source_fields,
     )
 
 
@@ -2572,6 +2644,7 @@ def _readonly_market_view(market: MarketDataMatrix) -> MarketDataMatrix:
         limit_up_locked=_readonly_view(market.limit_up_locked),
         limit_down_locked=_readonly_view(market.limit_down_locked),
         fields=MappingProxyType(fields),
+        source_fields=market.source_fields,
     )
 
 
@@ -2634,6 +2707,7 @@ def _append_market_row(
         symbols=market.symbols,
         names=market.names,
         fields=MappingProxyType(fields),
+        source_fields=market.source_fields,
         **arrays,
     )
 
@@ -2997,6 +3071,7 @@ _VALID_REDUCE_MIN = 0
 _VALID_REDUCE_MAX = 1
 _VALID_REDUCE_MEAN = 2
 _VALID_REDUCE_STD = 3
+_VALID_REDUCE_SUM = 4
 
 
 @njit(cache=True, nogil=True, parallel=True)
@@ -3048,6 +3123,8 @@ def _valid_rolling_kernel(
                 mean = total / window_value
                 if operation == _VALID_REDUCE_MEAN:
                     out[row, asset_id] = mean
+                elif operation == _VALID_REDUCE_SUM:
+                    out[row, asset_id] = total
                 else:
                     squared = 0.0
                     for offset in range(window):
@@ -3181,6 +3258,30 @@ def valid_rolling_std(
             window,
             _VALID_REDUCE_STD,
             ddof=int(ddof),
+            bar_index=index,
+        ),
+    )
+
+
+def valid_rolling_sum(
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    window: int,
+    *,
+    bar_index: ValidBarIndex | None = None,
+) -> np.ndarray:
+    source = np.asarray(values, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(source)
+    index = _resolve_valid_bar_index(source, valid, bar_index)
+    return _cached_matrix_operation(
+        "valid_rolling_sum",
+        (source, valid, index.offsets, index.rows),
+        {"window": int(window)},
+        lambda: _valid_rolling_reduce(
+            source,
+            valid,
+            window,
+            _VALID_REDUCE_SUM,
             bar_index=index,
         ),
     )
@@ -3397,6 +3498,7 @@ class MatrixPipelineConfig:
     scoring: dict[str, float]
     order_by: str | None
     descending: bool
+    scoring_directions: dict[str, str] = field(default_factory=dict)
     asset_mask: np.ndarray | None = None
     protect_strategy_cache: bool = False
 
@@ -3462,6 +3564,7 @@ class MatrixStrategyPipeline:
                 config.order_by,
                 config.descending,
                 fallback=signals.score,
+                directions=config.scoring_directions,
             )
             entry_codes = np.where(entry != 0, signals.entry_signal_code, -1).astype(np.int16)
             exit_codes = np.where(signals.exit != 0, signals.exit_signal_code, -1).astype(np.int16)
@@ -3502,14 +3605,7 @@ def _estimate_pipeline_cache_bytes(
     for name in feature_names:
         if name in {"open", "high", "low", "close", "volume"} or name in market.fields:
             continue
-        if name == "vol_ratio_5d":
-            estimated += 2 * float_bytes
-        elif name == "ma20_bias":
-            estimated += 2 * float_bytes
-        elif name == "change_pct" or (
-            name.startswith("momentum_") and name.endswith("d")
-        ):
-            estimated += float_bytes
+        estimated += 5 * float_bytes
     return estimated
 
 
@@ -3588,6 +3684,7 @@ def build_matrix_score(
     descending: bool,
     *,
     fallback: np.ndarray,
+    directions: Mapping[str, str] | None = None,
 ) -> np.ndarray:
     weights = {name: float(weight) for name, weight in scoring.items() if float(weight) != 0.0}
     total_weight = sum(weights.values())
@@ -3639,6 +3736,8 @@ def build_matrix_score(
                 np.divide(scratch, row_range[:, None], out=scratch, where=mask)
                 np.logical_and(finite, ~varying_rows[:, None], out=mask)
                 scratch[mask] = np.float32(0.5)
+                if (directions or {}).get(name) == SCORING_DIRECTION_LOW:
+                    scratch[finite] = np.float32(1.0) - scratch[finite]
                 scratch *= normalized_weight
                 score[:, start:stop] += scratch
         score *= np.float32(100.0)
@@ -3665,38 +3764,48 @@ def build_matrix_score(
     return result
 
 
+_MATRIX_COMPUTED_FEATURES = frozenset({
+    "prev_close", "change_pct", "change_amount", "amplitude",
+    "boll_upper", "boll_lower", "boll_position", "boll_width",
+    "high_60d", "low_60d", "annual_vol_20d",
+    "macd_dif", "macd_dea", "macd_hist",
+    "macd_dif_pct", "macd_dea_pct", "macd_hist_pct",
+    "kdj_k", "kdj_d", "kdj_j", "atr_14", "atr_pct",
+    "vol_ma5", "vol_ma10", "vol_ratio_5d", "vol_ratio_10d", "vol_trend_5_10",
+    "turnover_ratio_5d", "log_amount", "amount_ratio_5d",
+    "gap_return", "intraday_return", "close_position",
+    "distance_to_high_60d", "distance_from_low_60d",
+    "max_ret_20d", "ret_skew_20d", "up_days_20d",
+    "amihud_20d", "turnover_z_60d", "vol_price_corr_20d",
+    "vwap_bias", "vol_trend_5_60",
+    "limit_up_count_20d", "limit_up_count_60d",
+    # --- 扩充批次 (2026-09-05): 与注册表/scoring 口径一致的 16 个新虚拟因子 ---
+    "log_float_mv", "mom_accel_20_60", "rsi_14_delta_5d",
+    "overnight_ret_20d", "intraday_ret_20d", "downside_vol_20d",
+    "vol_regime_5_60", "amplitude_trend_20_60", "obv_trend_20d",
+    "amount_mean_20d", "turnover_mean_20d", "turnover_std_20d",
+    "position_240d", "distance_to_high_240d", "kdj_kd_diff",
+})
+
+
 def matrix_feature(market: MarketDataMatrix, name: str) -> np.ndarray:
     if name in {"open", "high", "low", "close", "volume"} or name in market.fields:
         return market.field(name)
-    close_feature = (
-        name in {
-            "prev_close",
-            "change_pct",
-            "change_amount",
-            "amplitude",
-            "boll_upper",
-            "boll_lower",
-            "high_60d",
-            "low_60d",
-            "annual_vol_20d",
-            "ma20_bias",
-        }
+    supported = (
+        name in _MATRIX_COMPUTED_FEATURES
+        or (name.startswith("ma") and name.endswith("_bias") and name[2:-5].isdigit())
+        or (name.startswith("ema") and name.endswith("_bias") and name[3:-5].isdigit())
         or (name.startswith("ma") and name[2:].isdigit())
+        or (name.startswith("ema") and name[3:].isdigit())
         or (name.startswith("rsi_") and name[4:].isdigit())
-        or (
-            name.startswith("momentum_") and name.endswith("d")
-        )
+        or (name.startswith("momentum_") and name.endswith("d"))
     )
-    if close_feature:
-        source = market.close
-    elif name == "vol_ratio_5d":
-        source = market.volume
-    else:
+    if not supported:
         raise ValueError(f"unsupported matrix feature: {name}")
     with _activate_valid_bar_index(market.valid_bars):
         return _cached_matrix_operation(
             "matrix_feature",
-            (source,),
+            (market.close,),
             {"name": name},
             lambda: _compute_matrix_feature(market, name),
         )
@@ -3729,40 +3838,82 @@ def _compute_matrix_feature(market: MarketDataMatrix, name: str) -> np.ndarray:
         except ValueError as exc:
             raise ValueError(f"unsupported matrix feature: {name}") from exc
         return _valid_return_over_bars(market.close, close_valid, bars)
-    if name == "vol_ratio_5d":
+    if name.startswith("ma") and name.endswith("_bias"):
+        period = int(name.removeprefix("ma").removesuffix("_bias"))
+        return _matrix_relative(market.close, valid_rolling_mean(market.close, close_valid, period))
+    if name.startswith("ema") and name.endswith("_bias"):
+        period = int(name.removeprefix("ema").removesuffix("_bias"))
+        return _matrix_relative(market.close, _matrix_ema(market.close, close_valid, period))
+    if name.startswith("ma") and name[2:].isdigit():
+        return valid_rolling_mean(market.close, close_valid, int(name[2:]))
+    if name.startswith("ema") and name[3:].isdigit():
+        return _matrix_ema(market.close, close_valid, int(name[3:]))
+    if name in {"macd_dif", "macd_dea", "macd_hist"}:
+        dif, dea = _matrix_macd(market.close, close_valid)
+        if name == "macd_dif":
+            return dif
+        if name == "macd_dea":
+            return dea
+        return ((dif - dea) * np.float32(2.0)).astype(np.float32, copy=False)
+    if name in {"macd_dif_pct", "macd_dea_pct", "macd_hist_pct"}:
+        source = matrix_feature(market, name.removesuffix("_pct"))
+        return _matrix_ratio(source, market.close)
+    if name in {"vol_ratio_5d", "vol_ratio_10d"}:
+        window = 5 if name == "vol_ratio_5d" else 10
         volume_valid = close_valid & np.isfinite(market.volume)
         previous_volume = valid_shift(market.volume, 1, volume_valid)
         previous_mean = valid_rolling_mean(
             previous_volume,
             np.isfinite(previous_volume),
-            5,
+            window,
         )
+        return _matrix_ratio(market.volume, previous_mean)
+    if name in {"vol_ma5", "vol_ma10"}:
+        window = 5 if name == "vol_ma5" else 10
+        volume_valid = close_valid & np.isfinite(market.volume)
+        return valid_rolling_mean(market.volume, volume_valid, window)
+    if name == "vol_trend_5_10":
+        return _matrix_relative(
+            matrix_feature(market, "vol_ma5"),
+            matrix_feature(market, "vol_ma10"),
+        )
+    if name == "turnover_ratio_5d":
+        turnover = market.field("turnover_rate")
+        valid = close_valid & np.isfinite(turnover)
+        previous = valid_shift(turnover, 1, valid)
+        return _matrix_relative(
+            turnover,
+            valid_rolling_mean(previous, np.isfinite(previous), 5),
+        )
+    if name == "log_amount":
+        amount = market.field("amount")
         out = np.full(market.shape, np.nan, dtype=np.float32)
-        np.divide(
-            market.volume,
-            previous_mean,
-            out=out,
-            where=volume_valid & np.isfinite(previous_mean) & (previous_mean != 0),
-        )
+        valid = close_valid & np.isfinite(amount) & (amount >= 0)
+        np.log(amount + np.float32(1.0), out=out, where=valid)
         return out
-    if name == "ma20_bias":
-        ma20 = valid_rolling_mean(market.close, close_valid, 20)
-        out = np.full(market.shape, np.nan, dtype=np.float32)
-        np.divide(
-            market.close,
-            ma20,
-            out=out,
-            where=close_valid & np.isfinite(ma20) & (ma20 != 0),
+    if name == "amount_ratio_5d":
+        amount = market.field("amount")
+        valid = close_valid & np.isfinite(amount)
+        previous = valid_shift(amount, 1, valid)
+        return _matrix_relative(
+            amount,
+            valid_rolling_mean(previous, np.isfinite(previous), 5),
         )
-        out -= np.float32(1.0)
-        return out
-    if name.startswith("ma") and name[2:].isdigit():
-        return valid_rolling_mean(market.close, close_valid, int(name[2:]))
     if name == "boll_upper" or name == "boll_lower":
         middle = valid_rolling_mean(market.close, close_valid, 20)
         deviation = valid_rolling_std(market.close, close_valid, 20, ddof=1)
         offset = np.float32(2.0) * deviation
         return middle + offset if name == "boll_upper" else middle - offset
+    if name == "boll_position":
+        return _matrix_ratio(
+            market.close - matrix_feature(market, "boll_lower"),
+            matrix_feature(market, "boll_upper") - matrix_feature(market, "boll_lower"),
+        )
+    if name == "boll_width":
+        return _matrix_ratio(
+            matrix_feature(market, "boll_upper") - matrix_feature(market, "boll_lower"),
+            matrix_feature(market, "ma20"),
+        )
     if name == "high_60d":
         return valid_rolling_max(market.close, close_valid, 60)
     if name == "low_60d":
@@ -3775,6 +3926,29 @@ def _compute_matrix_feature(market: MarketDataMatrix, name: str) -> np.ndarray:
             20,
             ddof=1,
         ) * np.float32(252 ** 0.5)
+    if name in {"kdj_k", "kdj_d", "kdj_j"}:
+        low_valid = close_valid & np.isfinite(market.low)
+        high_valid = close_valid & np.isfinite(market.high)
+        low_9 = valid_rolling_min(market.low, low_valid, 9)
+        high_9 = valid_rolling_max(market.high, high_valid, 9)
+        rsv = _matrix_ratio(market.close - low_9, high_9 - low_9) * np.float32(100.0)
+        k = valid_ewm_adjust_false(rsv, np.isfinite(rsv), alpha=1.0 / 3.0)
+        if name == "kdj_k":
+            return k
+        d = valid_ewm_adjust_false(k, np.isfinite(k), alpha=1.0 / 3.0)
+        if name == "kdj_d":
+            return d
+        return (np.float32(3.0) * k - np.float32(2.0) * d).astype(np.float32, copy=False)
+    if name in {"atr_14", "atr_pct"}:
+        previous = valid_shift(market.close, 1, close_valid)
+        true_range = np.fmax.reduce([
+            market.high - market.low,
+            np.abs(market.high - previous),
+            np.abs(market.low - previous),
+        ]).astype(np.float32, copy=False)
+        true_range[~close_valid] = np.nan
+        atr = valid_ewm_adjust_false(true_range, np.isfinite(true_range), alpha=1.0 / 14.0)
+        return atr if name == "atr_14" else _matrix_ratio(atr, market.close)
     if name.startswith("rsi_") and name[4:].isdigit():
         window = int(name[4:])
         delta = market.close - valid_shift(market.close, 1, close_valid)
@@ -3798,7 +3972,214 @@ def _compute_matrix_feature(market: MarketDataMatrix, name: str) -> np.ndarray:
         np.divide(average_gain, denominator, out=out, where=np.isfinite(denominator))
         out = np.float32(100.0) - np.float32(100.0) / (np.float32(1.0) + out)
         return out
+    if name == "gap_return":
+        return _matrix_relative(market.open, valid_shift(market.close, 1, close_valid))
+    if name == "intraday_return":
+        return _matrix_relative(market.close, market.open)
+    if name == "close_position":
+        return _matrix_ratio(market.close - market.low, market.high - market.low)
+    if name == "distance_to_high_60d":
+        return _matrix_relative(market.close, matrix_feature(market, "high_60d"))
+    if name == "distance_from_low_60d":
+        return _matrix_relative(market.close, matrix_feature(market, "low_60d"))
+    if name == "max_ret_20d":
+        daily = matrix_feature(market, "change_pct")
+        return valid_rolling_max(daily, np.isfinite(daily), 20)
+    if name == "ret_skew_20d":
+        return _matrix_rolling_skew(matrix_feature(market, "change_pct"), 20)
+    if name == "up_days_20d":
+        daily = matrix_feature(market, "change_pct")
+        up = np.where(daily > 0, np.float32(1.0), np.float32(0.0)).astype(np.float32)
+        up[~np.isfinite(daily)] = np.nan
+        return valid_rolling_sum(up, np.isfinite(up), 20)
+    if name == "amihud_20d":
+        daily = matrix_feature(market, "change_pct")
+        amount = market.field("amount")
+        amount_yi = amount / np.float32(1e8)
+        illiquidity = _matrix_ratio(np.abs(daily), amount_yi)
+        return valid_rolling_mean(
+            illiquidity,
+            close_valid & np.isfinite(illiquidity),
+            20,
+        )
+    if name == "turnover_z_60d":
+        turnover = market.field("turnover_rate")
+        valid = close_valid & np.isfinite(turnover)
+        previous = valid_shift(turnover, 1, valid)
+        baseline_valid = np.isfinite(previous)
+        mean = valid_rolling_mean(previous, baseline_valid, 60)
+        std = valid_rolling_std(previous, baseline_valid, 60, ddof=1)
+        deviation = _matrix_ratio(turnover - mean, std)
+        deviation[np.isfinite(std) & (std <= 0)] = np.nan
+        return deviation
+    if name == "vol_price_corr_20d":
+        daily = matrix_feature(market, "change_pct")
+        return _matrix_rolling_corr(daily, market.volume, close_valid, 20)
+    if name == "vwap_bias":
+        amount = market.field("amount")
+        shares = market.volume * np.float32(100.0)
+        valid = close_valid & np.isfinite(amount) & (market.volume > 0) & (amount > 0)
+        vwap = np.full(market.shape, np.nan, dtype=np.float32)
+        np.divide(amount, shares, out=vwap, where=valid)
+        return _matrix_relative(market.close, vwap)
+    if name == "vol_trend_5_60":
+        volume_valid = close_valid & np.isfinite(market.volume)
+        fast = valid_rolling_mean(market.volume, volume_valid, 5)
+        slow = valid_rolling_mean(market.volume, volume_valid, 60)
+        return _matrix_relative(fast, slow)
+    if name in {"limit_up_count_20d", "limit_up_count_60d"}:
+        window = 20 if name == "limit_up_count_20d" else 60
+        consecutive = market.field("consecutive_limit_ups")
+        hits = np.where(np.isfinite(consecutive) & (consecutive > 0), np.float32(1.0), np.float32(0.0))
+        hits = hits.astype(np.float32)
+        return valid_rolling_sum(hits, close_valid, window)
+    # --- 扩充批次 (2026-09-05): numpy 内核实现, 口径与 strategy/scoring.py 一致 ---
+    if name == "log_float_mv":
+        turnover = market.field("turnover_rate")
+        valid = close_valid & np.isfinite(turnover) & (turnover > 0) & (market.volume > 0)
+        out = np.full(market.shape, np.nan, dtype=np.float32)
+        np.multiply(market.close, market.volume, out=out, where=valid)
+        np.multiply(out, np.float32(10_000.0), out=out, where=valid)
+        np.divide(out, turnover, out=out, where=valid)
+        np.log(out, out=out, where=valid)
+        return out
+    if name == "mom_accel_20_60" or name == "kdj_kd_diff":
+        left, right = (
+            (matrix_feature(market, "momentum_20d"), matrix_feature(market, "momentum_60d"))
+            if name == "mom_accel_20_60"
+            else (matrix_feature(market, "kdj_k"), matrix_feature(market, "kdj_d"))
+        )
+        out = np.full(market.shape, np.nan, dtype=np.float32)
+        np.subtract(left, right, out=out, where=np.isfinite(left) & np.isfinite(right))
+        return out
+    if name == "rsi_14_delta_5d":
+        rsi = matrix_feature(market, "rsi_14")
+        return rsi - valid_shift(rsi, 5, np.isfinite(rsi))
+    if name == "overnight_ret_20d":
+        overnight = _matrix_relative(market.open, matrix_feature(market, "prev_close"))
+        return valid_rolling_sum(overnight, np.isfinite(overnight), 20)
+    if name == "intraday_ret_20d":
+        intraday = _matrix_relative(market.close, market.open)
+        return valid_rolling_sum(intraday, np.isfinite(intraday), 20)
+    if name == "downside_vol_20d":
+        daily = matrix_feature(market, "change_pct")
+        downside = np.where(
+            np.isfinite(daily), np.minimum(daily, np.float32(0.0)), np.nan,
+        ).astype(np.float32)
+        mean_sq = valid_rolling_mean(np.square(downside, dtype=np.float32), np.isfinite(downside), 20)
+        out = np.full(market.shape, np.nan, dtype=np.float32)
+        np.sqrt(mean_sq, out=out, where=np.isfinite(mean_sq))
+        return out
+    if name == "vol_regime_5_60":
+        daily = matrix_feature(market, "change_pct")
+        valid = np.isfinite(daily)
+        return _matrix_ratio(
+            valid_rolling_std(daily, valid, 5, ddof=1),
+            valid_rolling_std(daily, valid, 60, ddof=1),
+        )
+    if name == "amplitude_trend_20_60":
+        amplitude = matrix_feature(market, "amplitude")
+        valid = np.isfinite(amplitude)
+        return _matrix_relative(
+            valid_rolling_mean(amplitude, valid, 20),
+            valid_rolling_mean(amplitude, valid, 60),
+        )
+    if name == "obv_trend_20d":
+        daily = matrix_feature(market, "change_pct")
+        volume_valid = close_valid & np.isfinite(market.volume)
+        signed = np.where(
+            np.isfinite(daily), np.sign(daily) * market.volume, np.nan,
+        ).astype(np.float32)
+        total = valid_rolling_sum(signed, volume_valid & np.isfinite(daily), 20)
+        scale = valid_rolling_mean(market.volume, volume_valid, 20) * np.float32(20.0)
+        return _matrix_ratio(total, scale)
+    if name == "amount_mean_20d":
+        amount = market.field("amount")
+        return valid_rolling_mean(amount / np.float32(1e8), np.isfinite(amount), 20)
+    if name == "turnover_mean_20d" or name == "turnover_std_20d":
+        turnover = market.field("turnover_rate")
+        valid = np.isfinite(turnover)
+        mean = valid_rolling_mean(turnover, valid, 20)
+        if name == "turnover_mean_20d":
+            return mean
+        return _matrix_ratio(valid_rolling_std(turnover, valid, 20, ddof=1), mean)
+    if name == "position_240d":
+        high = valid_rolling_max(market.close, close_valid, 240)
+        low = valid_rolling_min(market.close, close_valid, 240)
+        return _matrix_ratio(market.close - low, high - low)
+    if name == "distance_to_high_240d":
+        return _matrix_relative(market.close, valid_rolling_max(market.close, close_valid, 240))
     raise ValueError(f"unsupported matrix feature: {name}")
+
+
+def _matrix_rolling_skew(values: np.ndarray, window: int) -> np.ndarray:
+    valid = np.isfinite(values)
+    first = valid_rolling_mean(values, valid, window)
+    second = valid_rolling_mean(np.square(values, dtype=np.float32), valid, window)
+    third = valid_rolling_mean(
+        (values * values * values).astype(np.float32), valid, window
+    )
+    variance = second - np.square(first, dtype=np.float32)
+    central_third = (
+        third
+        - np.float32(3.0) * first * second
+        + np.float32(2.0) * np.power(first, 3)
+    )
+    out = _matrix_ratio(central_third, np.sqrt(np.power(variance, 3)))
+    out[np.isfinite(variance) & (variance <= 0)] = np.nan
+    return out
+
+
+def _matrix_rolling_corr(
+    left: np.ndarray, right: np.ndarray, valid_mask: np.ndarray, window: int
+) -> np.ndarray:
+    valid = valid_mask & np.isfinite(left) & np.isfinite(right)
+    product = (left * right).astype(np.float32)
+    mean_left = valid_rolling_mean(left, valid, window)
+    mean_right = valid_rolling_mean(right, valid, window)
+    mean_product = valid_rolling_mean(product, valid, window)
+    mean_left_sq = valid_rolling_mean(
+        np.square(left, dtype=np.float32), valid, window
+    )
+    mean_right_sq = valid_rolling_mean(
+        np.square(right, dtype=np.float32), valid, window
+    )
+    covariance = mean_product - mean_left * mean_right
+    variance_left = mean_left_sq - np.square(mean_left, dtype=np.float32)
+    variance_right = mean_right_sq - np.square(mean_right, dtype=np.float32)
+    denominator = np.sqrt(variance_left * variance_right)
+    out = _matrix_ratio(covariance, denominator)
+    degenerate = (
+        np.isfinite(variance_left)
+        & np.isfinite(variance_right)
+        & ((variance_left <= 0) | (variance_right <= 0))
+    )
+    out[degenerate] = np.nan
+    return out
+
+
+def _matrix_ema(values: np.ndarray, valid: np.ndarray, period: int) -> np.ndarray:
+    return valid_ewm_adjust_false(values, valid, alpha=2.0 / (period + 1.0))
+
+
+def _matrix_macd(values: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    dif = _matrix_ema(values, valid, 12) - _matrix_ema(values, valid, 26)
+    dif = dif.astype(np.float32, copy=False)
+    dea = valid_ewm_adjust_false(dif, np.isfinite(dif), alpha=2.0 / 10.0)
+    return dif, dea
+
+
+def _matrix_ratio(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    out = np.full(numerator.shape, np.nan, dtype=np.float32)
+    valid = np.isfinite(numerator) & np.isfinite(denominator) & (denominator != 0)
+    np.divide(numerator, denominator, out=out, where=valid)
+    return out
+
+
+def _matrix_relative(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    out = _matrix_ratio(numerator, denominator)
+    out[np.isfinite(out)] -= np.float32(1.0)
+    return out
 
 
 def apply_time_masks(

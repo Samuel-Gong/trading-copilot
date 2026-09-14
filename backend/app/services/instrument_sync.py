@@ -8,11 +8,11 @@ Starter+ 盘后可用 quotes.get(universes) 顺便补充 name。
 from __future__ import annotations
 
 import logging
-from datetime import date
 from pathlib import Path
 
 import polars as pl
 
+from app.market_time import cn_today
 from app.tickflow.client import get_client
 
 logger = logging.getLogger(__name__)
@@ -43,29 +43,9 @@ def _flatten_instruments(items: list[dict]) -> list[dict]:
     return rows
 
 
-def _fetch_instruments_via_provider() -> list[dict] | None:
-    """若当前日K数据源不是 tickflow 且该 provider 提供 get_instruments, 用它拉标的维表。
-
-    返回 flatten 行列表; 未命中(仍应走 tickflow)时返回 None。
-    标的维表跟随日K数据源(二者天然耦合, 无独立偏好项)。
-    """
-    from app.services import preferences
-
-    provider_name = preferences.get_daily_data_provider()
-    if provider_name == "tickflow":
-        return None
-    from app.data_providers import custom as custom_sources
-
-    if not custom_sources.is_custom_provider(provider_name):
-        return None
-    provider = custom_sources.get_provider(provider_name)
-    if not hasattr(provider, "get_instruments"):
-        return None
-    try:
-        items = provider.get_instruments("stock") or []
-    except Exception as e:  # noqa: BLE001
-        logger.warning("provider %s get_instruments 失败: %s", provider_name, e)
-        return None
+def _fetch_instruments_via_provider(provider_name: str, provider: object) -> list[dict]:
+    """在调用方持有的 Provider 租约内拉取并展开标的维表。"""
+    items = provider.get_instruments("stock") or []
     rows = _flatten_instruments(items)
     logger.info("instruments via %s: %d stocks", provider_name, len(rows))
     return rows
@@ -76,32 +56,57 @@ def sync_instruments(data_dir: Path) -> int:
 
     返回写入的行数。
     """
-    all_rows = _fetch_instruments_via_provider()
-    if all_rows is None:
-        # 未命中非 tickflow provider → 走 tickflow 直连
+    from app.services import preferences
+
+    provider_name = preferences.get_daily_data_provider()
+
+    def _publish(all_rows: list[dict], generation: int | None) -> int:
+        if not all_rows:
+            return 0
+        from app.services.provider_routes import provider_route_commit_guard
+
+        with provider_route_commit_guard(
+            provider_name,
+            generation,
+            preferences.get_daily_data_provider,
+            "instruments",
+        ):
+            df = pl.DataFrame(all_rows)
+            df = df.with_columns(pl.lit(cn_today()).alias("as_of"))
+            out = data_dir / "instruments" / "instruments.parquet"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            df.write_parquet(out)
+        logger.info("instruments synced: %d rows → %s", df.height, out)
+        return df.height
+
+    if provider_name == "tickflow":
         tf = get_client()
-        all_rows = []
+        tickflow_rows: list[dict] = []
         for ex in _EXCHANGES:
             try:
                 items = tf.exchanges.get_instruments(ex, instrument_type="stock")
                 if items:
-                    all_rows.extend(_flatten_instruments(items))
+                    tickflow_rows.extend(_flatten_instruments(items))
                     logger.info("instruments %s: %d stocks", ex, len(items))
             except Exception as e:
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
+        return _publish(tickflow_rows, None)
 
-    if not all_rows:
+    from app.data_providers import custom as custom_sources
+
+    if not custom_sources.provider_has_dataset(provider_name, "instruments"):
+        logger.error(
+            "selected daily provider %s does not provide instruments; refusing TickFlow fallback",
+            provider_name,
+        )
         return 0
-
-    df = pl.DataFrame(all_rows)
-    df = df.with_columns(pl.lit(date.today()).alias("as_of"))
-
-    out = data_dir / "instruments" / "instruments.parquet"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(out)
-
-    logger.info("instruments synced: %d rows → %s", df.height, out)
-    return df.height
+    try:
+        with custom_sources.lease_provider(provider_name) as (provider, generation):
+            rows = _fetch_instruments_via_provider(provider_name, provider)
+            return _publish(rows, generation)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("provider %s get_instruments 失败: %s", provider_name, exc)
+        return 0
 
 
 def enrich_names_from_quotes(

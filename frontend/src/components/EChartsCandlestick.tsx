@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useMemo } from 'react'
 import { chartTheme, getTheme, useTheme } from '@/lib/theme'
+import { fmtPct } from '@/lib/format'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
 
@@ -332,8 +333,9 @@ interface Props {
   symbol?: string
   linkedPrice?: number | null
   onDateClick?: (date: string) => void
-  /** 默认可见蜡烛根数, 默认 60 */
-  visibleBars?: number
+  onPriceDoubleClick?: (price: number, currentPrice: number) => void
+  /** 默认可见蜡烛根数, 默认 60; 'all' = 初始适配显示全部返回数据 */
+  visibleBars?: number | 'all'
   /** 已激活的子图 key 列表 (含 vol, 按点击顺序) */
   activeIndicators?: string[]
   /** 成交量柱相对前 N 个交易日均量的显示设置 */
@@ -551,6 +553,24 @@ function buildOption(
   const series: any[] = []
   const xAxisIndices: number[] = []
 
+  const priceLineValues = (priceLines ?? [])
+    .map(line => line.value)
+    .filter(value => Number.isFinite(value) && value > 0)
+  const axisMin = priceLineValues.length > 0
+    ? ({ min, max }: { min: number; max: number }) => {
+        const nextMin = Math.min(min, ...priceLineValues)
+        const nextMax = Math.max(max, ...priceLineValues)
+        return nextMin - Math.max((nextMax - nextMin) * 0.03, nextMax * 0.001)
+      }
+    : undefined
+  const axisMax = priceLineValues.length > 0
+    ? ({ min, max }: { min: number; max: number }) => {
+        const nextMin = Math.min(min, ...priceLineValues)
+        const nextMax = Math.max(max, ...priceLineValues)
+        return nextMax + Math.max((nextMax - nextMin) * 0.03, nextMax * 0.001)
+      }
+    : undefined
+
   // ===== grid 0: K线主图 =====
   grids.push({ left, right, top: topPad, height: candleAvail })
   xAxes.push({
@@ -562,6 +582,8 @@ function buildOption(
   })
   yAxes.push({
     scale: true,
+    min: axisMin,
+    max: axisMax,
     // 上下各留 3% 边距: 防止最高/最低点的蜡烛贴边, 涨停/炸板标签被遮挡
     boundaryGap: [0.03, 0.03],
     splitArea: { show: false },
@@ -791,6 +813,7 @@ export function EChartsCandlestick({
   symbol: _symbol,
   linkedPrice,
   onDateClick,
+  onPriceDoubleClick,
   visibleBars = 60,
   activeIndicators = [],
   volumeCompare = { enabled: true, days: 1 },
@@ -801,6 +824,8 @@ export function EChartsCandlestick({
   dataRef.current = data
   const onDateClickRef = useRef(onDateClick)
   onDateClickRef.current = onDateClick
+  const onPriceDoubleClickRef = useRef(onPriceDoubleClick)
+  onPriceDoubleClickRef.current = onPriceDoubleClick
   // 主题: buildOption/信息栏内部通过 CT() 动态取调色板, 这里只负责切换时触发重建
   const theme = useTheme()
 
@@ -808,6 +833,8 @@ export function EChartsCandlestick({
   const infoIdxRef = useRef<number>(data.length - 1)
   const compactRef = useRef(false)
   const userZoomRef = useRef<{ start: number; end: number } | null>(null)
+  // 竖虚线(crosshair)是否可见: 控制信息栏「至今」字段的显隐。鼠标移出图表区即 false。
+  const hoverActiveRef = useRef(false)
 
   // 需要在闭包中访问最新值的变量 — 先声明占位，后面赋值
   const activeIndicatorsRef = useRef(activeIndicators)
@@ -864,11 +891,13 @@ export function EChartsCandlestick({
     return m
   }, [dates])
 
-  // 计算 dataZoom 初始范围
-  const initialZoom = useMemo(() => ({
-    start: Math.max(0, 100 - (visibleBars / Math.max(data.length, 1)) * 100),
-    end: 100,
-  }), [visibleBars, data.length])
+  // dataZoom 初始范围: 'all' = 显示整段数据, 否则取末尾 visibleBars 根
+  const initialZoom = useMemo(() => {
+    const start = visibleBars === 'all'
+      ? 0
+      : Math.max(0, 100 - (visibleBars / Math.max(data.length, 1)) * 100)
+    return { start, end: 100 }
+  }, [visibleBars, data.length])
 
   // ===== 信息栏 HTML 内容 (基于 infoIdxRef.current) =====
   const getInfoBarHTML = useCallback(() => {
@@ -887,7 +916,7 @@ export function EChartsCandlestick({
     const floatShares = stockInfo?.float_shares
     const turnoverRate = floatShares && d.volume ? (d.volume * 100 / floatShares * 100) : null
 
-    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;height:20px;flex-wrap:wrap">`
+    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;min-height:20px;flex-wrap:wrap">`
     html += `<span style="color:${CT().text}">${d.date}</span>`
     html += `<span style="color:${CT().text}">开</span>`
     html += `<span style="color:${d.open >= d.close ? THEME.bear : THEME.bull}">${d.open.toFixed(2)}</span>`
@@ -906,11 +935,25 @@ export function EChartsCandlestick({
       html += `<span style="color:${CT().text}">换手</span>`
       html += `<span style="color:${CT().text}">${turnoverRate.toFixed(2)}%</span>`
     }
+    // 至今: 仅当竖虚线(crosshair)在图上且鼠标悬停某根 K 线时显示。
+    // 最新价取最后一根K线收盘 (后端 _maybe_inject_live_candle 盘中注入实时价, 收盘后即最近收盘)。
+    // 基准取该K线昨收(前一日收盘), 与同花顺及全市场涨幅口径一致; 数据第一根K线无昨收则跳过。
+    if (hoverActiveRef.current && prev && Number.isFinite(prev.close) && prev.close > 0) {
+      const latestPrice = data[data.length - 1].close
+      if (Number.isFinite(latestPrice)) {
+        const sinceRatio = (latestPrice - prev.close) / prev.close
+        const sinceClr = sinceRatio >= 0 ? THEME.bull : THEME.bear
+        html += `<span style="color:${CT().text}">至今</span>`
+        html += `<span style="color:${sinceClr}">${fmtPct(sinceRatio)}</span>`
+        // 周期数: 从该K线(含)到最新一根K线共多少根; 悬停最后一根时为 1
+        html += `<span style="color:${CT().text}">周期 ${data.length - idx}</span>`
+      }
+    }
     html += `</div>`
 
     // 第二行: MA + BOLL
     if (showMA) {
-      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;height:20px;flex-wrap:wrap">`
+      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;select:none;min-height:20px;flex-wrap:wrap">`
       if (d.ma5 != null) html += `<span style="color:${THEME.ma5}">MA5:${Number(d.ma5).toFixed(2)}</span>`
       if (d.ma10 != null) html += `<span style="color:${THEME.ma10}">MA10:${Number(d.ma10).toFixed(2)}</span>`
       if (d.ma20 != null) html += `<span style="color:${THEME.ma20}">MA20:${Number(d.ma20).toFixed(2)}</span>`
@@ -925,12 +968,17 @@ export function EChartsCandlestick({
   }, [data, stockInfo, showMA, activeIndicators])
   getInfoBarHTMLRef.current = getInfoBarHTML
 
-  // data 变化时重置 infoIdx
+  // data/symbol 变化时重置 infoIdx:
+  // symbol(_symbol) 进依赖是必要的——预取切股到同长度邻股时 data.length 不变,
+  // 但悬停上下文来自上一只股票, 必须清掉 hoverActiveRef 以免「至今/周期」残留显示。
+  // (同一股的实时刷新 symbol 不变, 不触发, 悬停位置与「至今」保持实时)
   useEffect(() => {
     infoIdxRef.current = data.length - 1
     compactRef.current = false
     userZoomRef.current = null
-  }, [data.length])
+    // 新数据无悬停上下文, 隐藏「至今」; 下次鼠标移动时由 updateAxisPointer 重新置位
+    hoverActiveRef.current = false
+  }, [_symbol, data.length])
 
   // ===== 初始化 chart (只在 chartHeight 变化时重建) =====
   useEffect(() => {
@@ -941,32 +989,36 @@ export function EChartsCandlestick({
     chartRef.current = chart
 
     // 鼠标移动 → 只更新 ref + DOM，不触发 React re-render
-    // 设计原则: 找不到有效数据时保持上次显示，永远不清空信息栏
+    // 设计原则: 找不到有效数据时保持上次显示，永远不清空信息栏; 鼠标移出时仅隐藏「至今」。
     chart.on('updateAxisPointer', (event: any) => {
       const axesInfo = event.axesInfo
-      if (!axesInfo) return // 鼠标移出图表区域，保持当前显示
-      for (const info of Object.values(axesInfo)) {
-        const val = (info as any)?.value
-        if (val == null) continue
-        const d = dataRef.current
-        const idx = typeof val === 'number' ? val : d.findIndex(x => x.date === val)
-        if (idx >= 0 && idx < d.length) {
-          if (infoIdxRef.current === idx) return
-          infoIdxRef.current = idx
-
-          // 直接更新信息栏 DOM (通过 ref 读取最新的生成函数)
-          const infoEl = infoBarRef.current
-          if (infoEl) {
-            const html = getInfoBarHTMLRef.current()
-            if (html) infoEl.innerHTML = html  // 只在有内容时更新
-          }
-
-          // 更新子图 graphic
-          triggerInfoBarUpdate()
-          return
+      const d = dataRef.current
+      // 竖虚线是否正落在某根有效 K 线上 (鼠标在图表数据区内)
+      let foundIdx = -1
+      if (axesInfo) {
+        for (const info of Object.values(axesInfo)) {
+          const val = (info as any)?.value
+          if (val == null) continue
+          const idx = typeof val === 'number' ? val : d.findIndex(x => x.date === val)
+          if (idx >= 0 && idx < d.length) { foundIdx = idx; break }
         }
       }
-      // 没有找到有效数据 — 不做任何操作，保持上次显示
+      const active = foundIdx >= 0
+      const idxChanged = foundIdx >= 0 && infoIdxRef.current !== foundIdx
+      const visChanged = active !== hoverActiveRef.current
+      hoverActiveRef.current = active
+      if (idxChanged) infoIdxRef.current = foundIdx
+      // 竖虚线显隐或悬停 K 线变化 → 重绘一次信息栏 (控制「至今」字段显隐 + 当前 K 线数据)
+      if (visChanged || idxChanged) {
+        const infoEl = infoBarRef.current
+        if (infoEl) {
+          const html = getInfoBarHTMLRef.current()
+          if (html) infoEl.innerHTML = html  // 只在有内容时更新
+        }
+      }
+      if (foundIdx < 0) return
+      // 更新子图 graphic (仅悬停 K 线变化时; 纯显隐切换不影响副图)
+      if (idxChanged) triggerInfoBarUpdate()
     })
 
     chart.on('click', (params: any) => {
@@ -981,6 +1033,18 @@ export function EChartsCandlestick({
         onDateClickRef.current?.(d[idx].date)
       }
     })
+
+    const handlePriceDoubleClick = (event: { offsetX: number; offsetY: number }) => {
+      const pixel: [number, number] = [event.offsetX, event.offsetY]
+      if (!chart.containPixel({ gridIndex: 0 }, pixel)) return
+      const coordinate = chart.convertFromPixel({ xAxisIndex: 0, yAxisIndex: 0 }, pixel)
+      const price = Array.isArray(coordinate) ? Number(coordinate[1]) : NaN
+      const currentPrice = dataRef.current[dataRef.current.length - 1]?.close
+      if (Number.isFinite(price) && price > 0 && Number.isFinite(currentPrice) && currentPrice > 0) {
+        onPriceDoubleClickRef.current?.(price, currentPrice)
+      }
+    }
+    chart.getZr().on('dblclick', handlePriceDoubleClick)
 
     // dataZoom → 只更新 ref，不触发 React re-render
     // compact 变化时需要增量更新 markPoint
@@ -1007,6 +1071,7 @@ export function EChartsCandlestick({
       chart.off('updateAxisPointer')
       chart.off('click')
       chart.off('dataZoom')
+      chart.getZr().off('dblclick', handlePriceDoubleClick)
       ro.disconnect()
       chart.dispose()
       chartRef.current = null
@@ -1122,7 +1187,7 @@ export function EChartsCandlestick({
     if (!d) return ''
     const floatShares = stockInfo?.float_shares
     const turnoverRate = floatShares && d.volume ? (d.volume * 100 / floatShares * 100) : null
-    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;height:20px;flex-wrap:wrap">`
+    let html = `<div style="display:flex;align-items:center;gap:6px;padding:0 8px;font:11px 'JetBrains Mono',monospace;min-height:20px;flex-wrap:wrap">`
     html += `<span style="color:${CT().text}">${d.date}</span>`
     html += `<span style="color:${CT().text}">开</span>`
     html += `<span style="color:${d.open >= d.close ? THEME.bear : THEME.bull}">${d.open.toFixed(2)}</span>`
@@ -1145,7 +1210,7 @@ export function EChartsCandlestick({
     }
     html += `</div>`
     if (showMA) {
-      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;height:20px;flex-wrap:wrap">`
+      html += `<div style="display:flex;align-items:center;gap:10px;padding:0 8px;font:11px 'JetBrains Mono',monospace;min-height:20px;flex-wrap:wrap">`
       if (d.ma5 != null) html += `<span style="color:${THEME.ma5}">MA5:${Number(d.ma5).toFixed(2)}</span>`
       if (d.ma10 != null) html += `<span style="color:${THEME.ma10}">MA10:${Number(d.ma10).toFixed(2)}</span>`
       if (d.ma20 != null) html += `<span style="color:${THEME.ma20}">MA20:${Number(d.ma20).toFixed(2)}</span>`

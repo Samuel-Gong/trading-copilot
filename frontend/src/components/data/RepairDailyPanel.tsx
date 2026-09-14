@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
+import { MissingCapChip } from '@/lib/capability-labels'
 import { DatePicker } from '@/components/DatePicker'
 
 function pad(n: number) { return String(n).padStart(2, '0') }
@@ -17,14 +18,15 @@ function daysAgo(n: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
-export function RepairDailyPanel({ caps, isRunning, latestDate, onStart }: {
-  caps: { label: string; capabilities: Record<string, { rpm: number | null; batch: number | null; subscribe: number | null }> } | undefined
+// hasCap: 日K批量能力当前是否可用 (路由矩阵判定, 生效源含插件/自定义源)
+export function RepairDailyPanel({ hasCap, isRunning, latestDate, onStart }: {
+  hasCap: boolean
   isRunning: boolean
   latestDate: string | null
   onStart: () => void
 }) {
   const qc = useQueryClient()
-  const hasBatchCap = !!caps?.capabilities?.['kline.daily.batch']
+  const hasBatchCap = hasCap
 
   // 默认起始日期: 最新数据往前推 30 天 (兼顾补缺口 + 复核近期数据, 成本不高)
   const [startDate, setStartDate] = useState(daysAgo(30))
@@ -98,8 +100,8 @@ export function RepairDailyPanel({ caps, isRunning, latestDate, onStart }: {
       </button>
 
       {!hasBatchCap && (
-        <span className="block text-[10px] text-warning/80 bg-warning/8 rounded px-1.5 py-px font-medium text-center">
-          需 Pro+ 权限
+        <span className="block text-center">
+          <MissingCapChip capKey="kline.daily.batch" />
         </span>
       )}
     </div>

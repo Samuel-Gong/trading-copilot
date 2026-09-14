@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { api, type MinuteKlineRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
+import { klineMinuteQueryOptions } from '@/lib/kline'
 import { EChartsIntraday } from '@/components/EChartsIntraday'
 
 interface Props {
@@ -12,6 +13,9 @@ interface Props {
   prevClose?: number
   className?: string
   onPriceHover?: (price: number | null) => void
+  onPriceDoubleClick?: (price: number, currentPrice: number) => void
+  currentPrice?: number
+  priceLines?: { value: number; label?: string; color?: string }[]
   /** 自动刷新间隔(ms)。undefined/0 = 不轮询(默认)。个股对话框盘中实时刷新时传入。 */
   refetchIntervalMs?: number
 }
@@ -23,16 +27,20 @@ export function StockIntradayChart({
   prevClose,
   className,
   onPriceHover,
+  onPriceDoubleClick,
+  currentPrice,
+  priceLines,
   refetchIntervalMs,
 }: Props) {
   const qc = useQueryClient()
   const [minuteDismissed, setMinuteDismissed] = useState(false)
 
   const minute = useQuery({
-    queryKey: QK.klineMinute(symbol, date ?? ''),
-    queryFn: () => api.klineMinute(symbol, date ?? undefined),
+    // 轮询上下文 (个股详情) 传 live: 当日盘中后端直接实时拉取最新K,
+    // 避免读到分钟增量落盘的上一轮本地分区; 历史日期后端自行忽略 live。
+    ...klineMinuteQueryOptions(symbol, date ?? undefined, refetchIntervalMs != null),
     enabled: !!symbol && !!date,
-    refetchInterval: refetchIntervalMs,
+    refetchInterval: query => query.state.data?.source === 'none' ? false : refetchIntervalMs,
   })
 
   const fetchMinute = useMutation({
@@ -121,6 +129,9 @@ export function StockIntradayChart({
           date={date}
           priceLimit={minute.data?.price_limit ?? undefined}
           onPriceHover={onPriceHover}
+          onPriceDoubleClick={onPriceDoubleClick}
+          currentPrice={currentPrice}
+          priceLines={priceLines}
         />
       )}
     </div>

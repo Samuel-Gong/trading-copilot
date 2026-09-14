@@ -90,10 +90,18 @@ def client(tmp_path, monkeypatch):
         enriched_latest_date=lambda: date.fromisoformat(DAY),
         get_enriched_latest_asset=lambda _asset_type: (None, None),
     )
-    app.state.strategy_engine = SimpleNamespace(list_strategies=lambda: [
-        {"id": sid, "name": name, "asset_types": ["stock"], "timeframes": ["1d"]}
+    strategy_defs = {
+        sid: SimpleNamespace(meta={"id": sid, "name": name}, basic_filter={})
         for sid, name in NAMES.items()
-    ])
+    }
+    app.state.strategy_engine = SimpleNamespace(
+        list_strategies=lambda: [
+            {"id": sid, "name": name, "asset_types": ["stock"], "timeframes": ["1d"]}
+            for sid, name in NAMES.items()
+        ],
+        has=lambda sid: sid in strategy_defs,
+        get=lambda sid: strategy_defs[sid],
+    )
     app.state.monitor_engine = SimpleNamespace(
         latest_strategy_results=lambda **_: {},
         invalidate_strategy_state=lambda: None,
@@ -256,8 +264,8 @@ def test_export_matches_real_engine_result_limits(client, monkeypatch, overrides
     engine._strategies["alpha"] = StrategyDef(
         meta={"id": "alpha", "name": "合成策略", "limit": 2, "scoring": {}},
         basic_filter={"enabled": False}, entry_signals=[], exit_signals=[],
-        stop_loss=None, trailing_stop=None, trailing_take_profit_activate=None,
-        trailing_take_profit_drawdown=None, max_hold_days=None, alerts=[],
+            stop_loss=None, trailing_stop=None, trailing_take_profit_activate=None,
+            trailing_take_profit_drawdown=None, max_hold_days=None,
         filter_fn=lambda df, params: pl.col("close") > 0, filter_history_fn=None,
         lookback_days=1, source="custom",
     )
@@ -706,7 +714,7 @@ def test_etf_latest_date_allows_current_snapshot_ext_column(client, monkeypatch)
     assert value_maps == {"snapshot__signal": {"510300.SH": "etf-current"}}
 
 
-@pytest.mark.parametrize("operation", ["save", "reset"])
+@pytest.mark.parametrize("operation", ["save", "patch", "reset"])
 def test_strategy_config_change_only_invalidates_affected_export_snapshot(client, operation):
     data_dir = client.app.state.repo.store.data_dir
     strategy_cache.write_cache(data_dir, DAY, {
@@ -717,12 +725,13 @@ def test_strategy_config_change_only_invalidates_affected_export_snapshot(client
     invalidations: list[None] = []
     client.app.state.monitor_engine.invalidate_strategy_state = lambda: invalidations.append(None)
 
-    if operation == "save":
+    if operation in ("save", "patch"):
         engine = client.app.state.strategy_engine
         engine.has = lambda _: True
         engine.get = lambda _: SimpleNamespace(basic_filter={})
         engine.find_dependents = lambda _: ["beta"]
-        response = client.post("/api/strategies/config", json={
+        method = client.post if operation == "save" else client.patch
+        response = method("/api/strategies/config", json={
             "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
         })
     else:
@@ -737,7 +746,7 @@ def test_strategy_config_change_only_invalidates_affected_export_snapshot(client
     assert invalidations == [None]
 
 
-@pytest.mark.parametrize("operation", ["save", "reset"])
+@pytest.mark.parametrize("operation", ["save", "patch", "reset"])
 def test_strategy_config_change_invalidates_composite_using_override_child(client, operation):
     data_dir = client.app.state.repo.store.data_dir
     custom_dir = data_dir / "strategies" / "custom"
@@ -777,8 +786,9 @@ EXECUTION_BACKEND = "composite"
         "blend": result(rows=[{"symbol": "000001.SZ"}]),
     })
 
-    if operation == "save":
-        response = client.post("/api/strategies/config", json={
+    if operation in ("save", "patch"):
+        method = client.post if operation == "save" else client.patch
+        response = method("/api/strategies/config", json={
             "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
         })
     else:
@@ -791,7 +801,7 @@ EXECUTION_BACKEND = "composite"
     assert cached["results"] == {"beta": result(rows=[{"symbol": "600000.SH"}])}
 
 
-@pytest.mark.parametrize("operation", ["save", "reset"])
+@pytest.mark.parametrize("operation", ["save", "patch", "reset"])
 def test_strategy_config_dependency_error_invalidates_all_export_snapshot(client, operation):
     data_dir = client.app.state.repo.store.data_dir
     strategy_cache.write_cache(data_dir, DAY, {
@@ -801,11 +811,12 @@ def test_strategy_config_dependency_error_invalidates_all_export_snapshot(client
     engine = client.app.state.strategy_engine
     engine.find_dependents = lambda _: (_ for _ in ()).throw(TypeError("dependency failure"))
 
-    if operation == "save":
+    if operation in ("save", "patch"):
         engine.has = lambda _: True
         engine.get = lambda _: SimpleNamespace(basic_filter={})
+        method = client.post if operation == "save" else client.patch
         with pytest.raises(TypeError, match="dependency failure"):
-            client.post("/api/strategies/config", json={
+            method("/api/strategies/config", json={
                 "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
             })
     else:
@@ -815,7 +826,7 @@ def test_strategy_config_dependency_error_invalidates_all_export_snapshot(client
     assert strategy_cache.read_cache(data_dir) is None
 
 
-@pytest.mark.parametrize("operation", ["save", "reset"])
+@pytest.mark.parametrize("operation", ["save", "patch", "reset"])
 def test_strategy_config_failure_still_clears_realtime_results(client, monkeypatch, operation):
     class MonitorEngine:
         def __init__(self):
@@ -839,17 +850,22 @@ def test_strategy_config_failure_still_clears_realtime_results(client, monkeypat
     client.app.state.monitor_engine = MonitorEngine()
     engine = client.app.state.strategy_engine
     engine.find_dependents = lambda _: ["beta"]
+    expected_override = {}
+    if operation == "reset":
+        expected_override = {"params": {"window": 3}}
+        strategy_api.strategy_config.save_override(data_dir, "alpha", expected_override)
     monkeypatch.setattr(
-        strategy_cache.os,
-        "replace",
+        strategy_cache,
+        "_write_generation_state",
         lambda *_args: (_ for _ in ()).throw(OSError("cache replacement failed")),
     )
 
-    if operation == "save":
+    if operation in ("save", "patch"):
         engine.has = lambda _: True
         engine.get = lambda _: SimpleNamespace(basic_filter={})
+        method = client.post if operation == "save" else client.patch
         with pytest.raises(OSError, match="cache replacement failed"):
-            client.post("/api/strategies/config", json={
+            method("/api/strategies/config", json={
                 "strategy_id": "alpha", "overrides": {"params": {"window": 10}},
             })
     else:
@@ -858,6 +874,7 @@ def test_strategy_config_failure_still_clears_realtime_results(client, monkeypat
 
     cached = api._cached_with_realtime(SimpleNamespace(app=client.app))
     assert cached["results"] == {}
+    assert strategy_api.strategy_config.load_override(data_dir, "alpha") == expected_override
 
 
 def test_clear_strategy_results_preserves_unaffected_cached_rows(tmp_path):

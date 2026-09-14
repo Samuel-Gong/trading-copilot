@@ -320,6 +320,8 @@ def strategies(
         raise HTTPException(status_code=503, detail="策略引擎未初始化")
     presets = []
     for meta in engine.list_strategies():
+        if meta.get("research_only"):
+            continue
         if asset_type not in meta.get("asset_types", ["stock"]):
             continue
         if timeframe not in meta.get("timeframes", ["1d"]):
@@ -379,6 +381,10 @@ def run_preset(req: PresetRequest, request: Request):
     try:
         if not engine.has(req.strategy_id):
             raise ValueError(f"unknown strategy: {req.strategy_id}")
+        get_strategy = getattr(engine, "get", None)
+        strategy = get_strategy(req.strategy_id) if callable(get_strategy) else None
+        if strategy is not None and getattr(strategy, "meta", {}).get("research_only"):
+            raise ValueError(f"unknown strategy: {req.strategy_id}")
         params = dict(overrides.get("params") or {})
         context = svc.build_strategy_context(
             engine,
@@ -401,6 +407,7 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
+    # 股票日线结果才写入盘后缓存; ETF 与分钟周期结果不混入共享日线快照。
     if req.asset_type == "stock" and req.timeframe == "1d":
         _update_cache_strategy(
             data_dir,
@@ -652,14 +659,23 @@ def run_all(request: Request, body: Optional[dict] = None):
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
-        unknown = [sid for sid in all_ids if not engine.has(sid)]
+        unknown = [
+            sid
+            for sid in all_ids
+            if not engine.has(sid)
+            or (
+                callable(getattr(engine, "get", None))
+                and getattr(engine.get(sid), "meta", {}).get("research_only")
+            )
+        ]
         if unknown:
             raise HTTPException(status_code=404, detail=f"unknown strategies: {unknown}")
     else:
         all_ids = [
             meta["id"]
             for meta in engine.list_strategies()
-            if asset_type in meta.get("asset_types", ["stock"])
+            if not meta.get("research_only")
+            and asset_type in meta.get("asset_types", ["stock"])
             and timeframe in meta.get("timeframes", ["1d"])
         ]
 
@@ -715,8 +731,8 @@ def run_all(request: Request, body: Optional[dict] = None):
     elapsed = (time.perf_counter() - t_total) * 1000
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
-    # 写入策略缓存 (供页面秒加载)。最新日期判断在缓存写锁内完成, 避免较早
-    # 任务在较新任务完成后回退共享快照。
+    # 仅股票日线结果写入共享缓存。最新日期判断在缓存写锁内完成, 避免较早
+    # 任务在较新任务完成后回退快照; ETF 与分钟结果保持请求内瞬态语义。
     if results and asset_type == "stock" and timeframe == "1d":
         strategy_cache.write_cache(
             data_dir,
@@ -854,7 +870,9 @@ def limit_ladder(
     sealed_ready = False
     sealed_age: float | None = None
     if depth_svc:
-        sealed_map = depth_svc.get_sealed_map(as_of, is_down=is_down)
+        # 复用上方双方向计数已读取的 sealed map: 同一请求、同一 as_of、同一对象,
+        # 不再第三次读取 (内存路径含全量浅拷贝, parquet 路径含整文件读)。
+        sealed_map = down_map if is_down else up_map
         sealed_ready = bool(sealed_map) and depth_svc.is_sealed_ready(as_of)
         sealed_age = depth_svc.get_sealed_age(as_of) if sealed_ready else None
 

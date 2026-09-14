@@ -1,8 +1,7 @@
 [project]
 name = "tickflow-stock-panel-backend"
-version = "0.1.88"
+version = "0.2.3"
 description = "A 股选股 + 监控 + 回测面板 — TickFlow 适配"
-readme = "../README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
@@ -84,6 +83,9 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
 ignore = ["E501"]   # 长行交给 fmt
+# 本仓库注释、Docstring 与用户文案按约定使用中文；这些标点和公式符号是刻意使用，
+# 不是混入标识符的同形字符。继续保留 RUF001/2/3 对其他字符的检查。
+allowed-confusables = ["，", "；", "：", "（", "）", "×", "σ", "∨", "−", "｜", "∪"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

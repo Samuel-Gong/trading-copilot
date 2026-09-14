@@ -40,10 +40,11 @@ def capabilities() -> dict:
 def redetect(request: Request) -> dict:
     """用户在设置页"重新检测"按钮。"""
     capset = detect_capabilities(force=True)
+    # 同步刷新 app.state 快照 (minute_refresh 等服务的门控读这里) 与财务调度器,
+    # 与 settings.py 各探测路径一致 — 否则重检测后服务侧仍读旧 capset 被错误门控
     request.app.state.capabilities = capset
-    financial_scheduler = getattr(request.app.state, "financial_scheduler", None)
-    if financial_scheduler:
-        financial_scheduler.update_capabilities(capset)
+    from app.api.settings import _sync_financial_scheduler_caps
+    _sync_financial_scheduler_caps(request.app.state, capset)
     quote_service = getattr(request.app.state, "quote_service", None)
     if quote_service:
         quote_service.boot_check()

@@ -179,8 +179,9 @@ def _build_emotion_block(overview: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_user_prompt(overview: dict, news: list[dict], focus: str) -> str:
-    """构建用户消息:复盘日期 + 市场数据精简切片 + 新闻 + 关注点。"""
+def _build_user_prompt(overview: dict, news: list[dict], focus: str, lhb_context: str = "",
+                       bench_context: str = "") -> str:
+    """构建用户消息:复盘日期 + 市场数据精简切片 + 龙虎榜(可选) + 盘前风向标(可选) + 新闻 + 关注点。"""
     as_of = overview.get("as_of") or "今日"
 
     parts: list[str] = [
@@ -202,6 +203,22 @@ def _build_user_prompt(overview: dict, news: list[dict], focus: str) -> str:
         _build_sector_block(overview.get("industry_rank"), "行业"),
     ]
 
+    # 龙虎榜资金动向 (fuyao 数据源, 摘要自带数据日期; 无数据源/失败时为空不占段)
+    if lhb_context:
+        parts.extend([
+            "",
+            "## 龙虎榜资金动向",
+            lhb_context,
+        ])
+
+    # 盘前风向标 (fuyao 竞价筛选名单 + 当日实际表现对照; 失败为空不占段)
+    if bench_context:
+        parts.extend([
+            "",
+            "## 盘前风向标(竞价)",
+            bench_context,
+        ])
+
     if news:
         news_lines = []
         for i, n in enumerate(news[:8], 1):
@@ -220,10 +237,10 @@ def _build_user_prompt(overview: dict, news: list[dict], focus: str) -> str:
             "消息催化一节请直接从量价异动给出可能的催化逻辑结论,不要编造具体消息,也不要复述本说明。)",
         ])
 
-    from app.services.ai_provider import sanitize_focus
-    safe_focus = sanitize_focus(focus)
-    if safe_focus:
-        parts.extend(["", f"本次复盘请特别关注: {safe_focus}"])
+    from app.services.ai_provider import build_focus_instruction
+    focus_instruction = build_focus_instruction(focus, report_name="大盘复盘报告")
+    if focus_instruction:
+        parts.extend(["", focus_instruction])
 
     return "\n".join(parts)
 
@@ -300,15 +317,40 @@ async def recap_market_stream(
     try:
         from app.services.ai_provider import stream_ai_text
 
-        user_prompt = _build_user_prompt(overview, news or [], focus)
+        try:
+            context_as_of = date.fromisoformat(as_of_str)
+        except ValueError:
+            logger.warning("忽略非 ISO 复盘日期的扩展上下文: %s", as_of_str)
+            context_as_of = None
+
+        # 龙虎榜摘要 (fuyao 专有): 拉取失败/未配置 → 空串, 复盘主流程不受影响
+        from app.services import dragon_tiger as dragon_tiger_svc
+
+        lhb_ctx = (
+            dragon_tiger_svc.build_recap_context(repo.store.data_dir, context_as_of)
+            if context_as_of is not None else ""
+        )
+
+        # 盘前风向标摘要 (fuyao 专有): 失败/未配置 → 空串
+        from app.services import auction_benchmark as auction_benchmark_svc
+
+        bench_ctx = (
+            auction_benchmark_svc.build_recap_context(repo.store.data_dir, context_as_of)
+            if context_as_of is not None else ""
+        )
+        user_prompt = _build_user_prompt(overview, news or [], focus, lhb_ctx, bench_ctx)
+        got_content = False
         async for delta in stream_ai_text(
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=4500,
+            # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
+            max_tokens=None,
+            prefer_final_answer=True,
         ):
+            got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 
     except Exception as e:  # noqa: BLE001
@@ -316,6 +358,10 @@ async def recap_market_stream(
         yield json.dumps({"type": "error", "message": f"AI 复盘失败: {e}"}, ensure_ascii=False)
         return
 
+    if not got_content:
+        logger.warning("AI market recap ended with empty content for %s", as_of_str)
+        yield json.dumps({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"}, ensure_ascii=False)
+        return
     yield json.dumps({"type": "done"}, ensure_ascii=False)
 
 

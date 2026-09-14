@@ -1,4 +1,4 @@
-"""内置扩展数据预设 — 概念/行业首次启动自动拉取。
+"""内置扩展数据预设 — 概念/行业启动时只创建配置, 等待用户手动获取 (#199)。
 
 设计原则:
   - 扩展数据通用逻辑零改动 (ExtConfig / fetch_and_ingest / API / 前端均不动)
@@ -19,8 +19,10 @@ import logging
 import math
 from pathlib import Path
 
+from app.market_time import cn_today
 from app.services.ext_data import (
     ExtConfig,
+    ExtConfigChangedError,
     ExtConfigStore,
     ExtField,
     PullConfig,
@@ -55,14 +57,16 @@ def _concept_preset() -> ExtConfig:
             ExtField("股票简称", "string", "股票简称"),
             ExtField("所属概念", "string", "所属概念"),
         ],
-        description="同花顺概念分类 (首次启动自动拉取, 可在扩展数据页手动更新)",
+        description="同花顺概念分类 (启动仅创建配置, 在概念/行业页手动获取)",
         symbol_map={"type": "mapped", "col": "股票代码"},
         code_map={"type": "computed", "from": "symbol", "method": "strip_exchange"},
         pull=PullConfig(
             url=_CONCEPT_DATA_URL,
             method="GET",
             schedule_minutes=1440,
-            enabled=True,
+            # enabled=False: ensure_builtin_presets 承诺启动不拉取, PullScheduler
+            # 只调度 enabled 配置; 手动获取走 fetch_preset 独立路径不受影响 (#199)
+            enabled=False,
         ),
     )
 
@@ -84,14 +88,15 @@ def _industry_preset() -> ExtConfig:
             ExtField("股票简称", "string", "股票简称"),
             ExtField("所属同花顺行业", "string", "所属同花顺行业"),
         ],
-        description="同花顺行业分类 (首次启动自动拉取, 可在扩展数据页手动更新)",
+        description="同花顺行业分类 (启动仅创建配置, 在概念/行业页手动获取)",
         symbol_map={"type": "mapped", "col": "股票代码"},
         code_map={"type": "computed", "from": "symbol", "method": "strip_exchange"},
         pull=PullConfig(
             url=_INDUSTRY_DATA_URL,
             method="GET",
             schedule_minutes=1440,
-            enabled=True,
+            # 同概念 preset: 出厂禁用, 避免启动即网络拉取 (#199)
+            enabled=False,
         ),
     )
 
@@ -206,13 +211,11 @@ async def _fetch_json(url: str) -> list[dict]:
 
 async def _seed_one(config: ExtConfig, flatten, data_dir: Path) -> int:
     """拉取 + 转换 + 写入单个预设。返回写入行数。"""
-    from datetime import date
-
     raw = await _fetch_json(config.pull.url)
     rows = flatten(raw)
     if not rows:
         raise ValueError(f"接口返回 0 行: {config.pull.url}")
-    n = rows_to_parquet(rows, config, data_dir, snapshot_date=date.today())
+    n = rows_to_parquet(rows, config, data_dir, snapshot_date=cn_today())
     return n
 
 
@@ -246,7 +249,7 @@ async def ensure_builtin_presets(data_dir: Path) -> None:
             # 用户已有此表 (老用户 / 自己重建过) → 一律不动
             continue
         try:
-            store.upsert(config)
+            store.create(config)
             logger.info("内置扩展表 %s 配置已就绪 (待用户手动获取数据)", config.id)
         except Exception as e:
             logger.warning("内置扩展表 %s 配置写入失败 (不影响启动): %s", config.id, e)
@@ -259,16 +262,27 @@ async def fetch_preset(config_id: str, data_dir: Path) -> int:
         ValueError: config_id 不是内置预设
         Exception: 网络请求/解析/写入失败 (由 API 层转 HTTP 错误)
     """
-    config = get_preset(config_id)
-    if config is None:
+    preset = get_preset(config_id)
+    if preset is None:
         raise ValueError(f"未知的内置预设: {config_id}")
 
     flatten = _flatten_concept_rows if config_id == "ext_gn_ths" else _flatten_industry_rows
 
     # 确保 config.json 存在 (用户可能从未启动过 ensure_builtin_presets)
     store = ExtConfigStore(data_dir)
-    if store.get(config_id) is None:
-        store.upsert(config)
+    config = store.get(config_id)
+    if config is None:
+        try:
+            store.create(preset)
+            config = preset
+        except ExtConfigChangedError:
+            config = store.get(config_id)
+            if config is None:
+                raise
+
+    # 内置入口始终使用发行版固定的 URL/schema；磁盘对象只提供 CAS 修订号。
+    preset._storage_revision = config._storage_revision
+    config = preset
 
     n = await _seed_one(config, flatten, data_dir)
     logger.info("内置扩展表 %s 手动拉取成功: %d 行", config_id, n)

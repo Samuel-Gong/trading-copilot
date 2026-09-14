@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, BellRing, Database, Flame, Gauge, Info, LineChart, Loader2, Play, RefreshCw, Sparkles, Target, Timer } from 'lucide-react'
@@ -7,10 +7,12 @@ import { DatePicker } from '@/components/DatePicker'
 import { api, type MarketSnapshotRow, type OverviewDimensionRankItem, type OverviewMarket, type AlertEvent } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { fmtBigNum, fmtPct } from '@/lib/format'
-import { useDataStatus, useCapabilities, useSettings } from '@/lib/useSharedQueries'
+import { DimensionMembersDialog, dimensionKindForSourceField, type DimensionMembersTarget } from '@/components/DimensionMembersDialog'
+import { useDataStatus, useCapabilities, useSettings, usePreferences } from '@/lib/useSharedQueries'
 import { SealedBadge } from '@/components/SealedBadge'
-import { StockPreviewDialog } from '@/components/StockPreviewDialog'
+import { StockPreviewDialog, toNavItems, type NavItem } from '@/components/StockPreviewDialog'
 import { SettingsModal } from '@/components/data/SettingsModal'
+import { useAdjFactorSyncGate } from '@/components/AdjFactorSyncGate'
 import { STAGE_LABELS } from '@/components/data/ActiveJobCard'
 import { cn } from '@/lib/cn'
 import { cnSignal } from '@/lib/signals'
@@ -87,22 +89,28 @@ const _SOURCE_BADGE: Record<string, string> = {
   signal: 'bg-accent/10 text-accent',
   price: 'bg-emerald-400/10 text-emerald-400',
   market: 'bg-purple-500/10 text-purple-400',
+  sector: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
 }
 const _SOURCE_LABEL: Record<string, string> = {
-  strategy: '策略', signal: '信号', price: '价格', market: '异动',
+  strategy: '策略', signal: '信号', price: '价格', market: '异动', sector: '板块',
 }
 const _SEVERITY_BAR: Record<string, string> = {
   info: 'bg-accent/40', warn: 'bg-warning', critical: 'bg-danger',
 }
 
-function MonitorWidget({ onStockClick }: { onStockClick: (event: AlertEvent) => void }) {
+function MonitorWidget({ onStockClick, activeSymbol }: {
+  onStockClick: (event: AlertEvent, navList?: NavItem[]) => void
+  activeSymbol?: string
+}) {
+  const navigate = useNavigate()
   const alerts = useQuery({
     queryKey: ['alerts', ''],
     queryFn: () => api.alertsList({ days: 7, limit: 10 }),
     refetchInterval: 10000,
-    refetchIntervalInBackground: true,
   })
   const events: AlertEvent[] = alerts.data?.alerts ?? []
+  // 切股导航列表: 有 symbol 的触发记录
+  const alertNav = toNavItems(events.filter((ev): ev is AlertEvent & { symbol: string } => !!ev.symbol))
 
   if (events.length === 0) {
     return (
@@ -117,6 +125,7 @@ function MonitorWidget({ onStockClick }: { onStockClick: (event: AlertEvent) => 
           const sev = _SEVERITY_BAR[ev.severity ?? 'info'] ?? _SEVERITY_BAR.info
           const pct = ev.change_pct ?? 0
           const isStrategy = ev.source === 'strategy'
+          const isSector = ev.source === 'sector'
           const sname = isStrategy ? strategyName(ev.message ?? '') : ''
           const eventMeta = strategyEventMeta(ev.type)
           return (
@@ -125,15 +134,15 @@ function MonitorWidget({ onStockClick }: { onStockClick: (event: AlertEvent) => 
               initial={{ opacity: 0, y: -8, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               transition={{ duration: 0.3, delay: Math.min(i * 0.03, 0.3) }}
-              className="relative overflow-hidden rounded-md border border-border/40 bg-surface/60 pl-2.5 pr-2 py-1.5 hover:border-border hover:bg-surface transition-colors"
+              className={`relative overflow-hidden rounded-md border pl-2.5 pr-2 py-1.5 transition-colors ${ev.symbol && ev.symbol === activeSymbol ? 'border-accent/40 bg-accent/5' : 'border-border/40 bg-surface/60 hover:border-border hover:bg-surface'}`}
             >
               <div className={cn('absolute left-0 top-0 h-full w-0.5', sev)} />
               {/* 第一行: 代码 + 名称 + 价格 + 涨跌幅 (点击代码/名称弹日K) */}
               <div className="flex items-center gap-1.5">
                 <button
-                  onClick={() => ev.symbol && onStockClick(ev)}
-                  title={ev.symbol ? `查看 ${ev.symbol} 日K` : undefined}
-                  className="inline-flex items-center gap-1 min-w-0 shrink-0 rounded hover:bg-elevated/60 transition-colors -mx-0.5 px-0.5 cursor-pointer"
+                  onClick={() => isSector ? navigate('/monitor') : ev.symbol && onStockClick(ev, alertNav)}
+                  title={isSector ? '在监控中心查看板块告警' : ev.symbol ? `查看 ${ev.symbol} 日K` : undefined}
+                  className={`inline-flex items-center gap-1 min-w-0 shrink-0 rounded hover:bg-elevated/60 transition-colors -mx-0.5 px-0.5 ${isSector || ev.symbol ? 'cursor-pointer' : 'cursor-default'}`}
                 >
                   <span className="font-mono text-[10px] font-medium text-foreground/80 hover:text-accent">{ev.symbol?.replace(/\.(SH|SZ|BJ)$/, '')}</span>
                   {ev.symbol && (() => {
@@ -405,9 +414,10 @@ function MiniMetric({ label, value, cls = 'text-foreground' }: { label: string; 
   )
 }
 
-function StockList({ title, rows, mode, onStockClick }: {
+function StockList({ title, rows, mode, onStockClick, activeSymbol }: {
   title: string; rows: MarketSnapshotRow[]; mode: 'gain' | 'loss' | 'amount' | 'active';
   onStockClick?: (symbol: string, name?: string) => void;
+  activeSymbol?: string;
 }) {
   return (
     <div className="rounded-card border border-border bg-surface/80 p-1.5 shadow-[0_1px_2px_hsl(var(--border)/0.4)] backdrop-blur-sm transition-shadow hover:shadow-[0_2px_8px_hsl(var(--border)/0.5)]">
@@ -419,7 +429,7 @@ function StockList({ title, rows, mode, onStockClick }: {
         {rows.slice(0, 8).map((r, idx) => (
           <div
             key={`${r.symbol}-${idx}`}
-            className="grid grid-cols-[18px_1fr_auto] items-center gap-1.5 rounded-md bg-elevated/40 px-1.5 py-1 cursor-pointer hover:bg-elevated hover:brightness-110 transition-colors border border-transparent hover:border-border/60"
+            className={`grid grid-cols-[18px_1fr_auto] items-center gap-1.5 rounded-md px-1.5 py-1 cursor-pointer transition-colors border ${r.symbol === activeSymbol ? 'bg-accent/10 border-accent/30' : 'bg-elevated/40 border-transparent hover:bg-elevated hover:brightness-110 hover:border-border/60'}`}
             onClick={() => onStockClick?.(r.symbol, r.name ?? undefined)}
           >
             <span className="text-center font-mono text-[10px] text-muted">{idx + 1}</span>
@@ -463,18 +473,38 @@ function StockList({ title, rows, mode, onStockClick }: {
   )
 }
 
-function RankColumn({ title, rows, tone, onStockClick }: {
+function RankColumn({ title, rows, tone, onStockClick, onDimensionClick, activeSymbol }: {
   title: string; rows: OverviewDimensionRankItem[]; tone: 'bull' | 'bear';
   onStockClick?: (symbol: string, name?: string) => void;
+  onDimensionClick?: (target: DimensionMembersTarget) => void;
+  activeSymbol?: string;
 }) {
   return (
     <div className="min-w-0 space-y-1">
       <div className={`text-[10px] font-medium ${tone === 'bull' ? 'text-bull' : 'text-bear'}`}>{title}</div>
-      {rows.slice(0, 5).map((r, idx) => (
-        <div key={`${title}-${r.name}-${idx}`} className="grid grid-cols-[14px_1fr_auto] items-center gap-1 rounded-md bg-elevated/40 px-1.5 py-1 border border-transparent hover:border-border/60 transition-colors">
+      {rows.slice(0, 5).map((r, idx) => {
+        const kind = r.source_field ? dimensionKindForSourceField(r.source_field) : null
+        const clickable = !!(r.source_field && kind && onDimensionClick)
+        const isActive = r.leader?.symbol != null && r.leader.symbol === activeSymbol
+        return (
+        <div
+          key={`${title}-${r.name}-${idx}`}
+          onClick={() => clickable && onDimensionClick!({
+            kind: kind!,
+            value: r.name,
+            sourceField: r.source_field!,
+          })}
+          title={clickable ? `查看「${r.name}」成分股` : undefined}
+          className={`grid grid-cols-[14px_1fr_auto] items-center gap-1 rounded-md px-1.5 py-1 border transition-colors ${
+            isActive ? 'border-accent/30 bg-accent/10' : 'border-transparent bg-elevated/40'
+          } ${clickable ? 'cursor-pointer hover:border-accent/40 hover:bg-elevated/70' : 'hover:border-border/60'}`}
+        >
           <span className="text-center font-mono text-[9px] text-muted">{idx + 1}</span>
           <div className="min-w-0">
-            <div className="truncate text-[11px] text-foreground" title={r.name}>{r.name}</div>
+            <div className="truncate text-[11px] text-foreground" title={r.name}>
+              {r.name}
+              {clickable && <span className="ml-1 text-[8px] text-muted/50">↗</span>}
+            </div>
             <div className="mt-0.5 flex items-center gap-1">
               <span className="shrink-0 font-mono text-[9px] text-muted">{r.count}只</span>
               <span className="text-muted">·</span>
@@ -486,6 +516,11 @@ function RankColumn({ title, rows, tone, onStockClick }: {
                 >{r.leader?.name ?? '—'}</button>
               ) : (
                 <span className="truncate text-[10px] text-muted">{r.leader?.name ?? '—'}</span>
+              )}
+              {r.leader?.change_pct != null && (
+                <span className={`shrink-0 font-mono text-[9px] tabular-nums ${pctClass(r.leader.change_pct)}`}>
+                  {fmtStockPct(r.leader.change_pct)}
+                </span>
               )}
               {r.leader?.symbol && (() => {
                 const board = boardTag(r.leader!.symbol!)
@@ -499,24 +534,27 @@ function RankColumn({ title, rows, tone, onStockClick }: {
           </div>
           <div className={`font-mono text-[10px] font-semibold ${pctClass(r.avg_pct)}`}>{fmtStockPct(r.avg_pct)}</div>
         </div>
-      ))}
+        )
+      })}
       {rows.length === 0 && <div className="rounded border border-dashed border-border py-4 text-center text-xs text-muted">暂无数据</div>}
     </div>
   )
 }
 
-function HotRankCard({ title, rank, configUrl, onStockClick }: {
+function HotRankCard({ title, rank, configUrl, onStockClick, onDimensionClick, activeSymbol }: {
   title: string; rank?: OverviewMarket['concept_rank']; configUrl: string;
   onStockClick?: (symbol: string, name?: string) => void;
+  onDimensionClick?: (target: DimensionMembersTarget) => void;
+  activeSymbol?: string;
 }) {
   const hasData = (rank?.leading?.length ?? 0) > 0 || (rank?.lagging?.length ?? 0) > 0
   return (
     <section className="rounded-card border border-border bg-surface/80 p-1.5 shadow-[0_1px_2px_hsl(var(--border)/0.4)] backdrop-blur-sm transition-shadow hover:shadow-[0_2px_8px_hsl(var(--border)/0.5)]">
-      <SectionTitle icon={Flame} title={title} hint="领涨/领跌" />
+      <SectionTitle icon={Flame} title={title} hint="领涨/领跌 · 点击板块看成分股" />
       {hasData ? (
         <div className="grid grid-cols-2 gap-2">
-          <RankColumn title="领涨" rows={rank?.leading ?? []} tone="bull" onStockClick={onStockClick} />
-          <RankColumn title="领跌" rows={rank?.lagging ?? []} tone="bear" onStockClick={onStockClick} />
+          <RankColumn title="领涨" rows={rank?.leading ?? []} tone="bull" onStockClick={onStockClick} onDimensionClick={onDimensionClick} activeSymbol={activeSymbol} />
+          <RankColumn title="领跌" rows={rank?.lagging ?? []} tone="bear" onStockClick={onStockClick} onDimensionClick={onDimensionClick} activeSymbol={activeSymbol} />
         </div>
       ) : (
         <div className="py-4 text-center">
@@ -533,11 +571,32 @@ function HotRankCard({ title, rank, configUrl, onStockClick }: {
   )
 }
 
+// 切股导航列表构建 (与列表展示行一致: StockList 只显示前 8)
+function stockListNav(rows: MarketSnapshotRow[]): NavItem[] {
+  return toNavItems(rows.slice(0, 8))
+}
+function rankNav(rank?: OverviewMarket['concept_rank']): NavItem[] {
+  const leaders = [...(rank?.leading ?? []), ...(rank?.lagging ?? [])]
+    .map(r => r.leader)
+    .filter((l): l is NonNullable<typeof l> & { symbol: string } => !!l?.symbol)
+  return toNavItems(leaders)
+}
+
 export function Dashboard() {
   const qc = useQueryClient()
   const [selectedDate, setSelectedDate] = useState<string | undefined>()
   const [manualFetching, setManualFetching] = useState(false)
-  const [previewStock, setPreviewStock] = useState<{symbol: string; name?: string; alert?: AlertEvent} | null>(null)
+  const [previewStock, setPreviewStock] = useState<{
+    symbol: string
+    name?: string
+    alert?: AlertEvent
+    /** 打开来源榜: 仅高亮来源榜的行 */
+    source?: 'gain' | 'loss' | 'amount' | 'active' | 'concept' | 'industry' | 'alert'
+    /** 切股导航列表 (来自来源榜) */
+    navList?: NavItem[]
+  } | null>(null)
+  // 板块成分股弹窗 (概念/行业热度卡片行点击)
+  const [dimensionTarget, setDimensionTarget] = useState<DimensionMembersTarget | null>(null)
   // 首次使用(无数据 + 未完成引导)自动弹窗: 同一会话只弹一次
   const [showWelcomeModal, setShowWelcomeModal] = useState(false)
   const dataStatus = useDataStatus({ staleTime: 60_000 })
@@ -553,8 +612,22 @@ export function Dashboard() {
   const hasDepth = !!caps.data?.capabilities?.['depth5.batch']
   const sealedReady = !!data?.limit?.sealed_ready
   const isSealedDegrade = !hasDepth || !sealedReady
-  // none 档(无 key / 无效 key): 不再阻断功能, 仅实时行情等扩展能力受限
-  const isNoKey = settings.data?.mode === 'none'
+  // 空态引导文案按当前数据源分流: TickFlow 源提"免费服务器", 其他源提"当前数据源",
+  // 弱化与默认 TickFlow 的隐式绑定 (None 档/免费 Key 等 TickFlow 概念仅在其被选中时出现)
+  const prefs = usePreferences()
+  const dataSourceList = useQuery({
+    queryKey: QK.dataSources,
+    queryFn: api.dataSources,
+    staleTime: 60_000,
+  })
+  const activeProvider = prefs.data?.daily_data_provider || 'tickflow'
+  const isTickflowProvider = activeProvider === 'tickflow'
+  const providerLabel = [
+    ...(dataSourceList.data?.builtin ?? []),
+    ...(dataSourceList.data?.plugins ?? []),
+    ...(dataSourceList.data?.custom ?? []),
+  ].find(s => s.name === activeProvider)?.display_name
+    ?.replace(/（.*?）|\(.*?\)/g, '').trim() || activeProvider
   // 无本地数据(enriched/daily 都没有)→ 常驻引导卡片
   // 注: 后端 status 的 rows 为性能刻意返回 0, 用 trading_days 判断是否有数据
   const ds = dataStatus.data
@@ -584,6 +657,8 @@ export function Dashboard() {
   const fetchSucceeded = fetchStatus.data?.status === 'succeeded'
 
   // 首次使用且无数据 → 自动弹一次引导弹窗(同会话只弹一次)
+  // 「开始获取」前若无除权因子能力, 先弹前置确认 (adjGate.guard)
+  const adjGate = useAdjFactorSyncGate()
   useEffect(() => {
     if (!hasNoData) return
     if (settings.data?.onboarding_completed === false) return  // 还在引导流程中,不重复弹
@@ -652,7 +727,7 @@ export function Dashboard() {
   const currentDate = selectedDate ?? data.as_of ?? ''
   const quoteRunning = (!selectedDate || selectedDate === latestDate) && data.quote_status?.running
   // 实时模式: none / watchlist / full_market。
-  // watchlist (Free 档) 仅自选 ≤5 只实时, 看板呈现的大盘数据实为盘后快照, 需提示避免误读。
+  // watchlist 模式仅自选 ≤5 只实时, 看板呈现的大盘数据实为盘后快照, 需提示避免误读。
   const quoteMode = data.quote_status?.mode as ('none' | 'watchlist' | 'full_market') | undefined
 
   return (
@@ -666,22 +741,28 @@ export function Dashboard() {
           stage={fetchStatus.data?.stage}
           fetchPct={fetchStatus.data?.progress}
           onStart={() => startFetch.mutate()}
-          isNoKey={isNoKey}
+          isTickflowProvider={isTickflowProvider}
+          providerLabel={providerLabel}
         />
       )}
       {/* 首次使用自动弹窗(同会话仅一次) */}
       <AnimatePresence>
         {showWelcomeModal && (
           <WelcomeFetchModal
-            isNoKey={isNoKey}
+            isTickflowProvider={isTickflowProvider}
+            providerLabel={providerLabel}
             onClose={() => setShowWelcomeModal(false)}
             onStart={() => {
-              startFetch.mutate()
-              setShowWelcomeModal(false)
+              adjGate.guard(() => {
+                startFetch.mutate()
+                setShowWelcomeModal(false)
+              })
             }}
           />
         )}
       </AnimatePresence>
+      {/* 无除权因子能力时的同步前置确认 */}
+      {adjGate.dialog}
       <div className="relative mb-1.5 flex flex-wrap items-center justify-between gap-2 overflow-hidden rounded-card border border-border bg-gradient-to-r from-surface/90 to-surface/70 px-3 py-1.5 shadow-[0_1px_3px_hsl(var(--border)/0.4)] backdrop-blur-sm">
         <div className="pointer-events-none absolute left-0 top-0 h-full w-1 bg-gradient-to-b from-accent to-accent/20" aria-hidden />
         <div className="flex items-center gap-2">
@@ -722,14 +803,14 @@ export function Dashboard() {
         </div>
       </div>
 
-      {/* Free 档提示: 大盘看板为盘后数据, 仅自选股实时。避免用户误读为全市场实时。 */}
+      {/* 自选实时模式提示: 大盘看板为盘后数据, 仅自选股实时。避免用户误读为全市场实时。 */}
       {quoteMode === 'watchlist' && (
         <div className="mb-1.5 flex items-start gap-2 rounded-card border border-amber-500/30 bg-amber-500/8 px-3 py-1.5 text-[11px] leading-relaxed">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
           <div className="min-w-0 flex-1 text-secondary">
             当前为「自选实时」模式,看板展示的大盘数据为<strong className="text-foreground">盘后快照</strong>(最新有数据日),并非盘中实时;
             仅自选股({data.quote_status?.watchlist_symbol_count ?? 0} 只)支持实时监控。
-            <span className="ml-1 text-accent">全市场实时需 Starter+</span>
+            <span className="ml-1 text-accent">全市场实时依赖数据源支持</span>
           </div>
         </div>
       )}
@@ -802,15 +883,19 @@ export function Dashboard() {
           </div>
 
           <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
-            <HotRankCard title="概念热度" rank={data.concept_rank} configUrl="/concept-analysis" onStockClick={(symbol, name) => setPreviewStock({symbol, name})} />
-            <HotRankCard title="行业热度" rank={data.industry_rank} configUrl="/industry-analysis" onStockClick={(symbol, name) => setPreviewStock({symbol, name})} />
+            <HotRankCard title="概念热度" rank={data.concept_rank} configUrl="/concept-analysis" activeSymbol={previewStock?.source === 'concept' ? previewStock.symbol : undefined}
+              onStockClick={(symbol, name) => setPreviewStock({ symbol, name, source: 'concept', navList: rankNav(data.concept_rank) })}
+              onDimensionClick={setDimensionTarget} />
+            <HotRankCard title="行业热度" rank={data.industry_rank} configUrl="/industry-analysis" activeSymbol={previewStock?.source === 'industry' ? previewStock.symbol : undefined}
+              onStockClick={(symbol, name) => setPreviewStock({ symbol, name, source: 'industry', navList: rankNav(data.industry_rank) })}
+              onDimensionClick={setDimensionTarget} />
           </div>
 
           <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 xl:grid-cols-4">
-            <StockList title="涨幅榜" rows={data.top_gainers} mode="gain" onStockClick={(symbol, name) => setPreviewStock({symbol, name})} />
-            <StockList title="跌幅榜" rows={data.top_losers} mode="loss" onStockClick={(symbol, name) => setPreviewStock({symbol, name})} />
-            <StockList title="成交额榜" rows={data.turnover_leaders} mode="amount" onStockClick={(symbol, name) => setPreviewStock({symbol, name})} />
-            <StockList title="活跃换手" rows={data.active_leaders} mode="active" onStockClick={(symbol, name) => setPreviewStock({symbol, name})} />
+            <StockList title="涨幅榜" rows={data.top_gainers} mode="gain" activeSymbol={previewStock?.source === 'gain' ? previewStock.symbol : undefined} onStockClick={(symbol, name) => setPreviewStock({ symbol, name, source: 'gain', navList: stockListNav(data.top_gainers) })} />
+            <StockList title="跌幅榜" rows={data.top_losers} mode="loss" activeSymbol={previewStock?.source === 'loss' ? previewStock.symbol : undefined} onStockClick={(symbol, name) => setPreviewStock({ symbol, name, source: 'loss', navList: stockListNav(data.top_losers) })} />
+            <StockList title="成交额榜" rows={data.turnover_leaders} mode="amount" activeSymbol={previewStock?.source === 'amount' ? previewStock.symbol : undefined} onStockClick={(symbol, name) => setPreviewStock({ symbol, name, source: 'amount', navList: stockListNav(data.turnover_leaders) })} />
+            <StockList title="活跃换手" rows={data.active_leaders} mode="active" activeSymbol={previewStock?.source === 'active' ? previewStock.symbol : undefined} onStockClick={(symbol, name) => setPreviewStock({ symbol, name, source: 'active', navList: stockListNav(data.active_leaders) })} />
           </div>
         </main>
 
@@ -830,9 +915,12 @@ export function Dashboard() {
                 <ArrowUpRight className="h-3.5 w-3.5" />
               </Link>
             </div>
-            <MonitorWidget onStockClick={(event) => {
-              if (event.symbol) setPreviewStock({ symbol: event.symbol, name: event.name ?? undefined, alert: event })
-            }} />
+            <MonitorWidget
+              activeSymbol={previewStock?.source === 'alert' ? previewStock.symbol : undefined}
+              onStockClick={(event, navList) => {
+                if (event.symbol) setPreviewStock({ symbol: event.symbol, name: event.name ?? undefined, alert: event, source: 'alert', navList })
+              }}
+            />
           </section>
         </aside>
       </div>
@@ -847,7 +935,17 @@ export function Dashboard() {
           signals: previewStock.alert.signals,
           message: previewStock.alert.message,
         } : null}
+        navList={previewStock?.navList}
+        onNavigate={(sym, n) => setPreviewStock(prev => prev ? { ...prev, symbol: sym, name: n, alert: undefined } : prev)}
         onClose={() => setPreviewStock(null)}
+      />
+      <DimensionMembersDialog
+        target={dimensionTarget}
+        onClose={() => setDimensionTarget(null)}
+        onStockClick={(symbol, name) => {
+          setDimensionTarget(null)
+          setPreviewStock({ symbol, name })
+        }}
       />
     </div>
   )
@@ -855,7 +953,8 @@ export function Dashboard() {
 
 // ===== 无数据常驻引导卡片: 一键触发盘后管道获取行情数据(无 Key 也可) =====
 function FetchDataCard({
-  isFetching, isStarting, fetchFailed, stage, fetchPct, onStart, isNoKey,
+  isFetching, isStarting, fetchFailed, stage, fetchPct, onStart,
+  isTickflowProvider, providerLabel,
 }: {
   isFetching: boolean
   isStarting: boolean
@@ -863,7 +962,8 @@ function FetchDataCard({
   stage?: string
   fetchPct?: number
   onStart: () => void
-  isNoKey: boolean
+  isTickflowProvider: boolean
+  providerLabel: string
 }) {
   const stageText = stage ? (STAGE_LABELS[stage] ?? stage) : '正在同步行情数据…'
   return (
@@ -875,13 +975,17 @@ function FetchDataCard({
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium text-foreground">当前暂无数据</div>
           <p className="mt-1 text-xs text-secondary leading-relaxed">
-            首次使用需获取行情数据后才能查看看板。系统将从免费数据源拉取近 1 年全 A 股日K(约 5500 只),预计 1-3 分钟,期间可继续浏览其他页面。
+            首次使用需获取行情数据后才能查看看板。{isTickflowProvider
+              ? '可通过 TickFlow 免费服务器拉取近 1 年全 A 股日K'
+              : `将从当前数据源「${providerLabel}」拉取近 1 年全 A 股日K`}(约 5500 只),预计 1-3 分钟,期间可继续浏览其他页面。
           </p>
-          {isNoKey && (
-            <p className="mt-1 text-[11px] text-warning/80 leading-relaxed">
-              ⓘ 无需 API Key,当前为 None 档即可获取历史日K,可制定策略+回测。配置免费 Key 可解锁实时行情监控能力。
-            </p>
-          )}
+          <p className="mt-1 text-[11px] text-warning/80 leading-relaxed">
+            ⓘ 获取数据后即可进行策略定制、回测验证、选股扫描等本地分析功能。
+          </p>
+          <p className="mt-1 text-[11px] text-muted leading-relaxed">
+            💡 配置 fuyao(同花顺 REST) Key 可解锁财务四表 / 龙虎榜 / 盘前风向标 / 竞价异动:
+            <Link to="/settings?tab=data-sources" className="text-accent hover:text-accent/80 transition-colors">前往设置 →</Link>
+          </p>
 
           {isFetching ? (
             <div className="mt-3">
@@ -938,9 +1042,10 @@ function FetchDataCard({
 
 // ===== 首次使用自动弹窗: 询问用户后触发盘后管道 =====
 function WelcomeFetchModal({
-  isNoKey, onClose, onStart,
+  onClose, onStart, isTickflowProvider, providerLabel,
 }: {
-  isNoKey: boolean
+  isTickflowProvider: boolean
+  providerLabel: string
   onClose: () => void
   onStart: () => void
 }) {
@@ -957,14 +1062,27 @@ function WelcomeFetchModal({
         </motion.div>
         <h3 className="mt-4 text-base font-semibold text-foreground">首次使用,需先获取行情数据</h3>
         <p className="mt-2 text-xs text-secondary leading-relaxed">
-          系统将从免费数据源拉取近 1 年全 A 股日K(约 5500 只),预计 1-3 分钟。
+          {isTickflowProvider
+            ? '可通过 TickFlow 免费服务器拉取近 1 年全 A 股日K'
+            : `将从当前数据源「${providerLabel}」拉取近 1 年全 A 股日K`}(约 5500 只),预计 1-3 分钟。
           同步期间可继续浏览其他页面,完成后看板自动刷新。
         </p>
-        {isNoKey && (
-          <div className="mt-3 rounded-btn bg-elevated/60 px-3 py-2 text-[11px] text-muted leading-relaxed">
-            ⓘ 当前无需 API Key,None 档即可获取历史日K数据。
-          </div>
-        )}
+        <div className="mx-auto mt-4 max-w-md rounded-btn bg-elevated/60 px-4 py-3 text-left">
+          <div className="text-[11px] font-medium text-secondary">获取完成后的推荐步骤</div>
+          <ol className="mt-1.5 space-y-1 text-[11px] text-muted leading-relaxed">
+            <li>1. <span className="text-secondary">配置 fuyao(同花顺 REST) Key</span> — 解锁财务四表 / 龙虎榜 / 盘前风向标 / 竞价异动</li>
+            <li>2. <span className="text-secondary">分钟数据落盘(可选)</span> — 分钟策略回测与板块分时走势需要</li>
+            <li>3. <span className="text-secondary">开始研究</span> — 自选加标的 → 策略扫描 → 回测验证</li>
+          </ol>
+          <Link
+            to="/settings?tab=data-sources"
+            onClick={onClose}
+            className="mt-2 inline-flex items-center gap-0.5 text-[11px] text-accent hover:text-accent/80 transition-colors"
+          >
+            前往设置 → 数据源
+            <ArrowUpRight className="h-3 w-3 self-center" />
+          </Link>
+        </div>
         <div className="mt-5 flex items-center justify-center gap-2.5">
           <button
             onClick={onClose}

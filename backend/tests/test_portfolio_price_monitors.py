@@ -21,9 +21,17 @@ class CaptureMonitorEngine:
         self.rules = rules
 
 
+class FakeRepo:
+    def __init__(self, data_dir) -> None:
+        self.store = SimpleNamespace(data_dir=data_dir)
+
+    def resolve_asset_type(self, symbol: str) -> str:
+        return "etf" if symbol.startswith(("5", "1")) else "stock"
+
+
 def make_client(tmp_path) -> tuple[TestClient, CaptureMonitorEngine]:
     app = FastAPI()
-    app.state.repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
+    app.state.repo = FakeRepo(tmp_path)
     engine = CaptureMonitorEngine()
     app.state.monitor_engine = engine
     app.include_router(router)

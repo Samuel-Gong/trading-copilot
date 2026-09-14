@@ -4,6 +4,7 @@ import types
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -41,6 +42,7 @@ def test_all_builtin_strategies_declare_asset_types_and_timeframes():
     assert engine.load_errors() == []
     for meta in engine.list_strategies():
         assert meta["asset_types"]
+        # 分钟红7已迁至自定义策略目录, 内置策略均为日线
         assert meta["timeframes"] == ["1d"]
 
 
@@ -48,11 +50,13 @@ def test_all_builtin_strategies_use_matrix_backend_only():
     engine = _engine()
     assert engine.load_errors() == []
     strategies = [engine.get(meta["id"]) for meta in engine.list_strategies()]
-    assert len(strategies) == 18
-    assert all(strategy.execution_backend == "matrix_native" for strategy in strategies)
-    assert all(strategy.matrix_strategy is not None for strategy in strategies)
-    assert all(strategy.filter_fn is None for strategy in strategies)
-    assert all(strategy.filter_history_fn is None for strategy in strategies)
+    matrix_strategies = [s for s in strategies if s.execution_backend == "matrix_native"]
+    assert len(matrix_strategies) == 25
+    assert all(s.matrix_strategy is not None for s in matrix_strategies)
+    assert all(s.filter_fn is None for s in matrix_strategies)
+    assert all(s.filter_history_fn is None for s in matrix_strategies)
+    # 分钟形态策略 (minute_filter) 已迁至自定义策略目录, 不在 builtin 加载范围
+    assert [s.meta["id"] for s in strategies if s.execution_backend == "minute_filter"] == []
 
 
 def test_all_builtin_matrix_formulas_accept_base_market_matrix():
@@ -79,13 +83,60 @@ def test_all_builtin_matrix_formulas_accept_base_market_matrix():
     from app.backtest.matrix import build_market_data_matrix
 
     fields = set()
-    for strategy in (engine.get(meta["id"]) for meta in engine.list_strategies()):
+    matrix_metas = [
+        m for m in engine.list_strategies()
+        if engine.get(m["id"]).execution_backend == "matrix_native"
+    ]
+    for strategy in (engine.get(meta["id"]) for meta in matrix_metas):
         fields.update(engine._matrix_field_columns(strategy))
     market = build_market_data_matrix(panel, field_columns=fields)
-    for meta in engine.list_strategies():
+    for meta in matrix_metas:
         strategy = engine.get(meta["id"])
         signals = strategy.matrix_strategy.compute_signals(market, {})
         assert signals.shape == market.shape, meta["id"]
+
+
+def test_all_builtin_matrix_formulas_accept_declared_parameter_boundaries():
+    rows = []
+    start = date(2024, 1, 1)
+    for offset in range(100):
+        close = 10.0 + offset * 0.04
+        rows.append({
+            "symbol": "000001.SZ",
+            "date": start + timedelta(days=offset),
+            "open": close - 0.05,
+            "high": close + 0.15,
+            "low": close - 0.15,
+            "close": close,
+            "volume": 1000.0 + offset * 5.0,
+            "amount": 100000.0,
+            "raw_close": close,
+            "turnover_rate": 5.0,
+            "consecutive_limit_ups": 0,
+        })
+    panel = pl.DataFrame(rows)
+    engine = _engine()
+    from app.backtest.matrix import build_market_data_matrix
+
+    fields = set()
+    strategies = [
+        engine.get(meta["id"])
+        for meta in engine.list_strategies()
+        if engine.get(meta["id"]).execution_backend == "matrix_native"
+    ]
+    for strategy in strategies:
+        fields.update(engine._matrix_field_columns(strategy))
+    market = build_market_data_matrix(panel, field_columns=fields)
+
+    for strategy in strategies:
+        params = {
+            item["id"]: item.get("min", not item.get("default", False))
+            for item in strategy.meta.get("params", [])
+        }
+        signals = strategy.matrix_strategy.compute_signals(market, params)
+        assert signals.shape == market.shape, strategy.meta["id"]
+        assert signals.entry.dtype == np.uint8, strategy.meta["id"]
+        assert signals.exit.dtype == np.uint8, strategy.meta["id"]
 
 
 def test_limit_up_strategies_are_stock_only():

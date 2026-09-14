@@ -1,10 +1,8 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
-import { Link } from 'react-router-dom'
+import { useState, useCallback, useEffect, createContext, useContext } from 'react'
 import { useQueryClient, useMutation, useQuery } from '@tanstack/react-query'
 import {
   Activity,
   Wifi,
-  BarChart3,
   Flame,
   Zap,
   Webhook,
@@ -19,9 +17,13 @@ import {
 import { useUpdateQuoteInterval, useToggleRealtimeQuotes } from '@/lib/useSharedMutations'
 import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
-import { tierRank } from '@/lib/capability-labels'
+import { useCardFlash, cardFlashCls } from '@/lib/useCardFlash'
 import { toast } from '@/components/Toast'
 import { DepthConfigContent } from '@/components/data/DepthConfigCard'
+
+// 卡片定位锚点: highlight=<anchor> 时该卡片滚动到视口中央并闪烁高亮。
+// 其他页面用 /settings?tab=monitoring&highlight=<anchor> 精确引导用户到某张卡片。
+const HighlightContext = createContext('')
 
 // 页面 → 显示名
 const PAGE_LABELS: Record<string, string> = {
@@ -29,13 +31,6 @@ const PAGE_LABELS: Record<string, string> = {
   watchlist: '自选页',
   'limit-ladder': '连板梯队',
 }
-
-const SIDEBAR_INDEX_OPTIONS = [
-  { symbol: '000001.SH', name: '上证指数' },
-  { symbol: '399001.SZ', name: '深证成指' },
-  { symbol: '399006.SZ', name: '创业板指' },
-  { symbol: '000680.SH', name: '科创综指' },
-]
 
 // ===== 导出为 Panel 组件 (由 Settings.tsx 嵌入) =====
 
@@ -47,24 +42,30 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   const { data: intervalData } = useQuoteInterval()
   const updateInterval = useUpdateQuoteInterval()
   const toggleQuote = useToggleRealtimeQuotes()
-  const tier = tierRank(caps?.label ?? '')
-  const isNoneTier = tier < 0
-  // None 档但配了自定义实时源时, 后端 is_realtime_allowed 仍返回 True (realtime_mode=full_market)
-  // 此时不应拦截实时监控页 — 用 quoteStatus.realtime_allowed 作为最终判据
-  const realtimeAllowed = quoteStatus?.realtime_allowed ?? !isNoneTier
-  const isFreeTier = tier === 0
+  // 实时模式以 quote_status 为准 (数据源无关): full_market=全市场 / none=不可用
   const realtimeEnabled = prefs?.realtime_quotes_enabled ?? false
   // 分时图实时刷新间隔 (秒), 与后端 [3,60] clamp 对齐; 默认 6
   const intradayInterval = prefs?.minute_intraday_refresh_interval ?? 6
   // 滑块本地草稿: 拖动时即时反馈, 停顿 2s 后落库 (与行情轮询滑块一致)
   const [intradayIntervalDraft, setIntradayIntervalDraft] = useState(intradayInterval)
+  // 盘中分钟增量 (Expert 专有): 间隔 (秒), 与后端 [3,120] clamp 对齐; 默认 6
+  const minuteRefreshInterval = prefs?.minute_refresh_interval ?? 6
+  const [minuteRefreshIntervalDraft, setMinuteRefreshIntervalDraft] = useState(minuteRefreshInterval)
+  // 盘中增量服务状态 (15s 轮询; 无服务时 available=false)
+  const refreshStatus = useQuery({
+    queryKey: ['minute-refresh-status'],
+    queryFn: api.minuteRefreshStatus,
+    refetchInterval: 15000,
+  })
   const refreshPages = prefs?.sse_refresh_pages ?? {}
   const limitLadderMonitor = prefs?.limit_ladder_monitor_enabled ?? false
   const hasDepth = !!caps?.capabilities?.['depth5.batch']
+  // 全量分钟 = intraday.universe 能力 (TickFlow Expert 专有): 标的池单请求拉全市场当日分钟,
+  // 修复轮的 intraday.batch 与其同档, 见后端 minute_refresh 服务
+  const hasFullMinuteCap = !!caps?.capabilities?.['intraday.universe']
+  const rs = refreshStatus.data
   // 新建监控规则时默认勾选的推送渠道 (全局默认值数组, 单条规则可独立修改)
   const webhookDefaultChannels = prefs?.webhook_default_channels ?? []
-  const sidebarIndexSymbols = prefs?.sidebar_index_symbols ?? SIDEBAR_INDEX_OPTIONS.map(i => i.symbol)
-  const indicesPinned = prefs?.indices_nav_pinned ?? true
   const isRunning = quoteStatus?.running ?? false
   const isTrading = quoteStatus?.is_trading_hours ?? false
   // 管道/数据修正运行期间实时行情被临时暂停 — 此时禁止开启
@@ -107,15 +108,6 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     setBotIdDraft(wecomBotId)
     setBotSecretDraft(wecomBotSecret)
   }, [wecomBotId, wecomBotSecret])
-  const watchlistSymbols = prefs?.realtime_watchlist_symbols ?? []
-  const watchlist = useQuery({
-    queryKey: QK.watchlist,
-    queryFn: () => api.watchlistList(),
-    enabled: isFreeTier && watchlistSymbols.length > 0,
-  })
-  const watchlistNameBySymbol = new Map(
-    (watchlist.data?.symbols ?? []).map(row => [row.symbol, row.name] as const),
-  )
 
   const save = useCallback(async (cfg: Record<string, unknown>) => {
     try {
@@ -131,20 +123,6 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     qc.invalidateQueries({ queryKey: QK.preferences })
     qc.invalidateQueries({ queryKey: QK.quoteStatus })
   }, [toggleQuote, qc])
-
-  const toggleSidebarIndex = useCallback((symbol: string, visible: boolean) => {
-    const selected = new Set(sidebarIndexSymbols)
-    if (visible) selected.add(symbol)
-    else selected.delete(symbol)
-    const next = SIDEBAR_INDEX_OPTIONS
-      .map(item => item.symbol)
-      .filter(s => selected.has(s))
-    save({ sidebar_index_symbols: next })
-  }, [save, sidebarIndexSymbols])
-
-  const toggleIndicesPin = useCallback((pinned: boolean) => {
-    api.updateIndicesNavPinned(pinned).then(() => qc.invalidateQueries({ queryKey: QK.preferences }))
-  }, [qc])
 
   const toggleLimitLadderMonitor = useCallback(async (enabled: boolean) => {
     await api.updateLimitLadderMonitor(enabled)
@@ -198,6 +176,13 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     }
     saveWecomWebhook.mutate(url)
   }, [wecomDraft, saveWecomWebhook])
+
+  const testFeishu = useMutation({
+    mutationFn: () => api.sendTestWebhook('feishu'),
+  })
+  const testWecom = useMutation({
+    mutationFn: () => api.sendTestWebhook('wecom'),
+  })
 
   // 智能机器人 (BotID + Secret) 保存 → 后端立即重建连接
   const saveWecomBot = useMutation({
@@ -266,50 +251,27 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     return () => window.clearTimeout(t)
   }, [intradayIntervalDraft, intradayInterval, save])
 
-  // highlight=depth-fix 时闪烁高亮连板梯队修正卡片
-  const [flash, setFlash] = useState(false)
-  const flashedRef = useRef(false)
+  // 盘中增量间隔: 服务端值变化时同步本地草稿
   useEffect(() => {
-    if (highlight === 'depth-fix' && !flashedRef.current) {
-      flashedRef.current = true
-      // 延迟一帧确保 DOM 已渲染, 再触发闪烁
-      requestAnimationFrame(() => {
-        setFlash(true)
-        const t = setTimeout(() => setFlash(false), 2000)
-        return () => clearTimeout(t)
-      })
-    }
-  }, [highlight])
+    setMinuteRefreshIntervalDraft(minuteRefreshInterval)
+  }, [minuteRefreshInterval])
 
-  if (isNoneTier && !realtimeAllowed) {
-    return (
-      <div className="flex flex-col items-center justify-center py-20 text-center">
-        <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl
-                        bg-gradient-to-br from-purple-500/20 to-blue-500/20 mb-5">
-          <Activity className="h-7 w-7 text-purple-400" />
-        </div>
-        <h2 className="text-lg font-medium text-foreground mb-2">实时监控</h2>
-        <p className="text-sm text-secondary max-w-md mb-6">
-          实时行情需要 Free 及以上档位。None 档可使用 free-api 获取历史日K（当日数据需盘后1-2小时），但不能调用付费服务器实时接口。
-        </p>
-        <a
-          href="/settings?tab=account"
-          className="inline-flex items-center gap-2 px-5 py-2.5 rounded-btn
-                     bg-accent text-white text-sm font-medium
-                     hover:bg-accent/90 transition-colors"
-        >
-          配置 API Key 升级
-        </a>
-      </div>
-    )
-  }
+  // 盘中增量间隔: 草稿与已保存值不同时, 2s 防抖落库
+  useEffect(() => {
+    if (minuteRefreshIntervalDraft === minuteRefreshInterval) return
+    const t = window.setTimeout(() => {
+      save({ minute_refresh_interval: minuteRefreshIntervalDraft })
+    }, 2000)
+    return () => window.clearTimeout(t)
+  }, [minuteRefreshIntervalDraft, minuteRefreshInterval, save])
 
   return (
+    <HighlightContext.Provider value={highlight ?? ''}>
     <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-6 max-w-5xl">
       {/* ========== 左列 ========== */}
       <div className="space-y-6">
         {/* 行情状态 — 开关 + 间隔 */}
-        <Card icon={Activity} title="行情轮询">
+        <Card icon={Activity} title="行情轮询" anchor="quotes">
           <ToggleRow
             label="实时行情"
             desc={
@@ -328,7 +290,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
               <div className="min-w-0">
                 <div className="text-sm text-foreground">轮询间隔</div>
                 <div className="text-[11px] text-muted">
-                  {isFreeTier ? '每轮拉取自选股实时行情的时间间隔' : '每轮拉取全市场行情的时间间隔'}
+                  每轮拉取全市场行情的时间间隔
                 </div>
               </div>
               <span className="text-[11px] font-mono text-foreground shrink-0 tabular-nums">
@@ -352,43 +314,6 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
           </div>
         </Card>
 
-        {isFreeTier && (
-        <Card icon={Activity} title="自选股实时">
-          <div className="mb-3 rounded-btn border border-accent/25 bg-accent/10 px-3 py-2 text-xs font-medium leading-snug text-accent">
-            Free 档开启实时行情时自动监控「自选」页面前 5 个标的，最低 6 秒刷新。
-          </div>
-          {watchlistSymbols.length > 0 ? (
-            <div className="space-y-1.5">
-              {watchlistSymbols.map(symbol => {
-                const name = watchlistNameBySymbol.get(symbol)
-                return (
-                  <div key={symbol} className="flex items-center justify-between rounded-btn bg-base/50 border border-border px-2 py-1.5">
-                    <div className="min-w-0 flex items-baseline gap-1.5">
-                      <span className="text-xs font-mono text-foreground">{symbol}</span>
-                      {name && <span className="truncate text-[11px] text-secondary">{name}</span>}
-                    </div>
-                    <span className="text-[10px] text-muted shrink-0">自选页</span>
-                  </div>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="rounded-btn border border-border bg-base/40 px-3 py-3 text-xs text-muted">
-              自选列表为空，Free 实时行情开启前请先添加自选股。
-            </div>
-          )}
-          <div className="mt-2 flex items-center justify-between gap-3">
-            <span className="text-[10px] text-muted">当前 {watchlistSymbols.length}/5 只</span>
-            <Link
-              to="/watchlist"
-              className="px-3 py-1 rounded-btn bg-elevated text-secondary text-xs font-medium hover:text-foreground transition-colors"
-            >
-              管理自选
-            </Link>
-          </div>
-        </Card>
-        )}
-        {!isFreeTier && (
         <Card icon={Wifi} title="页面实时刷新">
           <p className="text-xs text-secondary mb-4">
             选择哪些页面跟随 SSE 实时刷新数据。关闭的页面不会被推送，
@@ -406,13 +331,12 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
             ))}
           </div>
         </Card>
-        )}
 
         {/* 自选列表分时图实时刷新 (默认关闭, 开启后盘中按设定间隔轮询刷新分时数据) */}
-        <Card icon={Activity} title="分时图刷新">
+        <Card icon={Activity} title="分时图刷新" anchor="intraday-refresh">
           <ToggleRow
             label="自选/策略分时图实时刷新"
-            desc={`开启后自选与策略列表的分时图盘中每 ${intradayInterval} 秒自动刷新（需 Pro+ 权限 + 实时行情运行）。关闭时仅打开页面时拉取一次, 可点表头刷新按钮手动更新。`}
+            desc={`开启后自选与策略列表的分时图盘中每 ${intradayInterval} 秒自动刷新（依赖分钟K批量数据 + 实时行情运行）。关闭时仅打开页面时拉取一次, 可点表头刷新按钮手动更新。`}
             checked={prefs?.minute_intraday_refresh ?? false}
             onChange={(v) => save({ minute_intraday_refresh: v })}
           />
@@ -445,45 +369,67 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
           </div>
         </Card>
 
-        {!isFreeTier && (
-        <Card icon={BarChart3} title="左侧菜单指数">
-          <p className="text-xs text-secondary mb-4">
-            选择实时行情开启时，左侧菜单底部显示哪些指数点位和涨跌幅。
-          </p>
-          <div className="space-y-2">
-            {SIDEBAR_INDEX_OPTIONS.map(item => (
-              <ToggleRow
-                key={item.symbol}
-                label={item.name}
-                desc={item.symbol}
-                checked={sidebarIndexSymbols.includes(item.symbol)}
-                onChange={(v) => toggleSidebarIndex(item.symbol, v)}
-              />
-            ))}
-          </div>
-          <div className="mt-3 pt-3 border-t border-border">
-            <ToggleRow
-              label="固定显示"
-              desc={indicesPinned ? '指数卡片常驻显示（即使实时行情关闭）' : '跟随实时行情开关（仅实时开时显示）'}
-              checked={indicesPinned}
-              onChange={toggleIndicesPin}
-            />
-          </div>
-        </Card>
-        )}
       </div>
 
       {/* ========== 右列 ========== */}
       <div className="space-y-6">
-        {/* 连板梯队降级修正 (移至右列顶部) */}
-        <div
-          id="depth-fix"
-          className={`rounded-card transition-all duration-500 ${flash ? 'ring-2 ring-accent/60 ring-offset-2 ring-offset-base scale-[1.01]' : 'ring-0 ring-transparent'}`}
-        >
+        {/* 全量分钟: 盘中全市场分钟落盘, 按能力路由 (TickFlow Expert 或声明 full_minute 的插件/自定义源) */}
+        <Card icon={Zap} title="全量分钟" anchor="minute-refresh">
+          <ToggleRow
+            label="全量分钟落盘"
+            desc={
+              !hasFullMinuteCap ? '需要全量分钟能力 (TickFlow Expert 或声明该能力的自定义源)'
+              : rs?.repair_only ? `服务运行中 · ${rs?.provider ?? '自定义源'} 无廉价增量端点, 按 ≥60s 全天批量节奏`
+              : rs?.running ? (rs?.in_trading_hours ? '服务运行中' : '运行中 · 非连续竞价时段暂停')
+              : '已关闭'
+            }
+            checked={prefs?.minute_refresh_enabled ?? false}
+            onChange={(v) => save({ minute_refresh_enabled: v })}
+            disabled={!hasFullMinuteCap}
+          />
+          <div className="mt-3 pt-3 border-t border-border">
+            <div className="flex items-center justify-between gap-4 py-1">
+              <div className="min-w-0">
+                <div className="text-sm text-foreground">刷新间隔</div>
+                <div className="text-[11px] text-muted">
+                  交易时段内全市场分钟K增量落盘的间隔; 稳态单请求增量, 冷启动/断档自动全天回补
+                </div>
+              </div>
+              <span className="text-[11px] font-mono text-foreground shrink-0 tabular-nums">
+                {minuteRefreshIntervalDraft >= 60 && minuteRefreshIntervalDraft % 60 === 0 ? `${minuteRefreshIntervalDraft / 60}m` : `${minuteRefreshIntervalDraft}s`}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 mt-2">
+              <input
+                type="range"
+                min={3}
+                max={120}
+                step={3}
+                value={minuteRefreshIntervalDraft}
+                disabled={!hasFullMinuteCap}
+                onChange={(e) => setMinuteRefreshIntervalDraft(parseInt(e.target.value, 10))}
+                className="flex-1 h-1 accent-accent cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              />
+              <span className="text-[10px] text-muted shrink-0">
+                {minuteRefreshIntervalDraft !== minuteRefreshInterval ? '2秒后保存' : '3s — 120s'}
+              </span>
+            </div>
+            {rs?.available && rs.rounds != null && rs.rounds > 0 && (
+              <div className="mt-2 text-[10px] text-muted">
+                已 {rs.rounds} 轮 · 最近 {rs.last_symbols} 标的 / {rs.last_rows} 行 / {rs.last_requests} 请求
+                {rs.last_round_ms != null ? ` · ${(rs.last_round_ms / 1000).toFixed(1)}s` : ''}
+                {rs.last_error ? ` · ${rs.last_error}` : ''}
+              </div>
+            )}
+          </div>
+        </Card>
+
+        {/* 连板梯队降级修正 */}
         <Card
           icon={Flame}
           title="连板梯队降级修正"
-          badge={!hasDepth ? '需 Pro+' : undefined}
+          anchor="depth-fix"
+          badge={!hasDepth ? '五档盘口不可用' : undefined}
           right={hasDepth ? (
             <button
               onClick={() => runFix.mutate()}
@@ -520,12 +466,11 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
             <DepthConfigContent disabled />
           )}
         </Card>
-        </div>
 
         {/* 推送通知 — 监控告警的外部推送渠道 (全局配置)。
             飞书 / 企业微信。
             每个渠道合并成一行: 勾选=新建规则默认推送, 点行展开地址配置。 */}
-        <Card icon={Webhook} title="推送通知">
+        <Card icon={Webhook} title="推送通知" anchor="webhooks">
           <p className="text-xs text-secondary mb-3">
             监控规则命中后,可把告警推送到外部。勾选渠道作为<b className="text-foreground/80">新建规则的默认推送</b>,
             单条规则仍可在编辑页独立修改。
@@ -565,7 +510,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     <span className="text-[11px] text-muted">Webhook 地址</span>
                     <input
                       value={feishuDraft}
-                      onChange={e => setFeishuDraft(e.target.value)}
+                      onChange={e => { setFeishuDraft(e.target.value); if (!testFeishu.isPending) testFeishu.reset() }}
                       placeholder={FEISHU_PREFIX + 'xxxxxxxx'}
                       className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
                     />
@@ -576,7 +521,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     <input
                       type="password"
                       value={feishuSecretDraft}
-                      onChange={e => setFeishuSecretDraft(e.target.value)}
+                      onChange={e => { setFeishuSecretDraft(e.target.value); if (!testFeishu.isPending) testFeishu.reset() }}
                       placeholder="机器人未启用签名校验则留空"
                       className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
                     />
@@ -594,9 +539,11 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     >
                       {saveFeishuWebhook.isPending ? '保存中…' : '保存'}
                     </button>
+                    <TestSendButton test={testFeishu} configured={!!feishuWebhookUrl} />
                     {feishuWebhookUrl && (
                       <span className="text-[10px] text-emerald-500">● 已配置</span>
                     )}
+                    <TestResult test={testFeishu} />
                   </div>
 
                   <details className="mt-3 text-[10px] text-muted">
@@ -650,7 +597,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     <span className="text-[11px] text-muted">Webhook 地址 或 Key</span>
                     <input
                       value={wecomDraft}
-                      onChange={e => setWecomDraft(e.target.value)}
+                      onChange={e => { setWecomDraft(e.target.value); if (!testWecom.isPending) testWecom.reset() }}
                       placeholder={WECOM_PREFIX + '?key=xxxxxxxx' + ' 或直接填 key'}
                       className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
                     />
@@ -668,9 +615,11 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     >
                       {saveWecomWebhook.isPending ? '保存中…' : '保存'}
                     </button>
+                    <TestSendButton test={testWecom} configured={!!wecomWebhookUrl} />
                     {wecomWebhookUrl && (
                       <span className="text-[10px] text-emerald-500">● 已配置</span>
                     )}
+                    <TestResult test={testWecom} />
                   </div>
 
                   <details className="mt-3 text-[10px] text-muted">
@@ -791,9 +740,52 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
         </Card>
       </div>
     </div>
+    </HighlightContext.Provider>
   )
 }
 
+
+// ===== 推送测试按钮 + 内联结果 =====
+
+function TestSendButton({ test, configured }: {
+  test: { isPending: boolean; mutate: () => void }
+  configured: boolean
+}) {
+  return (
+    <button
+      onClick={() => test.mutate()}
+      disabled={test.isPending || !configured}
+      title={!configured ? '请先保存 Webhook 地址' : '向已保存的地址发送测试消息'}
+      className="inline-flex items-center gap-1 px-3 py-1.5 rounded-btn bg-elevated text-secondary hover:text-foreground text-xs disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+    >
+      {test.isPending ? '测试中…' : '测试'}
+    </button>
+  )
+}
+
+function TestResult({ test }: {
+  test: { data?: { ok: boolean; detail: string } | null; isError: boolean; error?: Error | null; reset: () => void }
+}) {
+  // 成功结果 2 秒后自动消失; 失败保留, 便于阅读
+  useEffect(() => {
+    if (test.data?.ok) {
+      const t = window.setTimeout(test.reset, 2000)
+      return () => window.clearTimeout(t)
+    }
+  }, [test.data, test.reset])
+
+  let text: string | null = null
+  let tone = ''
+  if (test.isError) {
+    text = String(test.error?.message ?? '发送失败')
+    tone = 'text-danger'
+  } else if (test.data) {
+    text = (test.data.ok ? '✓ ' : '✗ ') + test.data.detail
+    tone = test.data.ok ? 'text-emerald-500' : 'text-danger'
+  }
+  if (!text) return null
+  return <span className={`min-w-0 text-[11px] leading-snug ${tone}`}>{text}</span>
+}
 
 // ===== ToggleRow =====
 
@@ -849,8 +841,10 @@ interface CardProps {
   children: React.ReactNode
 }
 
-function Card({ icon: Icon, title, badge, right, children }: CardProps) {
-  return (
+function Card({ icon: Icon, title, badge, right, children, anchor }: CardProps & { anchor?: string }) {
+  const highlight = useContext(HighlightContext)
+  const { ref, flash } = useCardFlash(anchor ? highlight : undefined, anchor ?? '')
+  const inner = (
     <section className="rounded-card border border-border bg-surface p-5">
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2.5">
@@ -866,5 +860,11 @@ function Card({ icon: Icon, title, badge, right, children }: CardProps) {
       </div>
       {children}
     </section>
+  )
+  if (!anchor) return inner
+  return (
+    <div ref={ref} id={anchor} className={cardFlashCls(flash)}>
+      {inner}
+    </div>
   )
 }
