@@ -130,7 +130,8 @@ def test_save_signal_invalidation_failure_restores_previous_definition(
 ) -> None:
     client = _client(tmp_path)
     assert client.post("/api/custom-signals", json=_payload("rollback")).status_code == 200
-    previous = _payload("rollback")
+    from app.strategy import custom_signals
+    previous = next(item for item in custom_signals.load_all(tmp_path) if item["id"] == "rollback")
     from app.indicators import pipeline
     from app.strategy import custom_signals
 

@@ -89,7 +89,7 @@ def test_attach_replaces_with_newer_announcement():
     assert roe[4] is None            # 4-5 公告日
     assert roe[5] == 20.0            # 4-6 起 20.0
     assert roe[13] == 20.0           # 4-14
-    assert roe[14] == 20.0           # 4-15 新公告尚不可用, 旧版本继续有效
+    assert roe[14] == 20.0           # 4-15 二次公告日: 新一期尚未生效, 仍保留上一期
     assert roe[15] == 33.0           # 4-16 起新公告生效
 
 
@@ -152,8 +152,8 @@ def test_matrix_field_matches_polars_attach():
                 np.testing.assert_allclose(actual, expected, rtol=1e-6)
 
 
-def test_pb_uses_unadjusted_close_in_polars_and_matrix_paths():
-    """PB 的分子必须使用未复权价格, 不能随前复权因子失真。"""
+def test_pb_uses_upstream_close_in_polars_and_matrix_paths():
+    """PB 在两条计算路径中都沿用 upstream 的 close 分子。"""
     panel = _daily_panel(date(2026, 4, 1), 4, ("600000.SH",)).with_columns(
         pl.lit(5.0).alias("close"),
         pl.lit(10.0).alias("raw_close"),
@@ -163,27 +163,27 @@ def test_pb_uses_unadjusted_close_in_polars_and_matrix_paths():
     ])
 
     attached = attach_fundamental_factors(panel, snapshot, ["pb_latest"]).sort("date")
-    assert attached["pb_latest"].to_list() == [None, 5.0, 5.0, 5.0]
+    assert attached["pb_latest"].to_list() == [None, 2.5, 2.5, 2.5]
 
     market = build_market_data_matrix(panel, field_columns={"raw_close"})
     matrix = build_fundamental_matrices(market, snapshot, ["pb_latest"])["pb_latest"]
     assert np.isnan(matrix[0, 0])
-    np.testing.assert_allclose(matrix[1:, 0], np.array([5.0, 5.0, 5.0]))
+    np.testing.assert_allclose(matrix[1:, 0], np.array([2.5, 2.5, 2.5]))
 
     missing_raw = panel.drop("raw_close")
     attached_missing = attach_fundamental_factors(
         missing_raw, snapshot, ["pb_latest"]
     )
-    assert attached_missing["pb_latest"].null_count() == attached_missing.height
+    assert attached_missing["pb_latest"].to_list() == [None, 2.5, 2.5, 2.5]
     market_missing = build_market_data_matrix(missing_raw)
     matrix_missing = build_fundamental_matrices(
         market_missing, snapshot, ["pb_latest"]
     )["pb_latest"]
-    assert np.isnan(matrix_missing).all()
+    np.testing.assert_allclose(matrix_missing, matrix, equal_nan=True)
 
 
-def test_matrix_pb_fails_closed_when_requested_raw_close_is_synthetic(tmp_path: Path):
-    """显式请求 raw_close 后的 close 合成回退不能用于 PB。"""
+def test_matrix_pb_uses_close_when_raw_close_is_synthetic(tmp_path: Path):
+    """PB 使用 close，raw_close 是否来自合成回退不影响结果。"""
     panel = _daily_panel(date(2026, 4, 1), 4, ("600000.SH",)).drop("raw_close")
     snapshot = _snapshot_frame([
         {"symbol": "600000.SH", "announce": "2026-04-01", "bps": 2.0},
@@ -205,11 +205,12 @@ def test_matrix_pb_fails_closed_when_requested_raw_close_is_synthetic(tmp_path: 
     np.testing.assert_array_equal(market.fields["raw_close"], market.close)
     matrix = build_fundamental_matrices(market, snapshot, ["pb_latest"])["pb_latest"]
 
-    assert np.isnan(matrix).all()
+    assert np.isnan(matrix[0, 0])
+    np.testing.assert_allclose(matrix[1:], market.close[1:] / 2.0)
 
 
-def test_older_period_revision_does_not_replace_latest_period():
-    """旧报告期晚修订后，当前因子仍使用已公布的最新报告期。"""
+def test_latest_announcement_controls_factor_like_upstream():
+    """按 upstream 公告时间排序，最新公告生效后决定因子值。"""
     panel = _daily_panel(date(2026, 1, 1), 40, ("600000.SH",))
     snapshot = _snapshot_frame([
         {
@@ -233,11 +234,60 @@ def test_older_period_revision_does_not_replace_latest_period():
     ])
 
     attached = attach_fundamental_factors(panel, snapshot, ["roe_latest"]).sort("date")
-    assert attached.filter(pl.col("date") == date(2026, 2, 2))["roe_latest"].item() == 20.0
+    assert attached.filter(pl.col("date") == date(2026, 2, 2))["roe_latest"].item() == 99.0
 
     market = build_market_data_matrix(panel)
     matrix = build_fundamental_matrices(market, snapshot, ["roe_latest"])["roe_latest"]
-    assert matrix[32, 0] == 20.0
+    assert matrix[32, 0] == 99.0
+
+
+def test_matrix_field_matches_polars_attach_across_two_announcements():
+    """换报告期时两条路径仍须一致: 新公告当日应保留上一期值(前向填充不断档)。"""
+    panel = _daily_panel(date(2026, 4, 1), 20, ("600000.SH",))
+    snapshot = _snapshot_frame([
+        {"symbol": "600000.SH", "announce": "2026-04-05", "roe": 20.0},
+        {"symbol": "600000.SH", "announce": "2026-04-15", "roe": 33.0},
+    ])
+    attached = attach_fundamental_factors(panel, snapshot, ["roe_latest"]).sort("date")
+    market = build_market_data_matrix(panel)
+    matrix = build_fundamental_matrices(market, snapshot, ["roe_latest"])["roe_latest"]
+    column = market.symbols.index("600000.SH")
+    for row_index, value in enumerate(attached["roe_latest"].to_list()):
+        actual = matrix[row_index, column]
+        if value is None:
+            assert np.isnan(actual), (row_index, actual)
+        else:
+            np.testing.assert_allclose(actual, value, rtol=1e-6)
+
+
+def test_matrix_field_clears_value_when_newer_report_lacks_metric():
+    """新一期财报缺该指标时不得继续沿用上一期值, 否则同一行混用两期报告。
+
+    矩阵路径逐列前向填充, 若跳过空值写入, 4-16 起 pb 已换到新期 bps=6,
+    roe 却仍停在上一期的 20 —— polars 侧 join_asof 只认最新一期整行 (roe 为
+    null), 两条路径给出不同的因子值。
+    """
+    panel = _daily_panel(date(2026, 4, 1), 20, ("600000.SH",))
+    snapshot = _snapshot_frame([
+        {"symbol": "600000.SH", "announce": "2026-04-05", "roe": 20.0, "bps": 4.0},
+        {"symbol": "600000.SH", "announce": "2026-04-15", "roe": None, "bps": 6.0},
+    ])
+    attached = attach_fundamental_factors(panel, snapshot, ["roe_latest", "pb_latest"]).sort("date")
+    market = build_market_data_matrix(panel, field_columns={"raw_close"})
+    matrices = build_fundamental_matrices(market, snapshot, ["roe_latest", "pb_latest"])
+    column = market.symbols.index("600000.SH")
+
+    # polars 口径: 新公告生效 (4-16) 后 roe 无值, pb 走新一期 bps
+    assert attached["roe_latest"].to_list()[15:] == [None] * 5
+    assert all(value is not None for value in attached["pb_latest"].to_list()[15:])
+
+    for name in ("roe_latest", "pb_latest"):
+        for row_index, value in enumerate(attached[name].to_list()):
+            actual = matrices[name][row_index, column]
+            if value is None:
+                assert np.isnan(actual), (name, row_index, actual)
+            else:
+                np.testing.assert_allclose(actual, value, rtol=1e-6)
 
 
 def test_bps_nonpositive_gives_null_pb():
@@ -307,7 +357,44 @@ def test_financial_sync_merges_history(tmp_path: Path):
     row = merged2.filter(
         (pl.col("symbol") == "600000.SH") & (pl.col("period_end") == "2025-12-31")
     )
-    assert row.height == 2
-    assert row.sort("announce_date")["roe"].to_list() == [9.0, 9.5]
-    assert merged2.height == 3
-    assert fs._merge_report_history(merged2, revised).height == 3
+    assert row.height == 1
+    assert row["roe"].item() == 9.5
+    assert merged2.height == 2  # 修正不增加行数
+
+
+def test_financial_sync_merge_unknown_announce_date_does_not_win():
+    """公告日未知的旧行不得压过带公告日的新行。
+
+    多源并存时旧行可能没有 announce_date (provider 不提供 / 上游缺该字段)。
+    这类"公告日未知"的行若排在真实公告日之后, 逐列取最后一个非空值时反而胜出,
+    合并结果会出现「announce_date 是新公告、数值仍是旧值」的自相矛盾行,
+    点时因子据此在公告日之后放出的是修正前的数。
+    """
+    from app.services import financial_sync as fs
+
+    revised = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "period_end": ["2025-12-31"],
+        "announce_date": ["2026-02-01"],
+        "roe": [9.5],
+    })
+    # 旧行有 announce_date 列但取值为空
+    old_null = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "period_end": ["2025-12-31"],
+        "announce_date": [None],
+        "roe": [9.0],
+    })
+    row = fs._merge_report_history(old_null, revised).to_dicts()[0]
+    assert row["announce_date"] == "2026-02-01"
+    assert row["roe"] == 9.5
+
+    # 旧帧整列缺失 (另一数据源不提供该字段) — 文档承诺"后写优先"
+    old_missing = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "period_end": ["2025-12-31"],
+        "roe": [9.0],
+    })
+    row = fs._merge_report_history(old_missing, revised).to_dicts()[0]
+    assert row["announce_date"] == "2026-02-01"
+    assert row["roe"] == 9.5

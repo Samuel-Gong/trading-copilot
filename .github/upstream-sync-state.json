@@ -3,9 +3,9 @@
   "upstream_repository": "shy3130/tickflow-stock-panel",
   "tag_pattern": "^v?(\\d+)\\.(\\d+)\\.(\\d+)$",
   "baseline_commit": "99bdec875d4bbf5c30ddc43534b81ada0f3b0f6b",
-  "merge_base_commit": "e0cd625ef455bd1ca1fcf36a8748813e53bdea09",
+  "merge_base_commit": "8d1efd91d78f9aaaef0dea2050846f1f0648bf1d",
   "last_synced_release": {
-    "tag": "v0.2.3",
-    "commit": "e0cd625ef455bd1ca1fcf36a8748813e53bdea09"
+    "tag": "v0.2.4",
+    "commit": "8d1efd91d78f9aaaef0dea2050846f1f0648bf1d"
   }
 }

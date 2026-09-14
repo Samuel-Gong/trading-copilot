@@ -294,11 +294,13 @@ def _sync_table(
 
 
 def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
-    """合并财务报告历史，并保留同报告期的每个公告版本。
+    """按 (symbol, period_end) 合并各报告期, 同期多行逐列取最新非空值。
 
-    相同公告版本按输入顺序逐列取最后一个非空值；较晚公告缺少的字段仅从同一
-    ``(symbol, period_end)`` 的既有较早公告向前填充。这样既能让不同 Provider
-    的字段并集共存，也不会折叠修订公告或把未来修订泄漏到更早时点。
+    语义(区分"覆盖"与"填空"): 每列独立取 announce_date 最新的非空值 —
+    新同步行有值则覆盖旧值, 新行缺的列(如 fuyao 不提供的字段)由旧行补齐,
+    实现多数据源并集共存。历史报告期不可变, 合并不会引入过期数据。
+    无 announce_date 的帧按输入顺序, 后写优先(与旧行为 keep="last" 一致);
+    公告日为空视为最旧, 不得压过带公告日的行。
     """
     valid = [
         frame
@@ -307,30 +309,23 @@ def _merge_report_history(*frames: pl.DataFrame) -> pl.DataFrame:
     ]
     if not valid:
         return pl.DataFrame()
-    merged = pl.concat(valid, how="diagonal_relaxed").filter(
-        pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null()
+    merged = (
+        pl.concat(valid, how="diagonal_relaxed")
+        .filter(pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null())
     )
-    # 同一报告期的原公告与修订公告必须同时保留, 历史回测才能按目标日还原当时
-    # 已公开的版本; 仅完全相同的公告版本去重。
-    version_columns = ["symbol", "period_end"]
-    if "announce_date" in merged.columns:
-        version_columns.append("announce_date")
-
-    value_columns = [column for column in merged.columns if column not in version_columns]
-    merged = merged.group_by(version_columns, maintain_order=True).agg([
-        pl.col(column).drop_nulls().last().alias(column)
-        for column in value_columns
-    ])
-    merged = merged.sort(version_columns, nulls_last=True)
-    if "announce_date" in version_columns and value_columns:
-        merged = merged.with_columns([
-            pl.col(column)
-            .forward_fill()
-            .over(["symbol", "period_end"])
-            .alias(column)
-            for column in value_columns
-        ])
-    return merged
+    sort_keys = ["symbol", "period_end"] + (
+        ["announce_date"] if "announce_date" in merged.columns else []
+    )
+    # 公告日为空排在最前: 排到最后会让"公告日未知"的旧行在逐列 last() 时胜出,
+    # 产出 announce_date 是新公告、数值却是旧值的自相矛盾行。symbol/period_end
+    # 已在上面过滤掉空值, 不受该参数影响。
+    merged = merged.sort(sort_keys, nulls_last=False)
+    value_cols = [c for c in merged.columns if c not in ("symbol", "period_end")]
+    return (
+        merged.group_by("symbol", "period_end")
+        .agg([pl.col(c).drop_nulls().last() for c in value_cols])
+        .sort(["symbol", "period_end"])
+    )
 
 
 def _sync_history_table_for_symbols(

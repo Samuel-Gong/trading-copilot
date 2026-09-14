@@ -209,8 +209,8 @@ def test_shares_returns_empty(monkeypatch):
     assert provider.get_financials("shares", ["600519.SH"]).is_empty()
 
 
-def test_merge_fills_missing_cells_without_collapsing_announcement_versions():
-    """较晚公告可继承已知字段，但修订前后的版本必须同时保留。"""
+def test_merge_fills_missing_cells_at_latest_announcement():
+    """沿用 upstream 按报告期聚合，较晚公告继承最新非空字段。"""
     old = pl.DataFrame({
         "symbol": ["600519.SH", "600519.SH"],
         "period_end": ["2026-03-31", "2026-06-30"],
@@ -227,7 +227,7 @@ def test_merge_fills_missing_cells_without_collapsing_announcement_versions():
         "bps": [200.99],                   # fuyao 扩展列, 旧行没有
     })
     merged = _merge_report_history(old, new).to_dicts()
-    assert len(merged) == 3
+    assert len(merged) == 2
     q2 = next(r for r in merged if r["announce_date"] == "2026-08-15")
     assert q2["net_income"] == pytest.approx(461.5)   # 新值覆盖
     assert q2["diluted_eps"] == pytest.approx(70.2)   # 旧行补齐
@@ -242,7 +242,7 @@ def test_merge_fills_missing_cells_without_collapsing_announcement_versions():
         "net_income": [999.0],
     })
     reversed_merged = _merge_report_history(old, reversed_new)
-    assert reversed_merged.height == 3
+    assert reversed_merged.height == 2
     q2b = reversed_merged.filter(
         pl.col("announce_date") == "2026-08-10"
     ).to_dicts()[0]
