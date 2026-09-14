@@ -32,7 +32,7 @@ export function TradeCostDialog({ trade, onClose, onSaved }: {
         symbol: trade.symbol,
         side: trade.side,
         quantity: trade.quantity,
-        price: trade.price,
+        price: trade.amount != null ? trade.amount / trade.quantity : trade.price,
       })
       setFee(result.fee.toFixed(2))
       setTax(result.tax.toFixed(2))
