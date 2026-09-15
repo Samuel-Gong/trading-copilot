@@ -8,6 +8,7 @@
 - 保持实现简单、改动范围最小，不处理无关问题。
 - 不覆盖工作区已有修改，不虚构测试或审查结果。
 - 以实际验证结果作为完成标准。
+- 新增策略默认新增到部署机器（UCloud 生产环境）；仅在用户明确指定本机时保存到本机。操作前按 [`生产运维文档`](docs/ucloud-production.md) 确认目标环境，使用部署环境的策略管理入口保存，并验证持久化和运行时加载后再报告完成。
 - GitHub 认证或推送结果在 Codex 与用户终端不一致时，必须完整执行 [`GitHub 认证分层诊断`](docs/github-auth-troubleshooting.md)；连接器、`gh` CLI 与 HTTPS Git Keychain 分开判断，不能根据沙箱内单次失败要求用户重新登录。
 - 登录本地 TickFlow 面板（`localhost` / `127.0.0.1`）时，读取根目录的 [`.agent-secrets.md`](.agent-secrets.md)，其中凭据仅限本机登录使用，不得复制到提交内容、日志或对外请求。
 - 启动本项目应用进程时，必须在启动命令中清除大小写的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`，避免应用继承 Codex shell 代理；该例外仅适用于应用进程，其他外部网络请求仍遵循全局代理约定。
