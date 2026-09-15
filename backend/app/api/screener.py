@@ -519,8 +519,8 @@ def get_cached_summary(request: Request):
         sid: {
             "total": int(result.get("total") or 0),
             "as_of": result.get("as_of"),
-            # 渐进式 run_all 写入的计算时间戳; 监控实时叠加/旧缓存无此字段 → None,
-            # 前端视为新鲜 (有值即为最新一轮实时结果)
+            # 渐进式扫描写入的完成时间；实时叠加只保留同日已落盘的时间。
+            # 无完成时间的旧摘要不能解除本轮等待。
             "computed_at": result.get("computed_at"),
         }
         for sid, result in results.items()
