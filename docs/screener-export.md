@@ -66,6 +66,42 @@ CSV 固定列为 `as_of,strategy_id,strategy_name,symbol,name,close,change_pct,t
 
 TXT 是 UTF-8 文本，每行一个完整证券代码，跨策略按首次出现顺序去重，不含表头。
 
+## helper 同步策略名称与描述
+
+选股结果的日期与个股命中关系继续读取上述导出接口；策略说明复用现有列表接口：
+
+```http
+GET /api/strategies?asset_type=stock&timeframe=1d
+```
+
+helper 只需消费 `strategies` 数组中以下字段，并检查顶层 `load_errors`；其他详情字段可以忽略。以下为合成数据投影，并非完整响应：
+
+```json
+{
+  "strategies": [
+    {"id": "trend_breakout", "name": "测试趋势策略", "description": "筛选满足指定趋势规则的股票。"}
+  ]
+}
+```
+
+- `id` 是策略稳定标识，与同一服务导出响应的 `results` 键关联。跨服务同步时使用“来源 + 策略 ID”，不要只按名称或 ID 合并不同来源。
+- `name`、`description` 使用请求时的当前配置，应用用户覆盖。沿用既有规则：空覆盖值回退策略默认值；默认描述缺失或为 `null` 时返回空字符串。无描述时客户端显示“未提供策略描述”，不从名称猜测。
+- `asset_type=stock&timeframe=1d` 返回支持股票日线的策略，默认不包含研究草稿。列表不等于策略池，也不等于已运行结果清单；没有可用策略时返回 `strategies=[]`。
+- 默认策略池和手动指定策略 ID 两种导入入口都应读取该列表，再按实际导出的策略 ID 关联。成功导出后若找不到对应元数据，或列表含 `load_errors`，应明确提示缺失/加载异常，不拿另一策略的说明补齐。
+- 两个接口沿用相同的 Cookie 会话认证。应先验证两次请求状态与字段，再保存完整导入批次；请求失败时保留已有本地记录，不用错误响应覆盖它们。策略引擎未初始化时列表返回 503。
+
+### 时间语义与离线保存
+
+列表返回的是**请求时的当前策略配置**；导出 `as_of` 是已保存结果的交易日期。两次请求不是原子快照，期间配置或策略集合可能变化。即使传入历史 `as_of`，也不能把当前说明称为“当日运行时策略说明”或个股实际满足条件的证据。导出中的策略名称同样取自当前配置。
+
+helper 可以将名称和描述随导入批次保存在本地，离线展示为“导入时保存的策略说明”。旧批次是否随以后同步更新，由客户端明确选择；本接口不保证或代替这一存储策略。需要严格的运行时版本时，必须另行设计运行时持久化与导出契约。不要将策略描述写入 `selection_evidence` 冒充运行证据。
+
+本轮不增加摘要端点、详细入选条件或服务端历史归档。helper 的历史只覆盖实际保存的导入快照。
+
+### 部署后核对
+
+对实际部署地址先读取 `/health` 的完整 `git_sha`，确认运行版本，再使用同一登录会话请求策略列表和导出。检查列表字段类型、股票日线范围及所选策略 ID 的关联；无保存结果时按导出状态码处理，不触发重算。源码存在端点或健康检查通过，都不能代替带认证的接口验证。
+
 ## 认证和调用示例
 
 接口沿用面板现有 Cookie 会话认证，没有单独的 API Key。设置访问密码后，先请求 `POST /api/auth/login`，保存响应中的 `tf_session` Cookie，后续请求携带该 Cookie。会话通常有效 30 天，过期或修改密码后重新登录；HTTPS 部署应全程使用 HTTPS。
@@ -79,6 +115,11 @@ curl --fail-with-body -c session.cookies \
   -H 'Content-Type: application/json' \
   --data-binary @login.json \
   "$BASE_URL/api/auth/login"
+
+curl --fail-with-body -b session.cookies --get \
+  --data-urlencode 'asset_type=stock' \
+  --data-urlencode 'timeframe=1d' \
+  "$BASE_URL/api/strategies"
 
 curl --fail-with-body -b session.cookies --get \
   --data-urlencode 'strategy_id=trend_breakout' \

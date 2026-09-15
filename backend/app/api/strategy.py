@@ -260,7 +260,7 @@ def _strategy_detail(
     return {
         "id": s.meta["id"],
         "name": name or s.meta.get("name", ""),
-        "description": description or s.meta.get("description", ""),
+        "description": description or s.meta.get("description") or "",
         "tags": s.meta.get("tags", []),
         "source": s.source,
         "research_only": s.meta.get("research_only", False),
