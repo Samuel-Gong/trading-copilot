@@ -1,7 +1,8 @@
-"""指数 API。"""
+"""指数 API (核心四只固定清单, 浏览/搜索全量指数已下线; 仅保留详情读数与同步)。"""
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -16,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/index", tags=["index"])
 
+# 当日指数分钟结果进程内缓存: 吸收板块切换卡片/指数页 30s 轮询与重挂载的重复请求
+_INDEX_MINUTE_CACHE_TTL = 10.0
+_INDEX_MINUTE_CACHE_MAX = 32
+_index_minute_cache: dict[tuple[str, str], tuple[float, pl.DataFrame]] = {}
+
 
 def _index_info(repo, symbol: str) -> dict:
     df = repo.get_index_instruments()
@@ -26,47 +32,6 @@ def _index_info(repo, symbol: str) -> dict:
         return {}
     return hit.to_dicts()[0]
 
-
-@router.get("/list")
-def list_indices(request: Request):
-    """返回已缓存的 CN_Index 指数列表。"""
-    repo = request.app.state.repo
-    df = repo.get_index_instruments()
-    if df.is_empty():
-        return {"results": [], "count": 0}
-    cols = [c for c in ["symbol", "name", "code", "asset_type"] if c in df.columns]
-    rows = df.select(cols).sort("symbol").to_dicts()
-    return {"results": rows, "count": len(rows)}
-
-
-@router.get("/search")
-def search_indices(
-    request: Request,
-    q: str = Query("", min_length=0, max_length=50, description="搜索关键词"),
-    limit: int = Query(20, ge=1, le=100),
-):
-    """模糊搜索指数。"""
-    repo = request.app.state.repo
-    df = repo.get_index_instruments()
-    if df.is_empty():
-        return {"results": []}
-    if not q.strip():
-        rows = df.head(limit).to_dicts()
-        return {"results": rows}
-
-    keyword = q.strip().upper()
-    masks = []
-    if "code" in df.columns:
-        masks.append(pl.col("code").cast(pl.Utf8).str.contains(keyword, literal=True))
-    masks.append(pl.col("symbol").cast(pl.Utf8).str.to_uppercase().str.contains(keyword, literal=True))
-    if "name" in df.columns:
-        masks.append(pl.col("name").cast(pl.Utf8).str.contains(q.strip(), literal=True))
-
-    mask = masks[0]
-    for m in masks[1:]:
-        mask = mask | m
-    rows = df.filter(mask).head(limit).to_dicts()
-    return {"results": rows}
 
 
 @router.get("/daily")
@@ -92,9 +57,11 @@ def get_index_daily(
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 
     try:
-        raw = kline_sync.sync_daily_batch([symbol], count=days + 150)
+        raw = kline_sync.fetch_daily_routed(
+            [symbol], capset, count=days + 150, asset_type="index",
+        )
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"TickFlow fetch failed: {e}") from e
+        raise HTTPException(status_code=502, detail=f"指数日 K 拉取失败: {e}") from e
     if raw.is_empty():
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 
@@ -109,11 +76,38 @@ def get_index_minute(
     symbol: str = Query(..., description="指数代码, 如 000001.SH"),
     trade_date: date | None = Query(None, alias="date", description="交易日期, 默认今天"),
 ):
-    """实时读取指数分钟 K。不写入股票分钟 parquet。"""
+    """实时读取指数分钟 K。不写入股票分钟 parquet。
+
+    仅当日有效: 本地无指数分钟存储, 实时数据源也不提供历史分时, 非当日请求
+    直接返回空 (source=not_today), 不做徒劳的数据源网络等待。
+    当日结果带 10s 进程内缓存, 重复轮询只打一次数据源。
+    """
     repo = request.app.state.repo
+    capset = request.app.state.capabilities
     info = _index_info(repo, symbol)
     day = trade_date or date.today()
-    df = kline_sync.fetch_minute_single(symbol, day, asset_type="index")
+    if day != date.today():
+        return {
+            "symbol": symbol,
+            "name": info.get("name"),
+            "index_info": info,
+            "date": str(day),
+            "rows": [],
+            "source": "not_today",
+        }
+    cache_key = (symbol, day.isoformat())
+    now = time.monotonic()
+    hit = _index_minute_cache.get(cache_key)
+    if hit is not None and now - hit[0] < _INDEX_MINUTE_CACHE_TTL:
+        df = hit[1]
+    else:
+        df = kline_sync.fetch_minute_single(symbol, day, asset_type="index", capset=capset)
+        _index_minute_cache[cache_key] = (now, df)
+        while len(_index_minute_cache) > _INDEX_MINUTE_CACHE_MAX:
+            oldest = min(_index_minute_cache, key=lambda k: _index_minute_cache[k][0])
+            if oldest == cache_key:
+                break
+            del _index_minute_cache[oldest]
     return {
         "symbol": symbol,
         "name": info.get("name"),

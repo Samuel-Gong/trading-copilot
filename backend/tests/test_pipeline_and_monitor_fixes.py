@@ -5,25 +5,82 @@
 from __future__ import annotations
 
 import json
+from datetime import date
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
 from app.jobs import daily_pipeline
-from app.services import pipeline_jobs, quote_service, webhook_adapter
+from app.services import pipeline_jobs, preferences, quote_service, webhook_adapter
 from app.services.pipeline_jobs import JobStore
 from app.services.quote_service import QuoteService
 from app.strategy import monitor_rules
 from app.strategy.monitor import MonitorRuleEngine
 
+
+class _AlertCapture:
+    def __init__(self) -> None:
+        self.alerts: list[dict] = []
+
+    def push_alerts(self, alerts: list[dict]) -> None:
+        self.alerts.extend(alerts)
+
+
+def test_phase_alert_skips_historical_recompute(monkeypatch, tmp_path):
+    """历史回填或 stale 重算不得重放早已发生的阶段切换。"""
+    capture = _AlertCapture()
+    monkeypatch.setattr(
+        "app.services.regime_builder.latest_phase_transition",
+        lambda data_dir: ("ebb", "ice", "2026-07-30"),
+    )
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: date(2026, 7, 31))
+    monkeypatch.setattr(
+        daily_pipeline,
+        "_get_app_state",
+        lambda: SimpleNamespace(quote_service=capture),
+    )
+
+    daily_pipeline._push_phase_change_alert(
+        tmp_path,
+        computed_dates={date(2026, 7, 30)},
+    )
+
+    assert capture.alerts == []
+
+
+def test_phase_alert_pushes_current_recomputed_transition(monkeypatch, tmp_path):
+    """仅本次确实重算的当前业务日切换可以推送。"""
+    capture = _AlertCapture()
+    monkeypatch.setattr(
+        "app.services.regime_builder.latest_phase_transition",
+        lambda data_dir: ("ebb", "ice", "2026-07-31"),
+    )
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: date(2026, 7, 31))
+    monkeypatch.setattr(
+        daily_pipeline,
+        "_get_app_state",
+        lambda: SimpleNamespace(quote_service=capture),
+    )
+
+    daily_pipeline._push_phase_change_alert(
+        tmp_path,
+        computed_dates={date(2026, 7, 31)},
+    )
+
+    assert len(capture.alerts) == 1
+    assert capture.alerts[0]["type"] == "phase_change"
+
 # ── JobStore 单飞 ────────────────────────────────────────────────────────
 
-def test_create_singleflight_dedupes_pending_window(tmp_path):
+def test_create_singleflight_dedupes_pending_window(monkeypatch, tmp_path):
     """两次快速 create() 在 pending 窗口内应复用同一 job(is_new=False)。"""
+    monkeypatch.setattr(preferences, "load", lambda: {"data_source_job_timeout_s": 3600})
     store = JobStore(store_dir=tmp_path / "jobs")
 
     jid1, new1 = store.create()
     assert new1 is True
+    assert store.get(jid1)["timeout_s"] == 3600
 
     # 尚未 start(), job 仍是 pending —— 旧实现会在此另起新 job(并发双跑根因)
     jid2, new2 = store.create()
@@ -37,10 +94,12 @@ def test_create_singleflight_dedupes_pending_window(tmp_path):
     assert new3 is False
 
 
-def test_create_new_after_terminal(tmp_path):
+def test_create_new_after_terminal(monkeypatch, tmp_path):
     """job 终态(succeed/fail)后, create() 应给出新 job。"""
+    monkeypatch.setattr(preferences, "load", lambda: {"data_source_long_job_timeout_s": 5400})
     store = JobStore(store_dir=tmp_path / "jobs")
-    jid1, _ = store.create()
+    jid1, _ = store.create(long_running=True)
+    assert store.get(jid1)["timeout_s"] == 5400
     store.start(jid1)
     store.succeed(jid1, {"ok": True})
 
@@ -113,6 +172,10 @@ def test_ladder_webhook_uses_chinese_title_without_brand(monkeypatch):
     monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda: "https://open.feishu.cn/open-apis/bot/v2/hook/test")
     monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda: "secret")
     monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda: "wecom-key")
+    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda: "")
+    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda: {})
+    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda: "")
+    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda: "")
 
     engine = type("Engine", (), {
         "rules": {"r_ladder": {"webhook_channels": ["feishu", "wecom"]}},
@@ -284,3 +347,71 @@ def test_review_webhooks_use_title_without_brand(monkeypatch):
 
     assert [args[1] for _, args in calls] == ["每日复盘", "每日复盘"]
     assert all("TickFlow" not in args[1] for _, args in calls)
+
+
+def test_review_pushes_custom_webhook_and_email(monkeypatch):
+    calls = []
+    email_config = {
+        "host": "smtp.example.com",
+        "username": "bot@example.com",
+        "from_address": "bot@example.com",
+        "to_addresses": ["alerts@example.com"],
+    }
+    monkeypatch.setattr("app.services.preferences.get_review_push_channels", lambda: ["custom", "email"])
+    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda: "https://example.com/hook")
+    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda: email_config)
+    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda: "hook-secret")
+    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda: "smtp-password")
+    monkeypatch.setattr(
+        "app.services.webhook_adapter.send_custom",
+        lambda *args: calls.append(("custom", args)) or True,
+    )
+    monkeypatch.setattr(
+        "app.services.email_adapter.send_email",
+        lambda *args: calls.append(("email", args)) or True,
+    )
+
+    daily_pipeline._maybe_push_review("复盘正文", {"as_of": "2026-07-18"})
+
+    assert [channel for channel, _ in calls] == ["custom", "email"]
+    assert calls[0][1][3] == "market_review"
+    assert calls[1][1][2] == "每日复盘"
+
+
+def test_ladder_dispatches_custom_webhook_and_email(monkeypatch):
+    calls = []
+
+    class CaptureExecutor:
+        def submit(self, fn, *args):
+            calls.append((fn.__name__, args))
+
+    email_config = {
+        "host": "smtp.example.com",
+        "username": "bot@example.com",
+        "from_address": "bot@example.com",
+        "to_addresses": ["alerts@example.com"],
+    }
+    monkeypatch.setattr(quote_service, "_WEBHOOK_EXECUTOR", CaptureExecutor())
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_url", lambda: "")
+    monkeypatch.setattr("app.services.preferences.get_feishu_webhook_secret", lambda: "")
+    monkeypatch.setattr("app.services.preferences.get_wecom_webhook_url", lambda: "")
+    monkeypatch.setattr("app.services.preferences.get_custom_webhook_url", lambda: "https://example.com/hook")
+    monkeypatch.setattr("app.services.preferences.get_email_smtp_config", lambda: email_config)
+    monkeypatch.setattr("app.secrets_store.get_custom_webhook_secret", lambda: "hook-secret")
+    monkeypatch.setattr("app.secrets_store.get_email_smtp_password", lambda: "smtp-password")
+
+    engine = type("Engine", (), {
+        "rules": {"r_ladder": {"webhook_channels": ["custom", "email"]}},
+    })()
+    event = {
+        "rule_id": "r_ladder",
+        "source": "ladder",
+        "symbol": "600000.SH",
+        "name": "浦发银行",
+        "message": "炸板预警",
+    }
+    QuoteService._maybe_send_webhook(object.__new__(QuoteService), [event], engine)
+
+    assert [name for name, _ in calls] == ["send_custom", "send_email"]
+    assert calls[0][1][3:] == ("monitor_alert", event, "hook-secret")
+    assert calls[1][1][:2] == (email_config, "smtp-password")

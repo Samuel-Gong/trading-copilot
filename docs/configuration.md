@@ -12,7 +12,7 @@
 TICKFLOW_API_KEY=              # 留空 = None 模式(历史日K免费);填 Key = 按订阅档位解锁
 ```
 
-本项目基于 [TickFlow](https://tickflow.org) 数据源。
+TickFlow 是内置默认数据源;同时支持插件化接入第三方数据源(YAML 声明自有接口见 [custom-data-source.md](./custom-data-source.md),插件开发见 [plugin-development.md](./plugin-development.md)),在面板 **设置 → 数据源** 切换。
 
 - **留空(None 模式)**:通过 free-api 使用历史日 K(当日数据盘后 1-2 小时可用),**无需付费**即可体验核心选股/回测功能
 - **填入 API Key**:按你的订阅档位解锁更多能力
@@ -24,10 +24,28 @@ TICKFLOW_API_KEY=              # 留空 = None 模式(历史日K免费);填 Key 
 | Free     | 自选页前 5 个标的实时监控(最低 6 秒刷新) |
 | Starter+ | 全市场实时行情                           |
 | Pro      | 分钟 K + 盘口                            |
-| Expert   | WebSocket + 财务数据                     |
+| Expert   | WebSocket + 财务数据 + 全量分钟          |
 
 > 完整能力矩阵见 [tickflow.org/pricing](https://tickflow.org/pricing/),高等档位含较低档全部权益。
 > 在面板 **设置 → 凭据与能力** 点「重新检测」可查看当前档位标签。
+>
+> **档位仅适用于 TickFlow 数据源**。功能门槛的统一标准是"能力"(`kline.minute.batch`、`depth5.batch`、`financial` 等能力键):其他第三方/自定义数据源以声明的数据集能力为准,系统会按当前数据源配置自动合并判定,UI 提示一律以能力名表达,不再依赖 TickFlow 档位名。
+
+### 全量分钟 (full_minute)
+
+「全量分钟」是一项**独立能力**(能力键 `full_minute`,探测名 `intraday.universe`),与其他能力同样**可路由**:盘中把全市场当日 1 分钟 K 持续增量落盘到本地 `data/kline_minute/` 当日分区,分钟策略(`minute_filter`)与分时视图即可读到新鲜数据。接入方式二选一:
+
+- **TickFlow Expert**:配置 Expert 档 Key,零配置即用(修复轮 `intraday.batch` + 稳态 `intraday.universe` 单请求增量)
+- **插件/自定义源**:声明 `full_minute` 数据集并在 **设置 → 数据源 → 全量分钟** 路由到该源 — Python 插件实现 `get_intraday_batch`(必需)/`get_intraday_latest`(可选,未实现自动降级仅修复轮、节奏下限 60s);YAML 声明式源数据集配置与 `minute` 同形(仅修复轮语义)。契约细节见 [plugin-development.md](./plugin-development.md) 与 [custom-data-source.md](./custom-data-source.md)
+
+接入步骤:
+
+1. **设置 → 凭据与能力**(TickFlow 路径)配置 API Key(Expert 档),或在 **设置 → 数据源** 声明/安装提供 `full_minute` 的源并路由;点「重新检测」后能力列表出现「全量分钟」
+2. **开启实时行情**后落盘服务自动启动;仅连续竞价时段(9:30–11:30 / 13:00–15:00)运行,午休/收盘自动暂停与恢复
+3. 冷启动(如 10 点才开服务)自动触发**全天修复轮**,一次批量补齐 9:30 起的全部缺口;稳态走**增量轮**(默认 6 秒一轮,可配 3–120 秒),幂等合并滚出全天
+4. 与盘后分钟同步写同一分区(`unique(symbol, datetime)` 幂等合并),互不冲突
+
+说明:标的池为 A 股股票(CN_Equity_A),ETF 不在内(分时走批量补拉路径);覆盖滞后超阈值或连续空轮会自动再跑修复轮自愈。
 
 ---
 
@@ -76,13 +94,13 @@ REVIEW_NEWS_MAX_ITEMS_PER_SOURCE=20
 ## 服务
 
 ```ini
-HOST=0.0.0.0          # 监听地址
-PORT=3018             # 服务端口
+HOST=0.0.0.0          # 开发服务监听地址 / Docker 主机绑定地址
+PORT=3018             # 开发后端端口 / Docker 主机映射端口
 LOG_LEVEL=INFO        # DEBUG | INFO | WARNING | ERROR
 ```
 
 - `HOST`:`0.0.0.0` 监听所有网卡(容器/公网部署需要);仅本机用可设 `127.0.0.1`
-- `PORT`:默认 `3018`,改端口后 Docker 映射、SSH 转发命令里的端口也要同步改
+- `PORT`:默认 `3018`;开发模式兼容显式的 `BACKEND_PORT` 覆盖,改端口后 SSH 转发命令也要同步改
 - `LOG_LEVEL`:排查问题时改 `DEBUG`
 
 ---
@@ -102,10 +120,11 @@ DATA_DIR=./data       # Parquet / DuckDB 数据存储目录
 ## 访问密码(公网部署)
 
 ```ini
-AUTH_PASSWORD=你的密码    # 至少 6 位;仅首次生效,已设过则不覆盖
+AUTH_PASSWORD='你的密码'  # 至少 6 位;仅首次生效,已设过则不覆盖
 ```
 
 面板首次设置访问密码时,出于安全考虑**仅允许本机或内网访问**(防公网陌生人抢先设置锁死面板)。公网服务器部署可通过此环境变量预置首个密码。
+密码建议使用单引号包裹，Docker 启动时会把整个原始 `.env` 只读挂载到容器内 `/app/.env`，兼容已有的未加引号配置。容器可以读取其中的密钥但不能修改该文件，请保持主机文件权限为 `600` 并仅运行可信镜像。
 
 详细步骤、SSH 转发方案、重置密码方法见 [deployment.md → 访问密码设置](./deployment.md#访问密码设置公网部署必读)。
 

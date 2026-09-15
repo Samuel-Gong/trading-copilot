@@ -1,10 +1,8 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
-import { Link } from 'react-router-dom'
+import { useState, useCallback, useEffect, createContext, useContext } from 'react'
 import { useQueryClient, useMutation, useQuery } from '@tanstack/react-query'
 import {
   Activity,
   Wifi,
-  BarChart3,
   Flame,
   Zap,
   Webhook,
@@ -17,11 +15,15 @@ import {
   useCapabilities,
 } from '@/lib/useSharedQueries'
 import { useUpdateQuoteInterval, useToggleRealtimeQuotes } from '@/lib/useSharedMutations'
-import { api } from '@/lib/api'
+import { api, type EmailSmtpConfig } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
-import { tierRank } from '@/lib/capability-labels'
+import { useCardFlash, cardFlashCls } from '@/lib/useCardFlash'
 import { toast } from '@/components/Toast'
 import { DepthConfigContent } from '@/components/data/DepthConfigCard'
+
+// 卡片定位锚点: highlight=<anchor> 时该卡片滚动到视口中央并闪烁高亮。
+// 其他页面用 /settings?tab=monitoring&highlight=<anchor> 精确引导用户到某张卡片。
+const HighlightContext = createContext('')
 
 // 页面 → 显示名
 const PAGE_LABELS: Record<string, string> = {
@@ -30,12 +32,14 @@ const PAGE_LABELS: Record<string, string> = {
   'limit-ladder': '连板梯队',
 }
 
-const SIDEBAR_INDEX_OPTIONS = [
-  { symbol: '000001.SH', name: '上证指数' },
-  { symbol: '399001.SZ', name: '深证成指' },
-  { symbol: '399006.SZ', name: '创业板指' },
-  { symbol: '000680.SH', name: '科创综指' },
-]
+const EMPTY_EMAIL_SMTP: EmailSmtpConfig = {
+  host: '',
+  port: 465,
+  security: 'ssl',
+  username: '',
+  from_address: '',
+  to_addresses: [],
+}
 
 // ===== 导出为 Panel 组件 (由 Settings.tsx 嵌入) =====
 
@@ -47,24 +51,30 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   const { data: intervalData } = useQuoteInterval()
   const updateInterval = useUpdateQuoteInterval()
   const toggleQuote = useToggleRealtimeQuotes()
-  const tier = tierRank(caps?.label ?? '')
-  const isNoneTier = tier < 0
-  // None 档但配了自定义实时源时, 后端 is_realtime_allowed 仍返回 True (realtime_mode=full_market)
-  // 此时不应拦截实时监控页 — 用 quoteStatus.realtime_allowed 作为最终判据
-  const realtimeAllowed = quoteStatus?.realtime_allowed ?? !isNoneTier
-  const isFreeTier = tier === 0
+  // 实时模式以 quote_status 为准 (数据源无关): full_market=全市场 / none=不可用
   const realtimeEnabled = prefs?.realtime_quotes_enabled ?? false
   // 分时图实时刷新间隔 (秒), 与后端 [3,60] clamp 对齐; 默认 6
   const intradayInterval = prefs?.minute_intraday_refresh_interval ?? 6
   // 滑块本地草稿: 拖动时即时反馈, 停顿 2s 后落库 (与行情轮询滑块一致)
   const [intradayIntervalDraft, setIntradayIntervalDraft] = useState(intradayInterval)
+  // 盘中分钟增量 (Expert 专有): 间隔 (秒), 与后端 [3,120] clamp 对齐; 默认 6
+  const minuteRefreshInterval = prefs?.minute_refresh_interval ?? 6
+  const [minuteRefreshIntervalDraft, setMinuteRefreshIntervalDraft] = useState(minuteRefreshInterval)
+  // 盘中增量服务状态 (15s 轮询; 无服务时 available=false)
+  const refreshStatus = useQuery({
+    queryKey: ['minute-refresh-status'],
+    queryFn: api.minuteRefreshStatus,
+    refetchInterval: 15000,
+  })
   const refreshPages = prefs?.sse_refresh_pages ?? {}
   const limitLadderMonitor = prefs?.limit_ladder_monitor_enabled ?? false
   const hasDepth = !!caps?.capabilities?.['depth5.batch']
+  // 全量分钟 = intraday.universe 能力 (TickFlow Expert 专有): 标的池单请求拉全市场当日分钟,
+  // 修复轮的 intraday.batch 与其同档, 见后端 minute_refresh 服务
+  const hasFullMinuteCap = !!caps?.capabilities?.['intraday.universe']
+  const rs = refreshStatus.data
   // 新建监控规则时默认勾选的推送渠道 (全局默认值数组, 单条规则可独立修改)
   const webhookDefaultChannels = prefs?.webhook_default_channels ?? []
-  const sidebarIndexSymbols = prefs?.sidebar_index_symbols ?? SIDEBAR_INDEX_OPTIONS.map(i => i.symbol)
-  const indicesPinned = prefs?.indices_nav_pinned ?? true
   const isRunning = quoteStatus?.running ?? false
   const isTrading = quoteStatus?.is_trading_hours ?? false
   // 管道/数据修正运行期间实时行情被临时暂停 — 此时禁止开启
@@ -82,6 +92,24 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   const wecomWebhookUrl = prefs?.wecom_webhook_url ?? ''
   const [wecomDraft, setWecomDraft] = useState(wecomWebhookUrl)
   const [wecomError, setWecomError] = useState('')
+  // 通用第三方 JSON webhook
+  const customWebhookUrl = prefs?.custom_webhook_url ?? ''
+  const customWebhookSecretSet = prefs?.custom_webhook_secret_set ?? false
+  const [customDraft, setCustomDraft] = useState(customWebhookUrl)
+  const [customSecretDraft, setCustomSecretDraft] = useState('')
+  const [customError, setCustomError] = useState('')
+  // SMTP 邮件通道
+  const emailSmtpConfig = prefs?.email_smtp_config ?? EMPTY_EMAIL_SMTP
+  const emailSmtpPasswordSet = prefs?.email_smtp_password_set ?? false
+  const emailConfigured = !!(
+    emailSmtpConfig.host
+    && emailSmtpConfig.from_address
+    && emailSmtpConfig.to_addresses.length
+    && (!emailSmtpConfig.username || emailSmtpPasswordSet)
+  )
+  const [emailDraft, setEmailDraft] = useState<EmailSmtpConfig>(emailSmtpConfig)
+  const [emailPasswordDraft, setEmailPasswordDraft] = useState('')
+  const [emailError, setEmailError] = useState('')
   // 企业微信智能机器人 (BotID + Secret, 长连接通道)
   const wecomBotId = prefs?.wecom_bot_id ?? ''
   const wecomBotSecret = prefs?.wecom_bot_secret ?? ''
@@ -94,6 +122,8 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
   const [channelOpen, setChannelOpen] = useState(false)
   // 企业微信渠道配置区展开态
   const [wecomOpen, setWecomOpen] = useState(false)
+  const [customOpen, setCustomOpen] = useState(false)
+  const [emailOpen, setEmailOpen] = useState(false)
   // 智能机器人配置区展开态
   const [botOpen, setBotOpen] = useState(false)
   useEffect(() => {
@@ -104,18 +134,17 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     setWecomDraft(wecomWebhookUrl)
   }, [wecomWebhookUrl])
   useEffect(() => {
+    setCustomDraft(customWebhookUrl)
+    setCustomSecretDraft('')
+  }, [customWebhookUrl, customWebhookSecretSet])
+  useEffect(() => {
+    setEmailDraft(emailSmtpConfig)
+    setEmailPasswordDraft('')
+  }, [emailSmtpConfig, emailSmtpPasswordSet])
+  useEffect(() => {
     setBotIdDraft(wecomBotId)
     setBotSecretDraft(wecomBotSecret)
   }, [wecomBotId, wecomBotSecret])
-  const watchlistSymbols = prefs?.realtime_watchlist_symbols ?? []
-  const watchlist = useQuery({
-    queryKey: QK.watchlist,
-    queryFn: () => api.watchlistList(),
-    enabled: isFreeTier && watchlistSymbols.length > 0,
-  })
-  const watchlistNameBySymbol = new Map(
-    (watchlist.data?.symbols ?? []).map(row => [row.symbol, row.name] as const),
-  )
 
   const save = useCallback(async (cfg: Record<string, unknown>) => {
     try {
@@ -132,26 +161,12 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     qc.invalidateQueries({ queryKey: QK.quoteStatus })
   }, [toggleQuote, qc])
 
-  const toggleSidebarIndex = useCallback((symbol: string, visible: boolean) => {
-    const selected = new Set(sidebarIndexSymbols)
-    if (visible) selected.add(symbol)
-    else selected.delete(symbol)
-    const next = SIDEBAR_INDEX_OPTIONS
-      .map(item => item.symbol)
-      .filter(s => selected.has(s))
-    save({ sidebar_index_symbols: next })
-  }, [save, sidebarIndexSymbols])
-
-  const toggleIndicesPin = useCallback((pinned: boolean) => {
-    api.updateIndicesNavPinned(pinned).then(() => qc.invalidateQueries({ queryKey: QK.preferences }))
-  }, [qc])
-
   const toggleLimitLadderMonitor = useCallback(async (enabled: boolean) => {
     await api.updateLimitLadderMonitor(enabled)
     qc.invalidateQueries({ queryKey: QK.preferences })
   }, [qc])
 
-  // 勾选/取消勾选某个默认推送渠道 (飞书 / 企业微信 各自独立)
+  // 勾选/取消勾选某个默认推送渠道。
   const toggleDefaultChannel = useCallback(async (ch: string, enabled: boolean) => {
     const cur = prefs?.webhook_default_channels ?? []
     const next = enabled ? [...cur, ch] : cur.filter(c => c !== ch)
@@ -198,6 +213,65 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     }
     saveWecomWebhook.mutate(url)
   }, [wecomDraft, saveWecomWebhook])
+
+  const testFeishu = useMutation({
+    mutationFn: () => api.sendTestWebhook('feishu'),
+  })
+  const testWecom = useMutation({
+    mutationFn: () => api.sendTestWebhook('wecom'),
+  })
+
+  const saveCustomWebhook = useMutation({
+    mutationFn: ({ url, secret }: { url: string; secret?: string }) => api.updateCustomWebhook(url, secret),
+    onSuccess: () => {
+      setCustomError('')
+      setCustomSecretDraft('')
+      toast('第三方 Webhook 已保存', 'success')
+      qc.invalidateQueries({ queryKey: QK.preferences })
+    },
+    onError: (err: any) => setCustomError(String(err?.message ?? '保存失败')),
+  })
+  const submitCustom = useCallback(() => {
+    const url = customDraft.trim()
+    if (url && !/^https?:\/\//i.test(url)) {
+      setCustomError('请输入完整的 HTTP(S) URL')
+      return
+    }
+    saveCustomWebhook.mutate({
+      url,
+      ...(customSecretDraft ? { secret: customSecretDraft } : {}),
+    })
+  }, [customDraft, customSecretDraft, saveCustomWebhook])
+  const testCustom = useMutation({
+    mutationFn: () => api.sendTestWebhook('custom'),
+  })
+
+  const saveEmailSmtp = useMutation({
+    mutationFn: ({ config, password }: { config: EmailSmtpConfig; password?: string }) =>
+      api.updateEmailSmtp(config, password),
+    onSuccess: () => {
+      setEmailError('')
+      setEmailPasswordDraft('')
+      toast('邮件推送配置已保存', 'success')
+      qc.invalidateQueries({ queryKey: QK.preferences })
+    },
+    onError: (err: any) => setEmailError(String(err?.message ?? '保存失败')),
+  })
+  const submitEmail = useCallback(() => {
+    saveEmailSmtp.mutate({
+      config: {
+        ...emailDraft,
+        host: emailDraft.host.trim(),
+        username: emailDraft.username.trim(),
+        from_address: emailDraft.from_address.trim(),
+        to_addresses: emailDraft.to_addresses.map(item => item.trim()).filter(Boolean),
+      },
+      ...(emailPasswordDraft ? { password: emailPasswordDraft } : {}),
+    })
+  }, [emailDraft, emailPasswordDraft, saveEmailSmtp])
+  const testEmail = useMutation({
+    mutationFn: () => api.sendTestWebhook('email'),
+  })
 
   // 智能机器人 (BotID + Secret) 保存 → 后端立即重建连接
   const saveWecomBot = useMutation({
@@ -266,50 +340,27 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
     return () => window.clearTimeout(t)
   }, [intradayIntervalDraft, intradayInterval, save])
 
-  // highlight=depth-fix 时闪烁高亮连板梯队修正卡片
-  const [flash, setFlash] = useState(false)
-  const flashedRef = useRef(false)
+  // 盘中增量间隔: 服务端值变化时同步本地草稿
   useEffect(() => {
-    if (highlight === 'depth-fix' && !flashedRef.current) {
-      flashedRef.current = true
-      // 延迟一帧确保 DOM 已渲染, 再触发闪烁
-      requestAnimationFrame(() => {
-        setFlash(true)
-        const t = setTimeout(() => setFlash(false), 2000)
-        return () => clearTimeout(t)
-      })
-    }
-  }, [highlight])
+    setMinuteRefreshIntervalDraft(minuteRefreshInterval)
+  }, [minuteRefreshInterval])
 
-  if (isNoneTier && !realtimeAllowed) {
-    return (
-      <div className="flex flex-col items-center justify-center py-20 text-center">
-        <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl
-                        bg-gradient-to-br from-purple-500/20 to-blue-500/20 mb-5">
-          <Activity className="h-7 w-7 text-purple-400" />
-        </div>
-        <h2 className="text-lg font-medium text-foreground mb-2">实时监控</h2>
-        <p className="text-sm text-secondary max-w-md mb-6">
-          实时行情需要 Free 及以上档位。None 档可使用 free-api 获取历史日K（当日数据需盘后1-2小时），但不能调用付费服务器实时接口。
-        </p>
-        <a
-          href="/settings?tab=account"
-          className="inline-flex items-center gap-2 px-5 py-2.5 rounded-btn
-                     bg-accent text-white text-sm font-medium
-                     hover:bg-accent/90 transition-colors"
-        >
-          配置 API Key 升级
-        </a>
-      </div>
-    )
-  }
+  // 盘中增量间隔: 草稿与已保存值不同时, 2s 防抖落库
+  useEffect(() => {
+    if (minuteRefreshIntervalDraft === minuteRefreshInterval) return
+    const t = window.setTimeout(() => {
+      save({ minute_refresh_interval: minuteRefreshIntervalDraft })
+    }, 2000)
+    return () => window.clearTimeout(t)
+  }, [minuteRefreshIntervalDraft, minuteRefreshInterval, save])
 
   return (
+    <HighlightContext.Provider value={highlight ?? ''}>
     <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-6 max-w-5xl">
       {/* ========== 左列 ========== */}
       <div className="space-y-6">
         {/* 行情状态 — 开关 + 间隔 */}
-        <Card icon={Activity} title="行情轮询">
+        <Card icon={Activity} title="行情轮询" anchor="quotes">
           <ToggleRow
             label="实时行情"
             desc={
@@ -328,7 +379,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
               <div className="min-w-0">
                 <div className="text-sm text-foreground">轮询间隔</div>
                 <div className="text-[11px] text-muted">
-                  {isFreeTier ? '每轮拉取自选股实时行情的时间间隔' : '每轮拉取全市场行情的时间间隔'}
+                  每轮拉取全市场行情的时间间隔
                 </div>
               </div>
               <span className="text-[11px] font-mono text-foreground shrink-0 tabular-nums">
@@ -352,43 +403,6 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
           </div>
         </Card>
 
-        {isFreeTier && (
-        <Card icon={Activity} title="自选股实时">
-          <div className="mb-3 rounded-btn border border-accent/25 bg-accent/10 px-3 py-2 text-xs font-medium leading-snug text-accent">
-            Free 档开启实时行情时自动监控「自选」页面前 5 个标的，最低 6 秒刷新。
-          </div>
-          {watchlistSymbols.length > 0 ? (
-            <div className="space-y-1.5">
-              {watchlistSymbols.map(symbol => {
-                const name = watchlistNameBySymbol.get(symbol)
-                return (
-                  <div key={symbol} className="flex items-center justify-between rounded-btn bg-base/50 border border-border px-2 py-1.5">
-                    <div className="min-w-0 flex items-baseline gap-1.5">
-                      <span className="text-xs font-mono text-foreground">{symbol}</span>
-                      {name && <span className="truncate text-[11px] text-secondary">{name}</span>}
-                    </div>
-                    <span className="text-[10px] text-muted shrink-0">自选页</span>
-                  </div>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="rounded-btn border border-border bg-base/40 px-3 py-3 text-xs text-muted">
-              自选列表为空，Free 实时行情开启前请先添加自选股。
-            </div>
-          )}
-          <div className="mt-2 flex items-center justify-between gap-3">
-            <span className="text-[10px] text-muted">当前 {watchlistSymbols.length}/5 只</span>
-            <Link
-              to="/watchlist"
-              className="px-3 py-1 rounded-btn bg-elevated text-secondary text-xs font-medium hover:text-foreground transition-colors"
-            >
-              管理自选
-            </Link>
-          </div>
-        </Card>
-        )}
-        {!isFreeTier && (
         <Card icon={Wifi} title="页面实时刷新">
           <p className="text-xs text-secondary mb-4">
             选择哪些页面跟随 SSE 实时刷新数据。关闭的页面不会被推送，
@@ -406,13 +420,12 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
             ))}
           </div>
         </Card>
-        )}
 
         {/* 自选列表分时图实时刷新 (默认关闭, 开启后盘中按设定间隔轮询刷新分时数据) */}
-        <Card icon={Activity} title="分时图刷新">
+        <Card icon={Activity} title="分时图刷新" anchor="intraday-refresh">
           <ToggleRow
             label="自选/策略分时图实时刷新"
-            desc={`开启后自选与策略列表的分时图盘中每 ${intradayInterval} 秒自动刷新（需 Pro+ 权限 + 实时行情运行）。关闭时仅打开页面时拉取一次, 可点表头刷新按钮手动更新。`}
+            desc={`开启后自选与策略列表的分时图盘中每 ${intradayInterval} 秒自动刷新（依赖分钟K批量数据 + 实时行情运行）。关闭时仅打开页面时拉取一次, 可点表头刷新按钮手动更新。`}
             checked={prefs?.minute_intraday_refresh ?? false}
             onChange={(v) => save({ minute_intraday_refresh: v })}
           />
@@ -445,45 +458,67 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
           </div>
         </Card>
 
-        {!isFreeTier && (
-        <Card icon={BarChart3} title="左侧菜单指数">
-          <p className="text-xs text-secondary mb-4">
-            选择实时行情开启时，左侧菜单底部显示哪些指数点位和涨跌幅。
-          </p>
-          <div className="space-y-2">
-            {SIDEBAR_INDEX_OPTIONS.map(item => (
-              <ToggleRow
-                key={item.symbol}
-                label={item.name}
-                desc={item.symbol}
-                checked={sidebarIndexSymbols.includes(item.symbol)}
-                onChange={(v) => toggleSidebarIndex(item.symbol, v)}
-              />
-            ))}
-          </div>
-          <div className="mt-3 pt-3 border-t border-border">
-            <ToggleRow
-              label="固定显示"
-              desc={indicesPinned ? '指数卡片常驻显示（即使实时行情关闭）' : '跟随实时行情开关（仅实时开时显示）'}
-              checked={indicesPinned}
-              onChange={toggleIndicesPin}
-            />
-          </div>
-        </Card>
-        )}
       </div>
 
       {/* ========== 右列 ========== */}
       <div className="space-y-6">
-        {/* 连板梯队降级修正 (移至右列顶部) */}
-        <div
-          id="depth-fix"
-          className={`rounded-card transition-all duration-500 ${flash ? 'ring-2 ring-accent/60 ring-offset-2 ring-offset-base scale-[1.01]' : 'ring-0 ring-transparent'}`}
-        >
+        {/* 全量分钟: 盘中全市场分钟落盘, 按能力路由 (TickFlow Expert 或声明 full_minute 的插件/自定义源) */}
+        <Card icon={Zap} title="全量分钟" anchor="minute-refresh">
+          <ToggleRow
+            label="全量分钟落盘"
+            desc={
+              !hasFullMinuteCap ? '需要全量分钟能力 (TickFlow Expert 或声明该能力的自定义源)'
+              : rs?.repair_only ? `服务运行中 · ${rs?.provider ?? '自定义源'} 无廉价增量端点, 按 ≥60s 全天批量节奏`
+              : rs?.running ? (rs?.in_trading_hours ? '服务运行中' : '运行中 · 非连续竞价时段暂停')
+              : '已关闭'
+            }
+            checked={prefs?.minute_refresh_enabled ?? false}
+            onChange={(v) => save({ minute_refresh_enabled: v })}
+            disabled={!hasFullMinuteCap}
+          />
+          <div className="mt-3 pt-3 border-t border-border">
+            <div className="flex items-center justify-between gap-4 py-1">
+              <div className="min-w-0">
+                <div className="text-sm text-foreground">刷新间隔</div>
+                <div className="text-[11px] text-muted">
+                  交易时段内全市场分钟K增量落盘的间隔; 稳态单请求增量, 冷启动/断档自动全天回补
+                </div>
+              </div>
+              <span className="text-[11px] font-mono text-foreground shrink-0 tabular-nums">
+                {minuteRefreshIntervalDraft >= 60 && minuteRefreshIntervalDraft % 60 === 0 ? `${minuteRefreshIntervalDraft / 60}m` : `${minuteRefreshIntervalDraft}s`}
+              </span>
+            </div>
+            <div className="flex items-center gap-3 mt-2">
+              <input
+                type="range"
+                min={3}
+                max={120}
+                step={3}
+                value={minuteRefreshIntervalDraft}
+                disabled={!hasFullMinuteCap}
+                onChange={(e) => setMinuteRefreshIntervalDraft(parseInt(e.target.value, 10))}
+                className="flex-1 h-1 accent-accent cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              />
+              <span className="text-[10px] text-muted shrink-0">
+                {minuteRefreshIntervalDraft !== minuteRefreshInterval ? '2秒后保存' : '3s — 120s'}
+              </span>
+            </div>
+            {rs?.available && rs.rounds != null && rs.rounds > 0 && (
+              <div className="mt-2 text-[10px] text-muted">
+                已 {rs.rounds} 轮 · 最近 {rs.last_symbols} 标的 / {rs.last_rows} 行 / {rs.last_requests} 请求
+                {rs.last_round_ms != null ? ` · ${(rs.last_round_ms / 1000).toFixed(1)}s` : ''}
+                {rs.last_error ? ` · ${rs.last_error}` : ''}
+              </div>
+            )}
+          </div>
+        </Card>
+
+        {/* 连板梯队降级修正 */}
         <Card
           icon={Flame}
           title="连板梯队降级修正"
-          badge={!hasDepth ? '需 Pro+' : undefined}
+          anchor="depth-fix"
+          badge={!hasDepth ? '五档盘口不可用' : undefined}
           right={hasDepth ? (
             <button
               onClick={() => runFix.mutate()}
@@ -520,12 +555,11 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
             <DepthConfigContent disabled />
           )}
         </Card>
-        </div>
 
         {/* 推送通知 — 监控告警的外部推送渠道 (全局配置)。
-            飞书 / 企业微信。
+            飞书 / 企业微信 / 第三方 Webhook / 邮件。
             每个渠道合并成一行: 勾选=新建规则默认推送, 点行展开地址配置。 */}
-        <Card icon={Webhook} title="推送通知">
+        <Card icon={Webhook} title="推送通知" anchor="webhooks">
           <p className="text-xs text-secondary mb-3">
             监控规则命中后,可把告警推送到外部。勾选渠道作为<b className="text-foreground/80">新建规则的默认推送</b>,
             单条规则仍可在编辑页独立修改。
@@ -565,7 +599,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     <span className="text-[11px] text-muted">Webhook 地址</span>
                     <input
                       value={feishuDraft}
-                      onChange={e => setFeishuDraft(e.target.value)}
+                      onChange={e => { setFeishuDraft(e.target.value); if (!testFeishu.isPending) testFeishu.reset() }}
                       placeholder={FEISHU_PREFIX + 'xxxxxxxx'}
                       className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
                     />
@@ -576,7 +610,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     <input
                       type="password"
                       value={feishuSecretDraft}
-                      onChange={e => setFeishuSecretDraft(e.target.value)}
+                      onChange={e => { setFeishuSecretDraft(e.target.value); if (!testFeishu.isPending) testFeishu.reset() }}
                       placeholder="机器人未启用签名校验则留空"
                       className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
                     />
@@ -594,9 +628,11 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     >
                       {saveFeishuWebhook.isPending ? '保存中…' : '保存'}
                     </button>
+                    <TestSendButton test={testFeishu} configured={!!feishuWebhookUrl} />
                     {feishuWebhookUrl && (
                       <span className="text-[10px] text-emerald-500">● 已配置</span>
                     )}
+                    <TestResult test={testFeishu} />
                   </div>
 
                   <details className="mt-3 text-[10px] text-muted">
@@ -650,7 +686,7 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     <span className="text-[11px] text-muted">Webhook 地址 或 Key</span>
                     <input
                       value={wecomDraft}
-                      onChange={e => setWecomDraft(e.target.value)}
+                      onChange={e => { setWecomDraft(e.target.value); if (!testWecom.isPending) testWecom.reset() }}
                       placeholder={WECOM_PREFIX + '?key=xxxxxxxx' + ' 或直接填 key'}
                       className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
                     />
@@ -668,9 +704,11 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                     >
                       {saveWecomWebhook.isPending ? '保存中…' : '保存'}
                     </button>
+                    <TestSendButton test={testWecom} configured={!!wecomWebhookUrl} />
                     {wecomWebhookUrl && (
                       <span className="text-[10px] text-emerald-500">● 已配置</span>
                     )}
+                    <TestResult test={testWecom} />
                   </div>
 
                   <details className="mt-3 text-[10px] text-muted">
@@ -689,6 +727,150 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
                       </a>
                     </p>
                   </details>
+                </div>
+              )}
+            </div>
+
+            {/* 通用第三方 JSON Webhook */}
+            <div className="rounded-btn border border-border/60 bg-base/40 overflow-hidden">
+              <div
+                onClick={() => setCustomOpen(o => !o)}
+                className="flex items-center gap-2 px-2.5 py-2 cursor-pointer transition-colors hover:bg-base/60"
+              >
+                <input
+                  type="checkbox"
+                  checked={webhookDefaultChannels.includes('custom')}
+                  onChange={e => { e.stopPropagation(); toggleDefaultChannel('custom', e.target.checked) }}
+                  onClick={e => e.stopPropagation()}
+                  title="作为新建规则的默认推送渠道"
+                  className="h-3 w-3 accent-accent cursor-pointer"
+                />
+                <span className="text-[11px] font-medium text-foreground">第三方系统</span>
+                <span className="text-[9px] text-muted">JSON Webhook</span>
+                {webhookDefaultChannels.includes('custom') && (
+                  <span className="rounded bg-accent/15 px-1 py-px text-[9px] text-accent">默认</span>
+                )}
+                <span className={`ml-auto text-[9px] ${customWebhookUrl ? 'text-emerald-500' : 'text-warning'}`}>
+                  {customWebhookUrl ? '已配置' : '未配置'}
+                </span>
+                <ChevronDown className={`h-3 w-3 text-muted transition-transform ${customOpen ? 'rotate-180' : ''}`} />
+              </div>
+
+              {customOpen && (
+                <div className="border-t border-border/60 bg-base/30 p-3">
+                  <label className="block space-y-1.5">
+                    <span className="text-[11px] text-muted">接收端 URL</span>
+                    <input
+                      value={customDraft}
+                      onChange={e => { setCustomDraft(e.target.value); if (!testCustom.isPending) testCustom.reset() }}
+                      placeholder="https://example.com/webhooks/tickflow"
+                      className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
+                    />
+                  </label>
+                  <label className="block mt-2 space-y-1.5">
+                    <span className="text-[11px] text-muted">签名密钥 (可选 · HMAC-SHA256)</span>
+                    <input
+                      type="password"
+                      value={customSecretDraft}
+                      onChange={e => setCustomSecretDraft(e.target.value)}
+                      placeholder={customWebhookSecretSet ? '已保存；留空保持不变' : '留空则不签名'}
+                      className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground focus:outline-none focus:border-accent/50"
+                    />
+                  </label>
+                  {customError && <div className="mt-2 text-[11px] text-danger">{customError}</div>}
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      onClick={submitCustom}
+                      disabled={saveCustomWebhook.isPending || (customDraft.trim() === customWebhookUrl && !customSecretDraft)}
+                      className="px-3 py-1.5 rounded-btn bg-accent text-base text-xs font-medium disabled:opacity-50 cursor-pointer hover:bg-accent/90 transition-colors"
+                    >
+                      {saveCustomWebhook.isPending ? '保存中…' : '保存'}
+                    </button>
+                    <TestSendButton test={testCustom} configured={!!customWebhookUrl} />
+                    <TestResult test={testCustom} />
+                  </div>
+                  <details className="mt-3 text-[10px] text-muted">
+                    <summary className="cursor-pointer hover:text-secondary">请求格式</summary>
+                    <p className="mt-1.5 leading-relaxed">
+                      POST JSON 包含 event、timestamp、title、body、data。配置密钥后会附带
+                      X-TickFlow-Timestamp 和 X-TickFlow-Signature 请求头。
+                    </p>
+                  </details>
+                </div>
+              )}
+            </div>
+
+            {/* SMTP 邮件推送 */}
+            <div className="rounded-btn border border-border/60 bg-base/40 overflow-hidden">
+              <div
+                onClick={() => setEmailOpen(o => !o)}
+                className="flex items-center gap-2 px-2.5 py-2 cursor-pointer transition-colors hover:bg-base/60"
+              >
+                <input
+                  type="checkbox"
+                  checked={webhookDefaultChannels.includes('email')}
+                  onChange={e => { e.stopPropagation(); toggleDefaultChannel('email', e.target.checked) }}
+                  onClick={e => e.stopPropagation()}
+                  title="作为新建规则的默认推送渠道"
+                  className="h-3 w-3 accent-accent cursor-pointer"
+                />
+                <span className="text-[11px] font-medium text-foreground">邮件</span>
+                <span className="text-[9px] text-muted">SMTP</span>
+                {webhookDefaultChannels.includes('email') && (
+                  <span className="rounded bg-accent/15 px-1 py-px text-[9px] text-accent">默认</span>
+                )}
+                <span className={`ml-auto text-[9px] ${emailConfigured ? 'text-emerald-500' : 'text-warning'}`}>
+                  {emailConfigured ? '已配置' : '未配置'}
+                </span>
+                <ChevronDown className={`h-3 w-3 text-muted transition-transform ${emailOpen ? 'rotate-180' : ''}`} />
+              </div>
+
+              {emailOpen && (
+                <div className="border-t border-border/60 bg-base/30 p-3">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_6rem_8rem]">
+                    <label className="space-y-1.5">
+                      <span className="text-[11px] text-muted">SMTP 主机</span>
+                      <input value={emailDraft.host} onChange={e => setEmailDraft(d => ({ ...d, host: e.target.value }))} placeholder="smtp.example.com" className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground" />
+                    </label>
+                    <label className="space-y-1.5">
+                      <span className="text-[11px] text-muted">端口</span>
+                      <input type="number" min={1} max={65535} value={emailDraft.port} onChange={e => setEmailDraft(d => ({ ...d, port: Number(e.target.value) }))} className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs text-foreground" />
+                    </label>
+                    <label className="space-y-1.5">
+                      <span className="text-[11px] text-muted">加密</span>
+                      <select value={emailDraft.security} onChange={e => setEmailDraft(d => ({ ...d, security: e.target.value as EmailSmtpConfig['security'] }))} className="h-9 w-full rounded-btn border border-border bg-base px-2 text-xs text-foreground">
+                        <option value="ssl">SSL</option>
+                        <option value="starttls">STARTTLS</option>
+                        <option value="none">无</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <label className="space-y-1.5">
+                      <span className="text-[11px] text-muted">登录用户名 (可选)</span>
+                      <input value={emailDraft.username} onChange={e => setEmailDraft(d => ({ ...d, username: e.target.value }))} placeholder="bot@example.com" className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground" />
+                    </label>
+                    <label className="space-y-1.5">
+                      <span className="text-[11px] text-muted">密码 / 授权码 (可选)</span>
+                      <input type="password" value={emailPasswordDraft} onChange={e => setEmailPasswordDraft(e.target.value)} placeholder={emailSmtpPasswordSet ? '已保存；留空保持不变' : '无认证服务器可留空'} className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground" />
+                    </label>
+                    <label className="space-y-1.5">
+                      <span className="text-[11px] text-muted">发件人</span>
+                      <input value={emailDraft.from_address} onChange={e => setEmailDraft(d => ({ ...d, from_address: e.target.value }))} placeholder="bot@example.com" className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground" />
+                    </label>
+                    <label className="space-y-1.5">
+                      <span className="text-[11px] text-muted">收件人 (多个用逗号分隔)</span>
+                      <input value={emailDraft.to_addresses.join(', ')} onChange={e => setEmailDraft(d => ({ ...d, to_addresses: e.target.value.split(/[,;，；\n]/) }))} placeholder="alerts@example.com" className="h-9 w-full rounded-btn border border-border bg-base px-3 text-xs font-mono text-foreground" />
+                    </label>
+                  </div>
+                  {emailError && <div className="mt-2 text-[11px] text-danger">{emailError}</div>}
+                  <div className="mt-2 flex items-center gap-2">
+                    <button onClick={submitEmail} disabled={saveEmailSmtp.isPending} className="px-3 py-1.5 rounded-btn bg-accent text-base text-xs font-medium disabled:opacity-50 cursor-pointer hover:bg-accent/90 transition-colors">
+                      {saveEmailSmtp.isPending ? '保存中…' : '保存'}
+                    </button>
+                    <TestSendButton test={testEmail} configured={emailConfigured} />
+                    <TestResult test={testEmail} />
+                  </div>
                 </div>
               )}
             </div>
@@ -791,9 +973,52 @@ export function SettingsMonitoringPanel({ highlight }: { highlight?: string } = 
         </Card>
       </div>
     </div>
+    </HighlightContext.Provider>
   )
 }
 
+
+// ===== 推送测试按钮 + 内联结果 =====
+
+function TestSendButton({ test, configured }: {
+  test: { isPending: boolean; mutate: () => void }
+  configured: boolean
+}) {
+  return (
+    <button
+      onClick={() => test.mutate()}
+      disabled={test.isPending || !configured}
+      title={!configured ? '请先完成该渠道配置' : '发送测试消息'}
+      className="inline-flex items-center gap-1 px-3 py-1.5 rounded-btn bg-elevated text-secondary hover:text-foreground text-xs disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+    >
+      {test.isPending ? '测试中…' : '测试'}
+    </button>
+  )
+}
+
+function TestResult({ test }: {
+  test: { data?: { ok: boolean; detail: string } | null; isError: boolean; error?: Error | null; reset: () => void }
+}) {
+  // 成功结果 2 秒后自动消失; 失败保留, 便于阅读
+  useEffect(() => {
+    if (test.data?.ok) {
+      const t = window.setTimeout(test.reset, 2000)
+      return () => window.clearTimeout(t)
+    }
+  }, [test.data, test.reset])
+
+  let text: string | null = null
+  let tone = ''
+  if (test.isError) {
+    text = String(test.error?.message ?? '发送失败')
+    tone = 'text-danger'
+  } else if (test.data) {
+    text = (test.data.ok ? '✓ ' : '✗ ') + test.data.detail
+    tone = test.data.ok ? 'text-emerald-500' : 'text-danger'
+  }
+  if (!text) return null
+  return <span className={`min-w-0 text-[11px] leading-snug ${tone}`}>{text}</span>
+}
 
 // ===== ToggleRow =====
 
@@ -849,8 +1074,10 @@ interface CardProps {
   children: React.ReactNode
 }
 
-function Card({ icon: Icon, title, badge, right, children }: CardProps) {
-  return (
+function Card({ icon: Icon, title, badge, right, children, anchor }: CardProps & { anchor?: string }) {
+  const highlight = useContext(HighlightContext)
+  const { ref, flash } = useCardFlash(anchor ? highlight : undefined, anchor ?? '')
+  const inner = (
     <section className="rounded-card border border-border bg-surface p-5">
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2.5">
@@ -866,5 +1093,11 @@ function Card({ icon: Icon, title, badge, right, children }: CardProps) {
       </div>
       {children}
     </section>
+  )
+  if (!anchor) return inner
+  return (
+    <div ref={ref} id={anchor} className={cardFlashCls(flash)}>
+      {inner}
+    </div>
   )
 }

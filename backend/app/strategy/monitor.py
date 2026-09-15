@@ -1,6 +1,6 @@
 """策略实时监控 — 订阅行情更新, 检查策略买卖信号和提醒条件。
 
-职责: 接收实时行情 DataFrame → 检查监控中策略的信号/提醒 → 推送告警。
+职责: 接收实时行情 DataFrame → 检查监控中策略的信号 → 推送告警。
 不知道: 策略加载逻辑、AI、API、配置持久化、回测。
 依赖: 外部调用 on_quote_update() 传入实时数据。
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from app.market_time import cn_today
 from app.strategy import config as _strategy_config
 from app.strategy.custom_signals import _OP_BUILDERS  # type: ignore  # 复用运算符构造器
 from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals, uses_price_cross_signals
+from app.strategy.monitor_rules import date_rule_in_window
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,8 @@ _SIGNAL_CN: dict[str, str] = {
     "last_price": "分时最新价",
     "close": "收盘价", "open": "开盘价", "high": "最高价", "low": "最低价",
     "change_pct": "涨跌幅", "change_amount": "涨跌额", "amplitude": "振幅",
-    "turnover_rate": "换手率", "volume": "成交量", "amount": "成交额",
+        "turnover_rate": "换手率", "volume": "成交量", "amount": "成交额",
+        "_volume_delta": "轮询成交量差值(手)", "_sealed_vol": "封单量(手)",
     # 均线
     "ma5": "MA5", "ma10": "MA10", "ma20": "MA20", "ma30": "MA30", "ma60": "MA60",
     "ema5": "EMA5", "ema10": "EMA10", "ema20": "EMA20",
@@ -70,10 +73,21 @@ def _signal_cn_name(name: str) -> str:
     return _SIGNAL_CN.get(name, name)
 
 
+def format_alert_quote(price, change_pct) -> str:
+    """告警正文尾部: '现价 1650.0 · +10.0%'。price/pct 均可缺; pct 为小数制。"""
+    parts = []
+    if price is not None:
+        parts.append(f"现价 {price}")
+    if change_pct is not None:
+        sign = "+" if change_pct >= 0 else ""
+        parts.append(f"{sign}{change_pct * 100:.1f}%")
+    return " · ".join(parts)
+
+
 @dataclass
 class StrategyAlert:
     """策略告警"""
-    type: str              # "entry" | "exit" | "alert"
+    type: str              # "entry" | "exit"
     strategy_id: str
     symbol: str
     name: str | None
@@ -105,7 +119,6 @@ class StrategyMonitorService:
         config: {
             "entry_signals": ["signal_n_day_high", ...],
             "exit_signals": ["signal_ma20_breakdown", ...],
-            "alerts": [{"field": "rsi_14", "op": ">", "value": 80, "message": "..."}],
         }
         """
         with self._watching_lock:
@@ -153,7 +166,7 @@ class StrategyMonitorService:
                         strategy_id=strategy_id,
                         symbol=sym,
                         name=name,
-                        message=f"入场信号触发",
+                        message="入场信号触发",
                         price=price,
                         change_pct=pct,
                         signals=hit_sigs,
@@ -170,25 +183,10 @@ class StrategyMonitorService:
                         strategy_id=strategy_id,
                         symbol=sym,
                         name=name,
-                        message=f"出场信号触发",
+                        message="出场信号触发",
                         price=price,
                         change_pct=pct,
                         signals=hit_sigs,
-                    )
-                    all_alerts.append(alert)
-                    self._emit(alert)
-
-            # 提醒条件
-            for alert_cfg in cfg.get("alerts", []):
-                for sym, name, price, pct in self._check_alert(df, alert_cfg):
-                    alert = StrategyAlert(
-                        type="alert",
-                        strategy_id=strategy_id,
-                        symbol=sym,
-                        name=name,
-                        message=alert_cfg.get("message", "提醒"),
-                        price=price,
-                        change_pct=pct,
                     )
                     all_alerts.append(alert)
                     self._emit(alert)
@@ -231,51 +229,63 @@ class StrategyMonitorService:
             results.append((sym, name, price, pct, hit_sigs))
         return results
 
-    @staticmethod
-    def _check_alert(
-        df: pl.DataFrame,
-        alert: dict,
-    ) -> list[tuple[str, str | None, float | None, float | None]]:
-        """检查阈值型提醒条件"""
-        field = alert.get("field", "")
-        if field not in df.columns:
-            return []
-
-        if "op" in alert:
-            # 阈值比较
-            op = alert["op"]
-            value = alert["value"]
-            col = pl.col(field)
-            ops = {
-                ">": col > value,
-                ">=": col >= value,
-                "<": col < value,
-                "<=": col <= value,
-            }
-            expr = ops.get(op)
-            if expr is None:
-                return []
-        else:
-            # 信号列 (布尔)
-            expr = pl.col(field).fill_null(False)
-
-        hit_df = df.filter(expr)
-        results = []
-        for row in hit_df.iter_rows(named=True):
-            results.append((
-                row.get("symbol", ""),
-                row.get("name"),
-                row.get("close"),
-                row.get("change_pct"),
-            ))
-        return results
-
-
 # ================================================================
 # 通用监控规则引擎 MonitorRuleEngine
 # ================================================================
 
 _SIGNAL_PREFIXES = ("signal_", "csg_")
+
+
+# ── 自选分组作用域: group_id → 成员集合解析 (进程内缓存) ────
+# 缓存按 watchlist 数据版本号失效: 版本不变时零磁盘 IO; 自选页任何增删
+# 分组/成员的操作都会 bump 版本号, 下一轮评估立即拿到新成员 (无需等 TTL)。
+_group_cache_lock = threading.Lock()
+_group_cache: dict[str, Any] = {}
+# 已告警过的「分组已删除」(rule_id, group_id), 防止每轮评估刷日志
+_warned_missing_groups: set[tuple[str, str]] = set()
+
+
+def _watchlist_groups_snapshot() -> dict[str, frozenset[str]]:
+    """返回 {group_id: 成员symbol集}。读前后版本一致才写缓存, 避免缓存住写竞态下的旧数据。"""
+    from app.services import watchlist
+
+    rev_before = watchlist.revision()
+    with _group_cache_lock:
+        cached = _group_cache.get("groups")
+        if cached is not None and _group_cache.get("_rev") == rev_before:
+            return cached
+    groups: dict[str, set[str]] = {g["id"]: set() for g in watchlist.list_groups()}
+    for row in watchlist.list_symbols():
+        for gid in row.get("group_ids") or []:
+            members = groups.get(gid)
+            if members is not None:
+                members.add(str(row["symbol"]))
+    frozen = {gid: frozenset(syms) for gid, syms in groups.items()}
+    if watchlist.revision() == rev_before:
+        with _group_cache_lock:
+            _group_cache["_rev"] = rev_before
+            _group_cache["groups"] = frozen
+    return frozen
+
+
+def _group_members_or_none(rule: dict) -> frozenset[str] | None:
+    """解析规则绑定的分组成员; 分组已删除返回 None, 解析异常返回 None 并记日志。"""
+    group_id = str(rule.get("group_id") or "")
+    try:
+        groups = _watchlist_groups_snapshot()
+    except Exception as exc:
+        logger.warning("自选分组数据读取失败, 规则 %s 本轮跳过: %s", rule.get("id"), exc)
+        return None
+    members = groups.get(group_id)
+    if members is None:
+        key = (str(rule.get("id") or ""), group_id)
+        if key not in _warned_missing_groups:
+            _warned_missing_groups.add(key)
+            logger.warning(
+                "监控规则 %s 绑定的自选分组 %s 已删除, 本轮跳过 (fail-closed, 恢复分组后自动生效)",
+                rule.get("id"), group_id,
+            )
+    return members
 
 
 def _is_signal_field(field: str) -> bool:
@@ -339,6 +349,10 @@ class MonitorRuleEngine:
         self._rules: dict[str, dict] = {}  # rule_id → rule
         # (rule_id, symbol, event_type) → 上次触发时间戳(秒)。用于 cooldown 去重。
         self._last_fire: dict[tuple[str, str, str], float] = {}
+        # date 规则每个交易日只在首个轮询评估一次; 规则集变更时失效重评
+        self._date_eval_day: str | None = None
+        self._date_eval_rules_version = -1
+        self._rules_version = 0  # set/add/remove/clear 递增, 供 date 缓存失效
         self._strategy_engine = None  # 延迟注入, type=strategy 规则用它跑选股
         # symbol → 股票名 (enriched DataFrame 已 drop name 列, 触发时从此映射回填)
         self._name_map: dict[str, str] = {}
@@ -369,6 +383,11 @@ class MonitorRuleEngine:
         self._building_strategy_results: dict[str, dict] = {}
         # 本轮成功写入股票策略实时结果的策略 ID, 供 QuoteService 在计算完成后精确通知策略页。
         self._latest_strategy_result_ids: set[str] = set()
+        self._sector_monitor_service = None
+        self._sector_condition_state: dict[tuple[str, str], bool] = {}
+        # abnormal 规则边缘触发状态: (rule_id, symbol) → 上一轮是否已达阈值。
+        # 只在 False → True 跳变时告警 (首轮观测不触发, 防止新建规则瞬间刷屏)。
+        self._abnormal_condition_state: dict[tuple[str, str], bool] = {}
 
     def set_strategy_engine(self, engine) -> None:
         """注入 StrategyEngine, type=strategy 规则据此跑选股。"""
@@ -377,6 +396,9 @@ class MonitorRuleEngine:
     def set_data_dir(self, data_dir) -> None:
         """注入数据目录, 用于加载策略的用户覆盖配置。"""
         self._data_dir = data_dir
+
+    def set_sector_monitor_service(self, service) -> None:
+        self._sector_monitor_service = service
 
     def invalidate_strategy_state(self) -> None:
         """策略注册表变更后清除选股池与结果, 并废弃进行中的评估。"""
@@ -421,16 +443,41 @@ class MonitorRuleEngine:
         self._name_map = name_map or {}
 
     # ── 规则管理 ───────────────────────────────────────
-    @staticmethod
-    def _rule_state_signature(rule: dict) -> tuple[Any, ...]:
-        return (
-            rule.get("type"),
-            rule.get("strategy_id"),
-            rule.get("asset_type", "stock"),
-            rule.get("scope", "symbols"),
-            tuple(sorted(str(symbol) for symbol in rule.get("symbols", []))),
-            rule.get("sector"),
-        )
+    @classmethod
+    def _freeze_rule_state(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple(sorted(
+                (str(key), cls._freeze_rule_state(item))
+                for key, item in value.items()
+            ))
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return tuple(sorted(
+                (cls._freeze_rule_state(item) for item in value),
+                key=repr,
+            ))
+        return value
+
+    @classmethod
+    def _rule_state_signature(cls, rule: dict) -> tuple[Any, ...]:
+        """只忽略不会改变命中语义的展示与通知字段。"""
+        cosmetic_fields = {
+            "cooldown_seconds",
+            "created_at",
+            "enabled",
+            "id",
+            "message",
+            "name",
+            "severity",
+            "updated_at",
+            "webhook_channels",
+            "webhook_enabled",
+            "webhook_url",
+        }
+        return cls._freeze_rule_state({
+            key: value
+            for key, value in rule.items()
+            if key not in cosmetic_fields
+        })
 
     def set_rules(self, rules: list[dict]) -> None:
         """批量设置规则 (覆盖)。用于启动时 reload。
@@ -468,10 +515,21 @@ class MonitorRuleEngine:
                 for key, value in list(self._strategy_signal_seen.items())
                 if key[0] in active_ids
             }
+            self._sector_condition_state = {
+                key: value
+                for key, value in list(self._sector_condition_state.items())
+                if key[0] in active_ids
+            }
+            self._abnormal_condition_state = {
+                key: value
+                for key, value in list(self._abnormal_condition_state.items())
+                if key[0] in active_ids
+            }
             self._latest_strategy_results = {}
             self._building_strategy_results = {}
             self._latest_strategy_result_ids.clear()
             self._strategy_state_generation += 1
+            self._rules_version += 1
             logger.info("MonitorRuleEngine: 装载 %d 条规则", len(self._rules))
 
     def add_rule(self, rule: dict) -> None:
@@ -484,6 +542,7 @@ class MonitorRuleEngine:
             self._building_strategy_results = {}
             self._latest_strategy_result_ids.clear()
             self._strategy_state_generation += 1
+            self._rules_version += 1
 
     def remove_rule(self, rule_id: str) -> None:
         with self._strategy_state_lock:
@@ -498,10 +557,17 @@ class MonitorRuleEngine:
             self._strategy_signal_seen = {
                 k: v for k, v in list(self._strategy_signal_seen.items()) if k[0] != rule_id
             }
+            self._sector_condition_state = {
+                k: v for k, v in self._sector_condition_state.items() if k[0] != rule_id
+            }
+            self._abnormal_condition_state = {
+                k: v for k, v in self._abnormal_condition_state.items() if k[0] != rule_id
+            }
             self._latest_strategy_results = {}
             self._building_strategy_results = {}
             self._latest_strategy_result_ids.clear()
             self._strategy_state_generation += 1
+            self._rules_version += 1
 
     def clear(self) -> None:
         with self._strategy_state_lock:
@@ -510,10 +576,13 @@ class MonitorRuleEngine:
             self._strategy_pools.clear()
             self._strategy_signal_state.clear()
             self._strategy_signal_seen.clear()
+            self._sector_condition_state.clear()
+            self._abnormal_condition_state.clear()
             self._latest_strategy_results = {}
             self._building_strategy_results = {}
             self._latest_strategy_result_ids.clear()
             self._strategy_state_generation += 1
+            self._rules_version += 1
 
     @property
     def rules(self) -> dict[str, dict]:
@@ -722,6 +791,10 @@ class MonitorRuleEngine:
         for rule_id, rule in rules:
             if rule.get("asset_type", "stock") != asset_type:
                 continue
+            if rule.get("type") in ("sector", "abnormal", "date"):
+                # 三者不走行情 DataFrame 评估, 各走 evaluate_sectors / evaluate_abnormal /
+                # evaluate_date_rules 专用路径
+                continue
             try:
                 events.extend(self._evaluate_rule(df, rule, now, state))
             except Exception as e:
@@ -738,15 +811,433 @@ class MonitorRuleEngine:
             self._building_strategy_results = state.building_strategy_results
             self._latest_strategy_results = state.building_strategy_results
             self._latest_strategy_result_ids = state.latest_strategy_result_ids
-
-        for event in events:
-            if self._alert_handler:
-                try:
-                    self._alert_handler(event)
-                except Exception as e:
-                    logger.warning("alert handler failed: %s", e)
+            # 状态发布与通知共用规则代际锁，保证 set/remove_rules 返回后不会再发送
+            # 已删除规则的旧事件。RLock 允许 handler 同线程回调规则管理接口。
+            for event in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(event)
+                    except Exception as e:
+                        logger.warning("alert handler failed: %s", e)
 
         return events
+
+    def evaluate_date_rules(self, now: float | None = None) -> list[dict]:
+        """纯日历评估 date 规则: 窗口命中 + 每天最多一次, 无行情条件。
+
+        由行情轮询在盘中调用 (quote_service._evaluate_monitors), 事件与 _evaluate_rule 同构。
+        窗口按自然日; 到期落在休市/节假日时需 lead_days 覆盖 (交易日历口径待 issue 定夺)。
+        每个交易日只在首个轮询完整评估一次, 其余轮次命中缓存直接跳过。
+        """
+        now = now if now is not None else time.time()
+        today_iso = cn_today().isoformat()
+        with self._strategy_state_lock:
+            generation = self._strategy_state_generation
+            rules_version = self._rules_version
+            if (
+                self._date_eval_day == today_iso
+                and self._date_eval_rules_version == rules_version
+            ):
+                return []
+            rules = list(self._rules.values())
+            last_fire = dict(self._last_fire)
+        # 跨天首轮清掉已过期日期的按天 cooldown 键, 避免 _last_fire 无限累积
+        last_fire = {
+            key: value
+            for key, value in last_fire.items()
+            if not (key[1].startswith("_date_") and key[1] != f"_date_{today_iso}")
+        }
+
+        today_d = _dt.date.fromisoformat(today_iso)
+        events: list[dict] = []
+        for rule in rules:
+            if rule.get("type") != "date" or rule.get("enabled") is False:
+                continue
+            remind = rule.get("remind_date") or ""
+            if not date_rule_in_window(remind, int(rule.get("lead_days", 0)), today_iso):
+                continue
+            # 按天隔离: 窗口内每天最多触发一次
+            key = (rule["id"], f"_date_{today_iso}", "date")
+            cooldown = int(rule.get("cooldown_seconds") or 86400)
+            last = last_fire.get(key)
+            if last is not None and (now - last) < cooldown:
+                continue
+            last_fire[key] = now
+
+            symbols = [s for s in rule.get("symbols", []) if s]
+            single_symbol = symbols[0] if len(symbols) == 1 else None
+            msg = rule.get("message") or f"日期提醒 · {today_iso}"
+            try:
+                remain = (_dt.date.fromisoformat(remind) - today_d).days
+            except ValueError:
+                remain = 0
+            msg += " · 今日到期" if remain <= 0 else f" · {remain}天后到期"
+            # 单标的由 ev.symbol 携带; 仅多标的时拼列表
+            if len(symbols) > 1:
+                shown = "、".join(symbols[:3]) + ("等" if len(symbols) > 3 else "")
+                msg = f"{msg} · {shown}"
+
+            ev = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "strategy_id": None,
+                "source": "date",
+                "type": "date_reminder",
+                "symbol": single_symbol or "",
+                "name": (self._name_map.get(single_symbol) or single_symbol) if single_symbol else None,
+                "message": msg,
+                "price": None,
+                "change_pct": None,
+                "signals": [],
+                "severity": rule.get("severity", "info"),
+                "conditions": [],
+                "logic": "and",
+            }
+            events.append(ev)
+
+        with self._strategy_state_lock:
+            if generation != self._strategy_state_generation:
+                return []
+            self._last_fire = last_fire
+            self._date_eval_day = today_iso
+            self._date_eval_rules_version = rules_version
+            for ev in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(ev)
+                    except Exception as e:
+                        logger.warning("alert handler failed: %s", e)
+        return events
+
+    def evaluate_sectors(
+        self,
+        stock_df: pl.DataFrame,
+        index_df: pl.DataFrame,
+        *,
+        now: float | None = None,
+    ) -> list[dict]:
+        """按板块聚合快照评估 type=sector 规则。"""
+        if self._sector_monitor_service is None:
+            return []
+        with self._strategy_state_lock:
+            generation = self._strategy_state_generation
+            rules = [
+                rule for rule in self._rules.values()
+                if rule.get("enabled", True) and rule.get("type") == "sector"
+            ]
+            last_fire = dict(self._last_fire)
+            condition_state = dict(self._sector_condition_state)
+        if not rules:
+            return []
+
+        targets_by_key: dict[str, dict] = {}
+        windows: set[int] = set()
+        for rule in rules:
+            for target in rule.get("sector_targets", []):
+                if target.get("key"):
+                    targets_by_key[str(target["key"])] = target
+            if rule.get("sector_trigger") == "momentum":
+                windows.add(int(rule.get("window_minutes", 5)))
+
+        timestamp = time.time() if now is None else now
+        snapshots = self._sector_monitor_service.build_snapshots(
+            stock_df,
+            index_df,
+            list(targets_by_key.values()),
+            windows,
+            now=timestamp,
+        )
+        events: list[dict] = []
+        for rule in rules:
+            try:
+                events.extend(
+                    self._evaluate_sector_rule(
+                        rule, snapshots, timestamp, last_fire, condition_state,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("板块规则评估失败 %s: %s", rule.get("id"), exc)
+
+        with self._strategy_state_lock:
+            if generation != self._strategy_state_generation:
+                return []
+            self._last_fire = last_fire
+            self._sector_condition_state = condition_state
+            for event in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(event)
+                    except Exception as exc:
+                        logger.warning("alert handler failed: %s", exc)
+        return events
+
+    def _evaluate_sector_rule(
+        self,
+        rule: dict,
+        snapshots: dict[str, dict],
+        now: float,
+        last_fire: dict[tuple[str, str, str], float],
+        condition_state: dict[tuple[str, str], bool],
+    ) -> list[dict]:
+        events: list[dict] = []
+        direction = rule.get("direction", "up")
+        trigger = rule.get("sector_trigger", "change_pct")
+        threshold = float(rule.get("threshold_pct", 1.0)) / 100
+        window = int(rule.get("window_minutes", 5))
+
+        for target in rule.get("sector_targets", []):
+            target_key = str(target.get("key") or "")
+            snapshot = snapshots.get(target_key)
+            if not snapshot or not snapshot.get("valid"):
+                continue
+            value = (
+                snapshot.get("change_pct")
+                if trigger == "change_pct"
+                else snapshot.get("window_changes", {}).get(window)
+            )
+            condition = value is not None and (
+                value >= threshold if direction == "up" else value <= -threshold
+            )
+            state_key = (rule["id"], target_key)
+            previous = condition_state.get(state_key)
+            condition_state[state_key] = condition
+            if previous is None or previous or not condition:
+                continue
+
+            event_type = f"sector_{trigger}_{direction}"
+            cooldown_key = (rule["id"], target_key, event_type)
+            last = last_fire.get(cooldown_key)
+            cooldown = int(rule.get("cooldown_seconds", 3600))
+            if last is not None and now - last < cooldown:
+                continue
+            last_fire[cooldown_key] = now
+            message = rule.get("message", "") or self._sector_message(
+                snapshot, trigger, direction, threshold, window, value,
+            )
+            event = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "strategy_id": None,
+                "source": "sector",
+                "type": event_type,
+                "symbol": snapshot.get("symbol") if snapshot.get("kind") == "index" else "",
+                "name": snapshot.get("name"),
+                "message": message,
+                "price": snapshot.get("price"),
+                "change_pct": snapshot.get("change_pct"),
+                "window_change_pct": value if trigger == "momentum" else None,
+                "signals": [],
+                "severity": rule.get("severity", "info"),
+                "conditions": [],
+                "logic": "and",
+                "sector_kind": snapshot.get("kind"),
+                "sector_key": target_key,
+                "sector_name": snapshot.get("name"),
+                "sector_source_field": snapshot.get("source_field"),
+                "sector_value": snapshot.get("value"),
+                "sector_level": snapshot.get("level"),
+                "coverage_ratio": snapshot.get("coverage_ratio"),
+                "valid_count": snapshot.get("valid_count"),
+                "total_count": snapshot.get("total_count"),
+                "up_count": snapshot.get("up_count"),
+                "down_count": snapshot.get("down_count"),
+                "leader": snapshot.get("leader"),
+            }
+            events.append(event)
+        return events
+
+    @staticmethod
+    def _sector_message(
+        snapshot: dict,
+        trigger: str,
+        direction: str,
+        threshold: float,
+        window: int,
+        value: float | None,
+    ) -> str:
+        kind_label = {
+            "index": "指数", "concept": "概念", "industry": "行业",
+        }.get(snapshot.get("kind"), "板块")
+        current = float(snapshot.get("change_pct") or 0)
+        if trigger == "momentum":
+            action = "快速拉升" if direction == "up" else "快速下跌"
+            head = (
+                f"{kind_label}「{snapshot.get('name')}」{window}分钟{action} "
+                f"{float(value or 0) * 100:+.2f}%"
+            )
+        else:
+            action = "涨幅上穿" if direction == "up" else "跌幅下穿"
+            head = f"{kind_label}「{snapshot.get('name')}」{action} {threshold * 100:.2f}%"
+        parts = [head, f"当前 {current * 100:+.2f}%"]
+        if snapshot.get("kind") != "index":
+            parts.append(f"上涨 {snapshot.get('up_count', 0)}/{snapshot.get('valid_count', 0)}")
+            parts.append(f"覆盖 {float(snapshot.get('coverage_ratio') or 0) * 100:.0f}%")
+            leader = snapshot.get("leader") or {}
+            if leader.get("name") or leader.get("symbol"):
+                parts.append(
+                    f"领涨 {leader.get('name') or leader.get('symbol')} "
+                    f"{float(leader.get('change_pct') or 0) * 100:+.2f}%"
+                )
+        return "｜".join(parts)
+
+    def min_abnormal_closeness(self) -> float:
+        """启用的 abnormal 规则中最小的接近度阈值 (小数)。
+
+        供调用方 (quote_service) 构建异动快照时预过滤, 不必按最高阈值拉全量。
+        """
+        with self._strategy_state_lock:
+            thresholds = [
+                float(r.get("threshold_pct", 70)) / 100
+                for r in self._rules.values()
+                if r.get("enabled", True) and r.get("type") == "abnormal"
+            ]
+        return min(thresholds) if thresholds else 1.0
+
+    def evaluate_abnormal(self, rows: list[dict], *, now: float | None = None) -> list[dict]:
+        """按异动边缘快照评估 type=abnormal 规则。
+
+        rows 为 abnormal_moves.build_overview 的 rows (调用方已按
+        min_abnormal_closeness 预过滤)。rows 为空也照常评估 —— 用于把
+        已消失标的的边缘状态清理回 False。
+        """
+        with self._strategy_state_lock:
+            generation = self._strategy_state_generation
+            rules = [
+                rule for rule in self._rules.values()
+                if rule.get("enabled", True) and rule.get("type") == "abnormal"
+            ]
+            last_fire = dict(self._last_fire)
+            condition_state = dict(self._abnormal_condition_state)
+        if not rules:
+            return []
+        timestamp = time.time() if now is None else now
+        events: list[dict] = []
+        for rule in rules:
+            try:
+                events.extend(
+                    self._evaluate_abnormal_rule(
+                        rule, rows, timestamp, last_fire, condition_state,
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("异动规则评估失败 %s: %s", rule.get("id"), exc)
+
+        with self._strategy_state_lock:
+            if generation != self._strategy_state_generation:
+                return []
+            self._last_fire = last_fire
+            self._abnormal_condition_state = condition_state
+            for event in events:
+                if self._alert_handler:
+                    try:
+                        self._alert_handler(event)
+                    except Exception as exc:
+                        logger.warning("alert handler failed: %s", exc)
+        return events
+
+    def _evaluate_abnormal_rule(
+        self,
+        rule: dict,
+        rows: list[dict],
+        now: float,
+        last_fire: dict[tuple[str, str, str], float],
+        condition_state: dict[tuple[str, str], bool],
+    ) -> list[dict]:
+        events: list[dict] = []
+        threshold = float(rule.get("threshold_pct", 70)) / 100
+        if not 0 < threshold <= 1.5:
+            threshold = 0.7
+        direction = rule.get("direction", "both")
+        window_filter = str(rule.get("abnormal_window", "any"))
+        if rule.get("scope") == "symbols":
+            scope_symbols = {str(s) for s in rule.get("symbols", []) if s}
+        elif rule.get("scope") == "watchlist_group":
+            # 异动规则同样支持动态分组; 分组已删除返回 None → 本轮整体跳过
+            members = _group_members_or_none(rule)
+            if members is None:
+                return events
+            scope_symbols = set(members)
+        else:
+            scope_symbols = None
+
+        seen: set[str] = set()
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            if not symbol or (scope_symbols is not None and symbol not in scope_symbols):
+                continue
+            seen.add(symbol)
+            # 方向/窗口过滤后取接近度最高的窗口作为代表
+            best: tuple[str, float, float, float] | None = None  # (窗口, 接近度, 偏离值, 阈值)
+            for key, win in (row.get("windows") or {}).items():
+                if window_filter != "any" and key != window_filter:
+                    continue
+                value = win.get("value")
+                if value is None:
+                    continue
+                if direction == "up" and value <= 0:
+                    continue
+                if direction == "down" and value >= 0:
+                    continue
+                closeness = float(win.get("closeness") or 0)
+                if best is None or closeness > best[1]:
+                    best = (key, closeness, float(value), float(win.get("threshold") or 0))
+            condition = best is not None and best[1] >= threshold
+            state_key = (rule["id"], symbol)
+            previous = condition_state.get(state_key)
+            condition_state[state_key] = condition
+            if previous is None or previous or not condition:
+                continue
+
+            event_type = f"abnormal_{'up' if best[2] > 0 else 'down'}"
+            cooldown_key = (rule["id"], symbol, event_type)
+            last = last_fire.get(cooldown_key)
+            cooldown = int(rule.get("cooldown_seconds", 3600))
+            if last is not None and now - last < cooldown:
+                continue
+            last_fire[cooldown_key] = now
+            event = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "strategy_id": None,
+                "source": "abnormal",
+                "type": event_type,
+                "symbol": symbol,
+                "name": row.get("name"),
+                "message": rule.get("message", "") or self._abnormal_message(row, best),
+                "price": row.get("close"),
+                "change_pct": row.get("rt_pct"),
+                "signals": [],
+                "severity": rule.get("severity", "info"),
+                "conditions": [],
+                "logic": "and",
+                "abnormal_window": best[0],
+                "abnormal_value": round(best[2], 4),
+                "abnormal_threshold": best[3],
+                "abnormal_closeness": round(best[1], 4),
+            }
+            events.append(event)
+        # 本轮未出现的标的 (跌出预过滤区间) 状态置 False 而非删除:
+        # 删除会被当成「首轮观测」而不触发, 置 False 才能在回升穿过阈值时再次告警。
+        for key, value in list(condition_state.items()):
+            if key[0] == rule["id"] and key[1] not in seen and value:
+                condition_state[key] = False
+        return events
+
+    @staticmethod
+    def _abnormal_message(row: dict, best: tuple[str, float, float, float]) -> str:
+        window, closeness, value, threshold = best
+        board = row.get("board") or ""
+        tag = f"{board}{'·ST' if row.get('st') else ''}"
+        state = "滚动估算达线" if closeness >= 1 else "滚动估算接近阈值"
+        return (
+            f"{row.get('name') or row.get('symbol')} {window}偏离值 "
+            f"{value * 100:+.2f}%/阈值{threshold * 100:.0f}% ({tag}) "
+            f"接近度{closeness * 100:.0f}%, {state}；"
+            "未计公告重置及无涨跌限制期，不代表交易所认定或披露义务"
+        )
 
     def _evaluate_rule(
         self, df: pl.DataFrame, rule: dict, now: float, state: _EvaluationState,
@@ -768,6 +1259,9 @@ class MonitorRuleEngine:
         elif rtype == "ladder":
             # 连板梯队封单监控: 独立处理 (需带预警封单值, 走专属 message)
             return self._evaluate_ladder(scoped, rule, now, state)
+        elif rtype == "volume_delta":
+            # 轮询放量监控: 相邻两次全市场快照的成交量差值, 独立处理走专属 message
+            return self._evaluate_volume_delta(scoped, rule, now, state)
         else:
             # signal / price / market: 通用条件匹配
             for sym, name, price, pct, hit_sigs in self._match_conditions(scoped, rule):
@@ -838,6 +1332,13 @@ class MonitorRuleEngine:
             if not syms:
                 return df.head(0)
             return df.filter(pl.col("symbol").is_in(syms))
+        if scope == "watchlist_group":
+            # 动态绑定自选分组: 每轮评估按分组当前成员过滤 (带版本号缓存)。
+            # 分组已删除/暂时为空 → fail-closed 返回空, 绝不退化为全市场。
+            members = _group_members_or_none(rule)
+            if not members:
+                return df.head(0)
+            return df.filter(pl.col("symbol").is_in(list(members)))
         if scope == "sector":
             # sector 过滤需 df 含板块列 (后续接入 ext_data JOIN)。在 JOIN 落地前
             # fail-closed 返回空 —— 绝不退化为「全市场」误触发 (旧行为 return df 会让
@@ -908,7 +1409,16 @@ class MonitorRuleEngine:
                 current=df,
                 market=matrix,
             )
-        elif s.filter_history_fn:
+        required_history_bars = 1
+        history_resolver = getattr(self._strategy_engine, "required_history_bars", None)
+        if callable(history_resolver):
+            required_history_bars = history_resolver(
+                [sid],
+                overrides_map={sid: overrides},
+            )
+        if getattr(s, "execution_backend", "polars_expr") not in {"composite", "matrix_native"} and (
+            s.filter_history_fn or required_history_bars > 1
+        ):
             history_loader = self._history_loader_for(rule)
             if history_loader is None:
                 logger.debug("策略 %s 需要历史数据但未注入 history_loader (asset_type=%s), 跳过实时监控",
@@ -916,7 +1426,7 @@ class MonitorRuleEngine:
                 return []
             try:
                 today = cn_today()
-                lookback = max(1, getattr(s, "lookback_days", 30))
+                lookback = max(1, getattr(s, "lookback_days", 1), required_history_bars)
                 hist_df = history_loader(today, lookback)
                 if hist_df is None or hist_df.is_empty():
                     logger.debug("策略 %s 历史数据为空, 跳过本轮实时监控", sid)
@@ -960,7 +1470,6 @@ class MonitorRuleEngine:
         # 避免并发读到半填充状态。
         if at == "stock":
             try:
-                import math
                 state.building_strategy_results[sid] = {
                     "total": result.total,
                     "as_of": str(cn_today()),
@@ -974,7 +1483,27 @@ class MonitorRuleEngine:
             except Exception:  # noqa: BLE001
                 pass
 
-        current_pool: set[str] = {r["symbol"] for r in result.rows}
+        score_min = rule.get("score_min")
+        score_max = rule.get("score_max")
+        score_filter_enabled = score_min is not None or score_max is not None
+        eligible_symbols: set[str] = set()
+        if score_filter_enabled:
+            for row in result.rows:
+                symbol = str(row.get("symbol", ""))
+                score = row.get("score", result.scores.get(symbol))
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    continue
+                if not math.isfinite(score):
+                    continue
+                if score_min is not None and score < score_min:
+                    continue
+                if score_max is not None and score > score_max:
+                    continue
+                eligible_symbols.add(symbol)
+        else:
+            eligible_symbols = {str(row["symbol"]) for row in result.rows}
+
+        current_pool = eligible_symbols
         prev_pool = state.strategy_pools.get(pool_key)
         state.strategy_pools[pool_key] = current_pool
 
@@ -987,9 +1516,15 @@ class MonitorRuleEngine:
         except Exception:
             pass
 
+        entry_signal_hits = result.entry_signal_hits
+        if score_filter_enabled:
+            entry_signal_hits = [
+                hit for hit in entry_signal_hits
+                if str(hit.get("symbol", "")) in eligible_symbols
+            ]
         changes: dict[str, set[str]] = {
             "buy_signal": self._new_strategy_signals(
-                pool_key, "buy_signal", result.as_of, result.entry_signal_hits, state,
+                pool_key, "buy_signal", result.as_of, entry_signal_hits, state,
             ),
             "sell_signal": self._new_strategy_signals(
                 pool_key, "sell_signal", result.as_of, result.exit_signal_hits, state,
@@ -1002,7 +1537,7 @@ class MonitorRuleEngine:
         signal_map = {
             "buy_signal": {
                 str(hit["symbol"]): list(hit.get("signals") or [])
-                for hit in result.entry_signal_hits
+                for hit in entry_signal_hits
             },
             "sell_signal": {
                 str(hit["symbol"]): list(hit.get("signals") or [])
@@ -1105,6 +1640,146 @@ class MonitorRuleEngine:
             ]
             results.append((sym, name, price, pct, hit_sigs))
         return results
+
+    @staticmethod
+    def _volume_delta_basic_mask(df: pl.DataFrame, bf: dict, name_map: dict[str, str]) -> pl.Expr | None:
+        """轮询放量基础过滤掩码 (与策略 basic_filter 语义对齐, 字段缺失时该项跳过)。
+
+        支持: price_min/max (收盘价), market_cap_min (总市值=close x total_shares),
+        float_cap_min/max (流通市值), amount_min (当日累计成交额), exclude_st (名称含 ST)。
+        """
+        masks: list[pl.Expr] = []
+        if bf.get("price_min") is not None:
+            masks.append(pl.col("close") >= float(bf["price_min"]))
+        if bf.get("price_max") is not None:
+            masks.append(pl.col("close") <= float(bf["price_max"]))
+        if bf.get("amount_min") is not None and "amount" in df.columns:
+            masks.append(pl.col("amount") >= float(bf["amount_min"]))
+        if bf.get("market_cap_min") is not None and "total_shares" in df.columns:
+            masks.append((pl.col("close") * pl.col("total_shares")) >= float(bf["market_cap_min"]))
+        if bf.get("float_cap_min") is not None and "float_shares" in df.columns:
+            masks.append((pl.col("close") * pl.col("float_shares")) >= float(bf["float_cap_min"]))
+        if bf.get("float_cap_max") is not None and "float_shares" in df.columns:
+            masks.append((pl.col("close") * pl.col("float_shares")) <= float(bf["float_cap_max"]))
+        if bf.get("exclude_st") and name_map:
+            st_symbols = [
+                sym for sym, name in name_map.items()
+                if name and "ST" in str(name).upper()
+            ]
+            if st_symbols:
+                masks.append(~pl.col("symbol").is_in(st_symbols))
+        if not masks:
+            return None
+        return pl.all_horizontal(masks)
+
+    def _evaluate_volume_delta(
+        self,
+        scoped: pl.DataFrame,
+        rule: dict,
+        now: float,
+        state: _EvaluationState,
+    ) -> list[dict]:
+        """评估轮询放量监控: 相邻两次全市场快照的成交量/成交额差值。
+
+        差值列 _volume_delta(手)/_volume_delta_amount(元)/间隔列 _volume_delta_span
+        由 quote_service 评估前注入。metric=volume 按手数、amount 按金额比较阈值;
+        basic_filter 先行过滤 (股价/市值/成交额/ST, 与策略 basic_filter 语义对齐)。
+        命中 >5 只时合并为一条批量事件防刷屏。
+        """
+        if "_volume_delta" not in scoped.columns:
+            return []  # 无差值数据 (首轮/开盘保护/非全市场轮询), 安全降级
+
+        metric = rule.get("metric", "volume")
+        if metric == "amount" and "_volume_delta_amount" in scoped.columns:
+            cmp_col, threshold = "_volume_delta_amount", rule.get("threshold_amount", 1e6)
+            th_text = f"{threshold / 1e4:,.0f} 万元"
+        else:
+            cmp_col, threshold = "_volume_delta", rule.get("threshold_volume", 9000)
+            th_text = f"{threshold:,.0f} 手"
+
+        cooldown = rule.get("cooldown_seconds", 300)
+        severity = rule.get("severity", "warn")
+        span_s = 0.0
+        if "_volume_delta_span" in scoped.columns and scoped.height > 0:
+            v = scoped["_volume_delta_span"][0]
+            span_s = float(v) if v is not None else 0.0
+        span_text = f" (间隔 {span_s:.0f}s)" if span_s > 0 else ""
+
+        candidate = scoped
+        bf = rule.get("basic_filter") or {}
+        if bf:
+            mask = self._volume_delta_basic_mask(candidate, bf, self._name_map)
+            if mask is not None:
+                candidate = candidate.filter(mask)
+
+        hit = candidate.filter(
+            pl.col(cmp_col).is_not_null() & (pl.col(cmp_col) >= threshold)
+        ).sort(cmp_col, descending=True)
+        if hit.is_empty():
+            return []
+        hit_rows = list(hit.iter_rows(named=True))
+
+        def _name_of(row: dict) -> str:
+            sym = row.get("symbol", "")
+            return row.get("name") or self._name_map.get(sym) or sym
+
+        def _fmt(v) -> str:
+            if metric == "amount":
+                return f"{v / 1e4:,.0f} 万元"
+            return f"{v:,.0f} 手"
+
+        def _event(symbol: str, name: str, message: str, *, delta=None, price=None, pct=None) -> dict:
+            ev = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "source": "volume_delta",
+                "type": "轮询放量",
+                "symbol": symbol,
+                "name": name,
+                "message": message,
+                "price": price,
+                "change_pct": pct,
+                "signals": [],
+                "severity": severity,
+                "conditions": [],
+                "logic": "and",
+                "volume_delta": delta,
+                "volume_delta_span": round(span_s, 1),
+            }
+            if metric == "amount":
+                ev["volume_delta_amount"] = delta
+            return ev
+
+        if len(hit_rows) > 5:
+            top = "、".join(_name_of(r) for r in hit_rows[:8])
+            suffix = "等" if len(hit_rows) > 8 else ""
+            message = (
+                f"放量 · 单轮增量 >= {th_text}{span_text} · "
+                f"共 {len(hit_rows)} 只: {top}{suffix}"
+            )
+            key = (rule["id"], "_volume_delta_batch", "volume_delta")
+            last = state.last_fire.get(key)
+            if last is not None and (now - last) < cooldown:
+                return []
+            state.last_fire[key] = now
+            return [_event("", "", message)]
+
+        events: list[dict] = []
+        for row in hit_rows:
+            sym = row.get("symbol", "")
+            key = (rule["id"], sym, "volume_delta")
+            last = state.last_fire.get(key)
+            if last is not None and (now - last) < cooldown:
+                continue
+            state.last_fire[key] = now
+            delta = row.get(cmp_col)
+            message = f"放量 · 单轮增量 {_fmt(delta)} >= {th_text}{span_text}"
+            events.append(_event(
+                sym, _name_of(row), message,
+                delta=delta, price=row.get("close"), pct=row.get("change_pct"),
+            ))
+        return events
 
     def _evaluate_ladder(
         self, scoped: pl.DataFrame, rule: dict, now: float, state: _EvaluationState,
@@ -1229,12 +1904,7 @@ class MonitorRuleEngine:
         # signal / price / market: 条件摘要 + 现价 + 涨跌幅
         # 条件摘要: 把 conditions (truth/比较) 拼成可读串, 如 "MA20金叉 且 量比>2"
         cond_text = self._format_conditions_text(rule, conditions)
-        price_text = f"现价 {price}" if price is not None else ""
-        pct_text = ""
-        if pct is not None:
-            sign = "+" if pct >= 0 else ""
-            pct_text = f"{sign}{pct * 100:.1f}%"
-        tail = " · ".join(s for s in (price_text, pct_text) if s)
+        tail = format_alert_quote(price, pct)
         if cond_text and tail:
             return f"{cond_text} · {tail}"
         return cond_text or tail or "监控触发"

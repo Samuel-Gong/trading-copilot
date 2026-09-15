@@ -92,12 +92,16 @@ interface StrategyCardProps {
   monitored?: boolean
   /** 切换策略监控 (点击 RadioTower 图标) */
   onToggleMonitor?: () => void
+  /** 周期徽章 (如 '分钟'); 日线策略不传 */
+  timeframeBadge?: string
+  /** 后台计算中 (渐进式 run_all): 数字未出时显示脉冲占位 */
+  computing?: boolean
 }
 
 export function StrategyCard({
   name, description, source, active, count, expiredCount,
   loading, cardSize,
-  onRun, disabled, onSettings, monitored, onToggleMonitor,
+  onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing,
 }: StrategyCardProps) {
   const cs = CARD_STYLES[cardSize]
   const activeCls = active
@@ -125,6 +129,9 @@ export function StrategyCard({
             className="flex flex-col items-start cursor-pointer disabled:opacity-50 disabled:cursor-wait w-full">
             <div className="flex items-center gap-1.5 max-w-full">
               <span className={`text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 ${badgeCls}`}>{srcLabel}</span>
+              {timeframeBadge && (
+                <span className="text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400">{timeframeBadge}</span>
+              )}
               <span className="text-xs font-medium truncate text-foreground">{name}</span>
             </div>
             {description && (
@@ -143,6 +150,9 @@ export function StrategyCard({
                   </div>
                 )}
               </div>
+            )}
+            {count == null && !loading && computing && (
+              <span className="mt-1.5 text-sm font-mono font-bold text-muted/50 animate-pulse">···</span>
             )}
             {loading && <div className="mt-1 h-4 w-10 rounded bg-elevated animate-pulse" />}
           </button>
@@ -164,9 +174,15 @@ export function StrategyCard({
             className="flex flex-col items-start cursor-pointer disabled:opacity-50 disabled:cursor-wait min-w-0">
             <div className="flex items-center gap-1.5 min-w-0">
               <span className={`text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 ${badgeCls}`}>{srcLabel}</span>
+              {timeframeBadge && (
+                <span className="text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400">{timeframeBadge}</span>
+              )}
               <span className="text-xs font-medium truncate text-foreground">{name}</span>
               {count != null && !loading && (
                 <span className={`text-xs font-mono font-bold tabular-nums shrink-0 ${countCls}`}>{count}</span>
+              )}
+              {count == null && !loading && computing && (
+                <span className="text-xs font-mono font-bold text-muted/50 animate-pulse shrink-0">···</span>
               )}
               {loading && <span className="w-5 h-3 rounded bg-elevated animate-pulse shrink-0" />}
             </div>
@@ -200,6 +216,9 @@ export function StrategyCard({
             <span className="text-[10px] font-medium whitespace-nowrap text-foreground">{name}</span>
             {count != null && !loading && (
               <span className={`text-xs font-mono font-bold tabular-nums ${countCls}`}>{count}</span>
+            )}
+            {count == null && !loading && computing && (
+              <span className="text-xs font-mono font-bold text-muted/50 animate-pulse">···</span>
             )}
             {hasExpired && (
               <span className="text-[9px] font-mono text-red-400/70">{'-' + expiredCount}</span>

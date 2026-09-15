@@ -1,6 +1,7 @@
 """Screener API。"""
 from __future__ import annotations
 
+import contextlib
 import glob as _glob
 import logging
 import math
@@ -9,7 +10,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime
 from typing import Annotated, Any, Literal, Optional
 
@@ -17,8 +18,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from app.config import settings
 from app.db_safe import is_valid_ext_ident, quote_ident
-from app.services import strategy_cache
+from app.services import strategy_cache, strategy_run_queue
 from app.services.screener import ScreenerService
 from app.services.screener_export import ExportError, build_export, export_csv
 from app.strategy import config as strategy_config
@@ -320,6 +322,8 @@ def strategies(
         raise HTTPException(status_code=503, detail="策略引擎未初始化")
     presets = []
     for meta in engine.list_strategies():
+        if meta.get("research_only"):
+            continue
         if asset_type not in meta.get("asset_types", ["stock"]):
             continue
         if timeframe not in meta.get("timeframes", ["1d"]):
@@ -379,6 +383,10 @@ def run_preset(req: PresetRequest, request: Request):
     try:
         if not engine.has(req.strategy_id):
             raise ValueError(f"unknown strategy: {req.strategy_id}")
+        get_strategy = getattr(engine, "get", None)
+        strategy = get_strategy(req.strategy_id) if callable(get_strategy) else None
+        if strategy is not None and getattr(strategy, "meta", {}).get("research_only"):
+            raise ValueError(f"unknown strategy: {req.strategy_id}")
         params = dict(overrides.get("params") or {})
         context = svc.build_strategy_context(
             engine,
@@ -401,6 +409,7 @@ def run_preset(req: PresetRequest, request: Request):
         raise HTTPException(status_code=status_code, detail=str(e)) from e
 
     safe_data = _safe(asdict(result))
+    # 股票日线结果才写入盘后缓存; ETF 与分钟周期结果不混入共享日线快照。
     if req.asset_type == "stock" and req.timeframe == "1d":
         _update_cache_strategy(
             data_dir,
@@ -427,7 +436,14 @@ def _cached_with_realtime(request: Request) -> dict:
         realtime_results = monitor_engine.latest_strategy_results()
         if realtime_results:
             results = dict(cached.get("results") or {})
-            results.update(realtime_results)
+            for sid, live in realtime_results.items():
+                previous = results.get(sid) or {}
+                completed_at = (
+                    previous.get("computed_at")
+                    if previous.get("as_of") == live.get("as_of") else None
+                )
+                # 实时行情可覆盖数量和明细，但不能抹掉同日已落盘扫描的完成凭据。
+                results[sid] = {**live, "computed_at": completed_at}
             cached = dict(cached)
             cached["results"] = results
             # 有实时数据时, 以最新时间戳为准
@@ -503,6 +519,9 @@ def get_cached_summary(request: Request):
         sid: {
             "total": int(result.get("total") or 0),
             "as_of": result.get("as_of"),
+            # 渐进式扫描写入的完成时间；实时叠加只保留同日已落盘的时间。
+            # 无完成时间的旧摘要不能解除本轮等待。
+            "computed_at": result.get("computed_at"),
         }
         for sid, result in results.items()
         if isinstance(result, dict)
@@ -623,6 +642,145 @@ def market_snapshot(request: Request):
     return {"as_of": str(as_of), "rows": rows}
 
 
+def _run_all_progressive(
+    *,
+    repo,
+    engine,
+    svc: ScreenerService,
+    as_of,
+    asset_type: str,
+    timeframe: str,
+    all_ids: list[str],
+    params_map: dict,
+    overrides_map: dict,
+    first_return_s: float,
+    t_total: float,
+    generation: strategy_cache.CacheGeneration,
+) -> dict:
+    """run_all 渐进式执行: 快策略随响应先返回, 慢策略后台算完逐个落缓存。
+
+    执行全程在单飞执行器里 (见 services/strategy_run_queue.py): 相同请求
+    搭车现有执行, 不同请求排队; HTTP 侧只轮询状态快照到首返时限。
+    """
+    data_dir = repo.store.data_dir
+    key = (str(data_dir.resolve()), asset_type, timeframe, str(as_of), tuple(sorted(all_ids)), (generation[0], tuple(sorted(generation[1].items()))))
+    ordered_ids = strategy_run_queue.order_strategy_ids(
+        all_ids, strategy_run_queue.load_run_timings(data_dir)
+    )
+
+    def job(handle: strategy_run_queue.StrategyRunHandle) -> None:
+        context = svc.build_strategy_context(
+            engine,
+            as_of,
+            ordered_ids,
+            timeframe=timeframe,
+            params_map=params_map,
+            overrides_map=overrides_map,
+        )
+        _ensure_context_has_current_data(context, as_of)
+        # 逐策略 run_all 不会把矩阵回写 context.market → 每个矩阵策略都会重建
+        # 全市场矩阵 (小服务器上单次数秒到十余秒)。这里按字段并集一次建好复用;
+        # FakeEngine 等无该方法的实现跳过 (保持旧行为)。
+        if getattr(context, "market", None) is None:
+            build_matrix = getattr(engine, "build_shared_matrix", None)
+            if callable(build_matrix):
+                matrix = build_matrix(
+                    context,
+                    [(sid, engine.get(sid)) for sid in ordered_ids],
+                    params_map,
+                    overrides_map,
+                )
+                if matrix is not None:
+                    context = replace(context, market=matrix)
+        all_results: dict[str, dict] = {}
+        elapsed_map: dict[str, float] = {}
+        for sid in ordered_ids:
+            t0 = time.perf_counter()
+            # 逐策略隔离: 单个策略崩溃 (如自定义代码的数据类型错误) 只记
+            # 错误跳过, 不让整批剩余策略陪葬 — 其余策略照常算完落缓存。
+            try:
+                single = engine.run_all(
+                    context,
+                    params_map=params_map,
+                    overrides_map=overrides_map,
+                    strategy_ids=[sid],
+                    parallel=False,
+                )
+                result = single[sid]
+            except Exception as e:
+                logger.warning("run_all: 策略 %s 执行失败, 跳过: %s", sid, e, exc_info=True)
+                handle.fail_one(sid, str(e))
+                continue
+            payload = {
+                "total": result.total,
+                "as_of": str(as_of),
+                "rows": _safe(asdict(result)).get("rows", []),
+                "computed_at": int(time.time() * 1000),
+                "asset_type": asset_type,
+                "timeframe": timeframe,
+            }
+            elapsed_map[sid] = (time.perf_counter() - t0) * 1000
+            # 逐策略增量落盘 (write_cache 同日按 sid 合并), 前端轮询即可逐个看到
+            try:
+                accepted = strategy_cache.write_cache(data_dir, str(as_of), {sid: payload},
+                    preserve_newer=True, latest_available_as_of=repo.enriched_latest_date,
+                    only_latest_available=True, expected_generation=generation)
+                if accepted is False:
+                    handle.fail_one(sid, "策略配置或数据版本已变化，请重新扫描")
+                    continue
+            except Exception:
+                logger.warning("run_all 渐进写入缓存失败: %s", sid, exc_info=True)
+                handle.fail_one(sid, "策略结果缓存写入失败，请重新扫描")
+                continue
+            all_results[sid] = payload
+            handle.complete(sid, {k: v for k, v in payload.items() if k != "rows"})
+        # 收尾: 与旧版口径一致的整体重写 + 耗时落盘供下次排序
+        if all_results:
+            with contextlib.suppress(Exception):
+                strategy_cache.write_cache(data_dir, str(as_of), all_results,
+                    preserve_newer=True, latest_available_as_of=repo.enriched_latest_date,
+                    only_latest_available=True, expected_generation=generation)
+        strategy_run_queue.record_run_timings(data_dir, elapsed_map)
+
+    handle = strategy_run_queue.MANAGER.get_or_submit(key, ordered_ids, job)
+    deadline = time.perf_counter() + first_return_s
+    snap = handle.snapshot()
+    while not snap["done"] and time.perf_counter() < deadline:
+        time.sleep(0.2)
+        snap = handle.snapshot()
+
+    done_results = snap["results"]
+    if snap["error"] and not done_results:
+        raise HTTPException(status_code=500, detail=snap["error"])
+    logger.info(
+        "run_all: first return %.1fms (%d done, %d pending)",
+        (time.perf_counter() - t_total) * 1000,
+        len(done_results),
+        len(snap["pending"]),
+    )
+    return {
+        "as_of": str(as_of),
+        "results": done_results,
+        "pending": snap["pending"],
+        "errors": snap["errors"],
+        "complete": snap["done"] and not snap["error"],
+        "error": snap["error"],
+        "started_at": snap["started_at_ms"],
+        "run_id": snap["run_id"],
+    }
+
+
+@router.get("/run_status")
+def get_run_status(request: Request, run_id: str = Query(..., min_length=1, max_length=64)):
+    """读取当前数据目录内一次渐进扫描的状态，包括首次响应后的逐策略失败。"""
+    scope = str(request.app.state.repo.store.data_dir.resolve())
+    status = strategy_run_queue.MANAGER.get_status(run_id, scope)
+    if status is None:
+        return {"run_id": run_id, "pending": [], "errors": {}, "done": True,
+                "error": "扫描状态已过期或服务已重启，请重新扫描"}
+    return {key: status[key] for key in ("run_id", "pending", "errors", "done", "error")}
+
+
 @router.post("/run_all")
 def run_all(request: Request, body: Optional[dict] = None):
     """批量运行指定策略；注册、路由和执行均由 StrategyEngine 负责。"""
@@ -642,7 +800,15 @@ def run_all(request: Request, body: Optional[dict] = None):
     # 解析日期
     raw_date = body.get("as_of")
     if raw_date:
-        as_of = date_type.fromisoformat(str(raw_date)) if isinstance(raw_date, str) else raw_date
+        # 与 /custom、/preset 的 `as_of: date` 同口径: 只收 ISO 日期字符串。
+        # 非字符串原样透传会让 str(as_of) 把 "20260904" 之类写进 strategy_cache.json,
+        # 与其它入口写的 "2026-09-04" 不是同一格式, 后续按 as_of 比对缓存永远失配。
+        if not isinstance(raw_date, str):
+            raise HTTPException(status_code=400, detail="as_of 必须是 YYYY-MM-DD 日期字符串")
+        try:
+            as_of = date_type.fromisoformat(raw_date)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
     else:
         as_of = svc.latest_date()
     if not as_of:
@@ -652,14 +818,23 @@ def run_all(request: Request, body: Optional[dict] = None):
     requested_ids = body.get("strategy_ids")
     if requested_ids and isinstance(requested_ids, list):
         all_ids = [str(sid) for sid in requested_ids]
-        unknown = [sid for sid in all_ids if not engine.has(sid)]
+        unknown = [
+            sid
+            for sid in all_ids
+            if not engine.has(sid)
+            or (
+                callable(getattr(engine, "get", None))
+                and getattr(engine.get(sid), "meta", {}).get("research_only")
+            )
+        ]
         if unknown:
             raise HTTPException(status_code=404, detail=f"unknown strategies: {unknown}")
     else:
         all_ids = [
             meta["id"]
             for meta in engine.list_strategies()
-            if asset_type in meta.get("asset_types", ["stock"])
+            if not meta.get("research_only")
+            and asset_type in meta.get("asset_types", ["stock"])
             and timeframe in meta.get("timeframes", ["1d"])
         ]
 
@@ -682,6 +857,28 @@ def run_all(request: Request, body: Optional[dict] = None):
         for sid in all_ids
     }
     overrides_map = {sid: all_overrides.get(sid, {}) for sid in all_ids}
+
+    # 渐进式返回 (页面首屏路径): 按历史耗时升序执行, 首返时限内算完的随响应
+    # 返回, 慢策略转后台继续算并逐个写入策略缓存, 前端轮询 cached-summary 点亮。
+    # 仅日线 + summary_only (策略页卡片) 启用; 分钟/明细请求保持整段阻塞。
+    first_return_s = settings.strategy_run_all_first_return_s
+    if (body.get("summary_only") and timeframe == "1d" and asset_type == "stock"
+            and as_of == repo.enriched_latest_date() and first_return_s > 0):
+        return _run_all_progressive(
+            repo=repo,
+            engine=engine,
+            svc=svc,
+            as_of=as_of,
+            asset_type=asset_type,
+            timeframe=timeframe,
+            all_ids=all_ids,
+            params_map=params_map,
+            overrides_map=overrides_map,
+            first_return_s=first_return_s,
+            t_total=t_total,
+            generation=cache_generation,
+        )
+
     try:
         context = svc.build_strategy_context(
             engine,
@@ -715,8 +912,8 @@ def run_all(request: Request, body: Optional[dict] = None):
     elapsed = (time.perf_counter() - t_total) * 1000
     logger.info("run_all: total took %.1fms (%d strategies)", elapsed, len(all_ids))
 
-    # 写入策略缓存 (供页面秒加载)。最新日期判断在缓存写锁内完成, 避免较早
-    # 任务在较新任务完成后回退共享快照。
+    # 仅股票日线结果写入共享缓存。最新日期判断在缓存写锁内完成, 避免较早
+    # 任务在较新任务完成后回退快照; ETF 与分钟结果保持请求内瞬态语义。
     if results and asset_type == "stock" and timeframe == "1d":
         strategy_cache.write_cache(
             data_dir,
@@ -854,7 +1051,9 @@ def limit_ladder(
     sealed_ready = False
     sealed_age: float | None = None
     if depth_svc:
-        sealed_map = depth_svc.get_sealed_map(as_of, is_down=is_down)
+        # 复用上方双方向计数已读取的 sealed map: 同一请求、同一 as_of、同一对象,
+        # 不再第三次读取 (内存路径含全量浅拷贝, parquet 路径含整文件读)。
+        sealed_map = down_map if is_down else up_map
         sealed_ready = bool(sealed_map) and depth_svc.is_sealed_ready(as_of)
         sealed_age = depth_svc.get_sealed_age(as_of) if sealed_ready else None
 
@@ -913,41 +1112,13 @@ def limit_ladder(
 
     df = df.with_columns(_one_word_limit_expr(status_main, df.columns).alias("is_one_word"))
 
-    # 动态 JOIN 扩展数据
-    ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []
+    # 复用策略结果的业务日期投影，历史请求不得读取未来分区或当前快照。
     ext_col_names: list[str] = []
-    if ext_specs:
-        db = repo.store.db
-        data_dir = repo.store.data_dir
-        from app.services.ext_data import ExtConfigStore
-
-        ext_store = ExtConfigStore(data_dir)
-        configs = {c.id: c for c in ext_store.load_all()}
-
-        for config_id, field_name in ext_specs:
-            view_name = f"ext_{config_id}"
-            ext_col_name = f"{config_id}__{field_name}"
-            try:
-                ext_df = pl.from_arrow(db.query(
-                    f"SELECT symbol, {quote_ident(field_name)} FROM {view_name}"
-                ).arrow())
-                if not ext_df.is_empty() and "symbol" in ext_df.columns:
-                    ext_df = ext_df.rename({field_name: ext_col_name})
-                    df = df.join(ext_df.select(["symbol", ext_col_name]), on="symbol", how="left")
-                    ext_col_names.append(ext_col_name)
-            except Exception:
-                cfg = configs.get(config_id)
-                if cfg:
-                    try:
-                        from app.api.ext_data import _parquet_glob
-                        glob = _parquet_glob(cfg, data_dir)
-                        ext_df = pl.read_parquet(glob)
-                        if not ext_df.is_empty() and "symbol" in ext_df.columns and field_name in ext_df.columns:
-                            ext_df = ext_df.select(["symbol", field_name]).rename({field_name: ext_col_name})
-                            df = df.join(ext_df, on="symbol", how="left")
-                            ext_col_names.append(ext_col_name)
-                    except Exception:
-                        pass
+    for out_col, values in _load_ext_value_maps(repo, ext_columns, as_of).items():
+        ext_frame = pl.DataFrame({"symbol": list(values), out_col: list(values.values())})
+        if not ext_frame.is_empty():
+            df = df.join(ext_frame, on="symbol", how="left")
+            ext_col_names.append(out_col)
 
     # 选择输出列
     cols = ["symbol", "name", "close", "change_pct", "boards", "status", consec_col, "sealed_status", "sealed_vol", "is_one_word"] + ext_col_names

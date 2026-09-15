@@ -11,18 +11,21 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, ValidationError, field_validator
+from starlette.concurrency import run_in_threadpool
 
 from app.api.monitor_rules import sync_engine
 from app.config import settings
 from app.services import (
+    execution_import,
     portfolio,
     portfolio_price_monitors,
     preferences,
     statement_import,
     watchlist,
 )
+from app.services.definition_transactions import definitions_transaction
 from app.services.stock_analyzer import analyze_stock_stream
 from app.strategy import monitor_rules
 
@@ -40,6 +43,7 @@ class _MonitorEngineSyncRetryState:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.generation = 0
+        self.pending_cleanup_symbols: set[str] = set()
         self.worker: threading.Thread | None = None
 
 
@@ -180,8 +184,19 @@ def _retry_monitor_engine_sync(
                 if state.stop_event.is_set():
                     return
                 generation = state.generation
+                pending_cleanup = set(state.pending_cleanup_symbols)
             try:
-                sync_engine(request)
+                # 与正常交易写入使用同一外层锁：持仓复检、规则删除及运行态同步
+                # 是一个线性化步骤，重新买入不能插入复检与删除之间。
+                with portfolio.mutation_guard():
+                    cleanup_targets = pending_cleanup - portfolio.held_symbols()
+                    if cleanup_targets:
+                        data_dir = request.app.state.repo.store.data_dir
+                        with definitions_transaction(data_dir), monitor_rules.locked():
+                            monitor_rules.delete_for_symbols(data_dir, cleanup_targets)
+                            sync_engine(request)
+                    else:
+                        sync_engine(request)
             except Exception:
                 if state.stop_event.is_set():
                     return
@@ -190,6 +205,7 @@ def _retry_monitor_engine_sync(
                 continue
             with state.lock:
                 if state.generation == generation:
+                    state.pending_cleanup_symbols.difference_update(pending_cleanup)
                     if state.worker is worker:
                         state.worker = None
                     released = True
@@ -228,13 +244,17 @@ def _start_monitor_engine_sync_retry_worker(
         raise
 
 
-def _schedule_monitor_engine_sync_retry(request: Request) -> None:
+def _schedule_monitor_engine_sync_retry(
+    request: Request,
+    cleanup_symbols: set[str] | None = None,
+) -> None:
     """每个应用仅保留一个重试线程,并确保新一代变更不会丢失。"""
     state = _monitor_engine_sync_retry_state(request)
     with state.lock:
         if state.stop_event.is_set():
             return
         state.generation += 1
+        state.pending_cleanup_symbols.update(cleanup_symbols or set())
         if state.worker is not None:
             return
         _start_monitor_engine_sync_retry_worker(request, state)
@@ -269,6 +289,7 @@ def stop_monitor_engine_sync_retry(app) -> None:
 def _cleanup_closed_position_rules(request: Request, held_before: set[str]) -> None:
     """交易落盘后清理规则,失败不得把已成功交易报告为失败。"""
     rules_changed = False
+    closed_symbols: set[str] = set()
     try:
         if not held_before:
             return
@@ -277,7 +298,7 @@ def _cleanup_closed_position_rules(request: Request, held_before: set[str]) -> N
             return
         store = getattr(request.app.state.repo, "store", None)
         data_dir = getattr(store, "data_dir", settings.data_dir)
-        with monitor_rules.locked():
+        with definitions_transaction(data_dir), monitor_rules.locked():
             rules_changed = bool(
                 monitor_rules.delete_for_symbols(data_dir, closed_symbols)
             )
@@ -285,11 +306,11 @@ def _cleanup_closed_position_rules(request: Request, held_before: set[str]) -> N
                 sync_engine(request)
     except Exception:
         logger.exception("closed position monitor rule cleanup failed")
-        if rules_changed:
+        if closed_symbols:
             try:
-                _schedule_monitor_engine_sync_retry(request)
+                _schedule_monitor_engine_sync_retry(request, closed_symbols)
             except Exception:
-                logger.exception("closed position monitor engine sync retry scheduling failed")
+                logger.exception("closed position monitor cleanup retry scheduling failed")
 
 
 @router.get("/accounts")
@@ -590,18 +611,24 @@ def list_price_monitors(request: Request):
 def save_price_monitor(symbol: str, body: PositionPriceMonitorRequest, request: Request):
     data_dir = request.app.state.repo.store.data_dir
     try:
-        with monitor_rules.locked():
-            item = portfolio_price_monitors.save_monitor(
-                data_dir,
-                symbol=symbol,
-                name=body.name,
-                asset_type=body.asset_type,
-                stop_loss_price=body.stop_loss_price,
-                add_position_price=body.add_position_price,
-                webhook_channels=list(body.webhook_channels),
-            )
-            sync_engine(request)
-        return item
+        asset_type = request.app.state.repo.resolve_asset_type(symbol)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="资产类型解析失败，请稍后重试") from exc
+    if asset_type not in {"stock", "etf"}:
+        raise HTTPException(status_code=422, detail=f"持仓价格监控不支持资产类型: {asset_type}")
+    if body.asset_type != asset_type:
+        raise HTTPException(status_code=422, detail="资产类型与证券代码不匹配")
+    try:
+        return portfolio_price_monitors.save_monitor(
+            data_dir,
+            symbol=symbol,
+            name=body.name,
+            asset_type=asset_type,
+            stop_loss_price=body.stop_loss_price,
+            add_position_price=body.add_position_price,
+            webhook_channels=list(body.webhook_channels),
+            reload_rules=lambda: sync_engine(request),
+        )
     except Exception as exc:
         raise _map_error(exc) from exc
 
@@ -620,3 +647,36 @@ def get_snapshot(
         )
     except Exception as exc:
         raise _map_error(exc) from exc
+
+
+@router.post("/execution-imports")
+async def import_executions(request: Request):
+    # 手动收敛校验错误,避免默认 422 的 input 字段回显来源账户或完整请求。
+    try:
+        body = execution_import.ExecutionImportRequest.model_validate(await request.json())
+    except (ValidationError, ValueError):
+        raise HTTPException(status_code=422, detail="成交导入请求格式无效,请核对 v1 字段和有限数值") from None
+    return await run_in_threadpool(_receive_executions, request, body)
+
+
+def _receive_executions(request: Request, body: execution_import.ExecutionImportRequest):
+    try:
+        with portfolio.mutation_guard():
+            result = execution_import.receive(request.app.state.repo, body)
+            if body.mode == "commit":
+                # 包含 duplicate 重试,以便重启或回执丢失后再次收敛清仓监控。
+                committed_ids = {row["trade_id"] for row in result["items"]}
+                sell_symbols = {
+                    trade["symbol"] for trade in portfolio.list_trades(account_id=body.account_id)
+                    if trade["id"] in committed_ids and trade["side"] == "sell"
+                }
+                _cleanup_closed_position_rules(request, sell_symbols)
+            return result
+    except execution_import.ExecutionImportConflict as exc:
+        return JSONResponse(status_code=409, content=exc.result)
+    except portfolio.PortfolioNotFoundError:
+        raise HTTPException(status_code=404, detail="目标账户不存在") from None
+    except portfolio.PortfolioConflictError:
+        raise HTTPException(status_code=409, detail="账本无法安全导入,请在 Trading Copilot 核对并修复") from None
+    except Exception:
+        raise HTTPException(status_code=500, detail="成交导入失败,请使用原批次重试") from None

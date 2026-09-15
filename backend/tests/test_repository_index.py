@@ -1,4 +1,6 @@
 """指数资产路由 — repository 层测试。"""
+import os
+
 import polars as pl
 import pytest
 
@@ -44,7 +46,63 @@ def test_name_map_stock_beats_index(repo):
     assert repo.get_name_map(["600000.SH"]).get("600000.SH") == "浦发银行"
 
 
+def _write_stock_instruments(repo, symbols, names):
+    pl.DataFrame({
+        "symbol": symbols, "name": names, "code": [s[:6] for s in symbols],
+        "exchange": ["SH"] * len(symbols), "region": ["CN"] * len(symbols),
+        "type": ["stock"] * len(symbols),
+        "listing_date": [None] * len(symbols), "total_shares": [None] * len(symbols),
+        "float_shares": [None] * len(symbols), "tick_size": [None] * len(symbols),
+        "limit_up": [None] * len(symbols), "limit_down": [None] * len(symbols),
+        "as_of": ["2026-08-14"] * len(symbols),
+    }).write_parquet(repo.store.data_dir / "instruments" / "instruments.parquet")
+    repo._refresh_instruments()
+
+
+def test_name_map_partial_query_does_not_poison_cache(repo):
+    """带 symbols 的部分查询不能把残缺映射写入缓存 (自选新加股票无名称的回归).
+
+    旧 bug: 首次 get_name_map(["600000.SH"]) 把只含 600000 的映射缓存住,
+    之后自选加入 000001.SZ 再查名称命中残缺缓存 → name=None。
+    """
+    _write_stock_instruments(repo, ["600000.SH", "000001.SZ"], ["浦发银行", "平安银行"])
+    first = repo.get_name_map(["600000.SH"])
+    assert first == {"600000.SH": "浦发银行"}
+    # 缓存必须是全量: 后续其他 symbols 查询仍能命中
+    second = repo.get_name_map(["000001.SZ"])
+    assert second == {"000001.SZ": "平安银行"}
+    full = repo.get_name_map()
+    assert full == {"600000.SH": "浦发银行", "000001.SZ": "平安银行"}
+
+
+def test_name_map_cache_invalidated_on_instruments_refresh(repo):
+    """维表刷新后缓存必须失效: 新收录的股票能立刻查到名称。"""
+    _write_stock_instruments(repo, ["600000.SH"], ["浦发银行"])
+    assert repo.get_name_map(["600000.SH"]) == {"600000.SH": "浦发银行"}
+    _write_stock_instruments(repo, ["600000.SH", "301999.SZ"], ["浦发银行", "新股股份"])
+    assert repo.get_name_map(["301999.SZ"]) == {"301999.SZ": "新股股份"}
+
+
 import datetime as _dt
+
+
+def test_execute_one_releases_parquet_file(repo):
+    minute_dir = repo.store.data_dir / "kline_minute" / "date=2026-07-23"
+    minute_dir.mkdir(parents=True, exist_ok=True)
+    part = minute_dir / "part.parquet"
+    replacement = minute_dir / "part.parquet.tmp"
+    minute = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "datetime": [_dt.datetime(2026, 7, 23, 9, 30)],
+        "close": [10.0],
+    })
+    minute.write_parquet(part)
+    repo.rebuild_views()
+
+    assert repo.execute_one("SELECT max(datetime) FROM kline_minute")[0] == _dt.datetime(2026, 7, 23, 9, 30)
+
+    minute.write_parquet(replacement)
+    os.replace(replacement, part)
 
 
 def _write_index_enriched(repo, dates_rows):
@@ -71,6 +129,30 @@ def test_get_enriched_latest_asset_index(repo):
     assert str(dt) == "2026-07-24"
     assert df["symbol"].to_list() == ["000001.SH"]
     assert "ma5" in df.columns or "rsi_14" in df.columns  # 重算产出指标列
+
+
+def test_get_daily_asset_before_returns_last_actual_partition(repo):
+    """前序日 K 查询应直接定位最后一条实际记录，不受停牌天数影响。"""
+    for ds, raw_close in (("2026-05-20", 9.8), ("2026-08-10", 10.2)):
+        target = repo.store.data_dir / "kline_daily_enriched" / f"date={ds}"
+        target.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({
+            "symbol": ["600000.SH"],
+            "date": [_dt.date.fromisoformat(ds)],
+            "raw_close": [raw_close],
+        }).write_parquet(target / "part.parquet")
+
+    result = repo.get_daily_asset_before(
+        "stock",
+        "600000.SH",
+        _dt.date(2026, 8, 10),
+        columns=["date", "raw_close"],
+    )
+
+    assert result.to_dicts() == [{
+        "date": _dt.date(2026, 5, 20),
+        "raw_close": 9.8,
+    }]
 
 
 def test_get_enriched_latest_asset_index_cold_no_refresh(repo):
@@ -106,4 +188,3 @@ def test_merge_live_enriched_asset_index_merges_cache(repo):
     cached, dt = repo.get_enriched_latest_asset("index", refresh=False)
     assert str(dt) == "2026-07-25"
     assert set(cached["symbol"].to_list()) == {"000001.SH", "000300.SH"}
-

@@ -10,6 +10,10 @@ const RULE_TYPE_LABEL: Record<MonitorRule['type'], string> = {
   market: '异动',
   strategy: '策略',
   ladder: '封单',
+  sector: '板块',
+  abnormal: '异动边缘',
+  volume_delta: '轮询放量',
+  date: '日期提醒',
 }
 
 const RULE_TYPE_STYLE: Record<MonitorRule['type'], string> = {
@@ -18,6 +22,10 @@ const RULE_TYPE_STYLE: Record<MonitorRule['type'], string> = {
   market: 'border-purple-400/20 bg-purple-400/[0.06] text-purple-400',
   strategy: 'border-amber-400/20 bg-amber-400/[0.06] text-amber-400',
   ladder: 'border-warning/20 bg-warning/[0.06] text-warning',
+  sector: 'border-cyan-500/20 bg-cyan-500/[0.06] text-cyan-500',
+  abnormal: 'border-orange-500/20 bg-orange-500/[0.06] text-orange-500',
+  volume_delta: 'border-rose-500/20 bg-rose-500/[0.06] text-rose-400',
+  date: 'border-violet-500/20 bg-violet-500/[0.06] text-violet-500',
 }
 
 const STRATEGY_EVENT_LABEL: Readonly<Record<string, string>> = {

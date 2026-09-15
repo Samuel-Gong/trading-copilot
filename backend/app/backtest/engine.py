@@ -26,6 +26,7 @@ from app.backtest.matrix import (
     load_market_data_matrix_from_parquet,
 )
 from app.config import settings
+from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
 
@@ -213,8 +214,11 @@ class PanelCache:
         columns: list[str] | None,
         compute_fn,
         asset_type: str = "stock",
+        generation: str | None = None,
     ) -> pl.DataFrame:
-        key = self._make_key(symbols, start, end, columns, asset_type)
+        key = self._make_key(
+            symbols, start, end, columns, asset_type, generation
+        )
         now = time.monotonic()
 
         with self._lock:
@@ -280,13 +284,28 @@ class PanelCache:
             self._cache.clear()
 
     @staticmethod
-    def _make_key(symbols: list[str] | None, start: date, end: date, columns: list[str] | None, asset_type: str = "stock") -> str:
+    def _make_key(
+        symbols: list[str] | None,
+        start: date,
+        end: date,
+        columns: list[str] | None,
+        asset_type: str = "stock",
+        generation: str | None = None,
+    ) -> str:
         if symbols is None:
             h = "all"
         else:
             h = hashlib.md5(",".join(sorted(symbols)).encode()).hexdigest()[:12]
         cols = "all" if columns is None else hashlib.md5(",".join(sorted(columns)).encode()).hexdigest()[:8]
-        return f"{asset_type}:{h}:{start}:{end}:{cols}"
+        return f"{asset_type}:{generation or 'unmanaged'}:{h}:{start}:{end}:{cols}"
+
+
+# 等待进行中 enriched 发布的上限与轮询间隔。孤儿标记由 get_enriched_generation
+# 在读取时直接自愈, 因此这里等到的 EnrichedGenerationUnavailableError 意味着
+# 发布方确实存活 —— 对回测/优化这类长任务, 有界等待优于立即失败。仅用于
+# worker 任务路径 (矩阵加载), 实时热路径不得调用 data_generation_await。
+_GENERATION_WAIT_TIMEOUT_S = 300.0
+_GENERATION_POLL_S = 1.0
 
 
 # ================================================================
@@ -302,6 +321,42 @@ class BacktestEngine:
 
     # ── 数据加载 ──────────────────────────────────────
 
+    def data_generation(self, asset_type: str = "stock") -> str | None:
+        loader = getattr(self.repo, "get_matrix_data_generation", None)
+        return loader(asset_type) if callable(loader) else None
+
+    def data_generation_await(
+        self,
+        asset_type: str = "stock",
+        *,
+        cancel_event: threading.Event | None = None,
+        timeout_s: float = _GENERATION_WAIT_TIMEOUT_S,
+    ) -> str | None:
+        """获取 generation; 发布进行中时在超时窗口内轮询, 可被取消事件打断。"""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                return self.data_generation(asset_type)
+            except EnrichedGenerationUnavailableError:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_GENERATION_POLL_S)
+
+    def assert_data_generation(
+        self,
+        asset_type: str,
+        expected: str | None,
+    ) -> None:
+        if expected is None:
+            return
+        current = self.data_generation(asset_type)
+        if current != expected:
+            raise EnrichedGenerationUnavailableError(
+                "enriched data changed while the snapshot was being read"
+            )
+
     def load_panel(
         self,
         symbols: list[str] | None,
@@ -309,9 +364,36 @@ class BacktestEngine:
         end: date,
         columns: list[str] | None = None,
         asset_type: str = "stock",
+        *,
+        expected_generation: str | None = None,
     ) -> pl.DataFrame:
         """加载 enriched 数据面板，带缓存。asset_type='etf' 时读 ETF enriched。"""
-        return self._cache.get_or_compute(symbols, start, end, columns, self._load_panel_inner, asset_type=asset_type)
+        attempts = 1 if expected_generation is not None else 2
+        for attempt in range(attempts):
+            generation = (
+                expected_generation
+                if expected_generation is not None
+                else self.data_generation(asset_type)
+            )
+            panel = self._cache.get_or_compute(
+                symbols,
+                start,
+                end,
+                columns,
+                self._load_panel_inner,
+                asset_type=asset_type,
+                generation=generation,
+            )
+            try:
+                self.assert_data_generation(asset_type, generation)
+            except EnrichedGenerationUnavailableError:
+                if attempt + 1 >= attempts:
+                    raise
+                continue
+            return panel
+        raise EnrichedGenerationUnavailableError(
+            "unable to read a stable enriched data snapshot"
+        )
 
     def load_panel_for_backtest(
         self,
@@ -337,6 +419,25 @@ class BacktestEngine:
         )
         if df.is_empty():
             return df
+
+        from app.backtest.fundamentals import (
+            attach_fundamental_factors,
+            load_fundamental_snapshot,
+        )
+
+        fundamental_names = sorted(
+            getattr(feature_plan, "fundamental_columns", frozenset())
+            or frozenset()
+        )
+        if fundamental_names:
+            # 财务因子列不落 enriched 存储, 在加载口按公告日门控并入。
+            df = attach_fundamental_factors(
+                df,
+                load_fundamental_snapshot(
+                    self.repo.store.data_dir if self.repo is not None else None
+                ),
+                fundamental_names,
+            )
 
         instruments = (
             self.repo.get_instruments_asset(asset_type)
@@ -402,6 +503,8 @@ class BacktestEngine:
         cache_profile: MatrixCacheProfile | None = None,
         coverage_start: date | None = None,
         coverage_end: date | None = None,
+        expected_generation: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> MarketDataMatrix:
         """Load a matrix-native backtest directly from projected parquet batches."""
         if feature_plan.execution_backend != "matrix_native":
@@ -430,36 +533,65 @@ class BacktestEngine:
             if cache_profile is not None
             else settings.backtest_matrix_cache_max_mb * 1024 * 1024
         )
-        generation_loader = getattr(self.repo, "get_matrix_data_generation", None)
         source_generation = (
-            generation_loader(asset_type)
-            if cache_root is not None and callable(generation_loader)
-            else None
+            expected_generation
+            if expected_generation is not None
+            else self.data_generation_await(asset_type, cancel_event=cancel_event)
         )
-        try:
-            return load_market_data_matrix_from_parquet(
-                parquet_root,
-                start,
-                end,
-                field_columns=field_columns,
-                symbols=symbols,
-                instruments=instruments,
-                cache_root=cache_root,
-                coverage_start=coverage_start,
-                coverage_end=coverage_end,
-                cache_field_columns=cache_fields,
-                cache_max_bytes=cache_max_bytes,
-                profile_generation=(
-                    cache_profile.generation if cache_profile is not None else "request"
-                ),
-                source_generation=source_generation,
-            )
-        except pa.ArrowException as exc:
-            raise ValueError(f"direct market matrix parquet scan failed: {exc}") from exc
+        attempts = 1 if expected_generation is not None else 2
+        for attempt in range(attempts):
+            try:
+                market = load_market_data_matrix_from_parquet(
+                    parquet_root,
+                    start,
+                    end,
+                    field_columns=field_columns,
+                    symbols=symbols,
+                    instruments=instruments,
+                    cache_root=cache_root,
+                    coverage_start=coverage_start,
+                    coverage_end=coverage_end,
+                    cache_field_columns=cache_fields,
+                    cache_max_bytes=cache_max_bytes,
+                    profile_generation=(
+                        cache_profile.generation if cache_profile is not None else "request"
+                    ),
+                    source_generation=source_generation,
+                    cancel_event=cancel_event,
+                )
+                self.assert_data_generation(asset_type, source_generation)
+                from app.backtest.fundamentals import attach_matrix_fundamental_fields
+
+                fundamental_names = sorted(
+                    getattr(feature_plan, "fundamental_columns", frozenset())
+                    or frozenset()
+                )
+                if fundamental_names:
+                    # 财务因子不落 enriched 存储: 矩阵加载后按公告日门控附加字段。
+                    market = attach_matrix_fundamental_fields(
+                        market,
+                        self.repo.store.data_dir if self.repo is not None else None,
+                        fundamental_names,
+                    )
+                return market
+            except EnrichedGenerationUnavailableError:
+                if attempt + 1 >= attempts:
+                    raise
+                source_generation = self.data_generation_await(
+                    asset_type, cancel_event=cancel_event
+                )
+            except pa.ArrowException as exc:
+                raise ValueError(f"direct market matrix parquet scan failed: {exc}") from exc
+        raise EnrichedGenerationUnavailableError(
+            "unable to read a stable enriched matrix snapshot"
+        )
 
     def cache_stats(self) -> dict:
         """暴露 PanelCache 遥测快照 (扫盘耗时/次数/命中/复用), 供上层量化 IO 占比。"""
         return self._cache.stats()
+
+    def clear_panel_cache(self) -> None:
+        self._cache.invalidate()
 
     def _load_panel_inner(
         self,
@@ -705,6 +837,14 @@ class BacktestEngine:
             matrix, raw_candidates, config, progress_cb, cancel_event,
         )
 
+    @staticmethod
+    def _resolve_entry_prices(matrix: MarketMatrix, config: MatcherConfig) -> np.ndarray:
+        """入场价矩阵: 分钟策略的逐格覆盖有限值处优先, 否则按 open/close 惯例。"""
+        base = matrix.open if config.entry_fill == "open_t+1" else matrix.close
+        if matrix.entry_price is None:
+            return base
+        return np.where(np.isfinite(matrix.entry_price), matrix.entry_price, base)
+
     def _simulate_independent_matrix(
         self,
         matrix: MarketMatrix,
@@ -715,7 +855,7 @@ class BacktestEngine:
         options: SimulationOptions | None = None,
     ) -> SimResult:
         options = options or SimulationOptions()
-        entry_prices = matrix.open if config.entry_fill == "open_t+1" else matrix.close
+        entry_prices = self._resolve_entry_prices(matrix, config)
         exit_prices = matrix.open if config.exit_fill == "open_t+1" else matrix.close
         buy_cost_pct = config.buy_cost_pct()
         sell_cost_pct = config.sell_cost_pct()
@@ -1614,7 +1754,7 @@ class BacktestEngine:
     ) -> SimResult:
         options = options or SimulationOptions()
         time_count, asset_count = matrix.shape
-        entry_prices = matrix.open if config.entry_fill == "open_t+1" else matrix.close
+        entry_prices = self._resolve_entry_prices(matrix, config)
         exit_prices = matrix.open if config.exit_fill == "open_t+1" else matrix.close
         buy_cost_pct = config.buy_cost_pct()
         sell_cost_pct = config.sell_cost_pct()

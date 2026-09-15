@@ -1,4 +1,4 @@
-"""AI 大盘复盘 API — 流式复盘 + 报告持久化。
+"""AI 大盘复盘 API — 流式复盘 + 报告持久化 + 龙虎榜 + 盘前风向标。
 
 路由前缀: /api/market-recap
 
@@ -7,16 +7,19 @@
   GET  /reports                历史复盘列表
   POST /reports                保存一条复盘报告
   DELETE /reports/{report_id}  删除一条复盘报告
+  GET  /dragon-tiger           龙虎榜三榜 (fuyao 专有, 历史按日缓存)
+  GET  /auction-benchmark      盘前风向标 (fuyao 专有, 含当日/次日真实收益)
 """
 from __future__ import annotations
 
 import logging
+from datetime import date as date_cls
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.services import market_recap_reports
+from app.services import auction_benchmark, dragon_tiger, market_recap_reports, preferences
 from app.services.market_recap import recap_market_stream
 
 logger = logging.getLogger(__name__)
@@ -28,6 +31,46 @@ class AnalyzeRequest(BaseModel):
     """AI 大盘复盘请求。"""
     as_of: str | None = None  # 可选:复盘日期(YYYY-MM-DD),缺省取最新有数据日
     focus: str = ""           # 可选:用户追加的复盘关注点
+
+
+@router.get("/dragon-tiger")
+def get_dragon_tiger(
+    request: Request,
+    date: str | None = Query(default=None, description="复盘目标日 YYYY-MM-DD, 缺省取最近已发布交易日"),
+):
+    """龙虎榜三榜 (全部/机构/游资)。fuyao 专有, 未配置时 state=source_unavailable。
+
+    非交易日/当日未发布由服务层自动回退到上一交易日 (state=fallback_prev)。
+    """
+    target = None
+    if date:
+        try:
+            target = date_cls.fromisoformat(date)
+        except ValueError as exc:
+            raise HTTPException(400, f"date 格式应为 YYYY-MM-DD, 收到: {date}") from exc
+    return dragon_tiger.get_dragon_tiger(
+        request.app.state.repo.store.data_dir, target
+    )
+
+
+@router.get("/auction-benchmark")
+def get_auction_benchmark(
+    request: Request,
+    date: str | None = Query(default=None, description="复盘目标日 YYYY-MM-DD, 缺省取最近交易日"),
+):
+    """盘前风向标 (同花顺竞价筛选名单 + 当日/次日真实收益)。
+
+    fuyao 专有, 未配置时 state=source_unavailable; 非交易日由服务层自动回退。
+    """
+    target = None
+    if date:
+        try:
+            target = date_cls.fromisoformat(date)
+        except ValueError as exc:
+            raise HTTPException(400, f"date 格式应为 YYYY-MM-DD, 收到: {date}") from exc
+    return auction_benchmark.get_auction_benchmark(
+        request.app.state.repo.store.data_dir, target
+    )
 
 
 @router.post("/analyze")
@@ -79,6 +122,7 @@ class SaveReportRequest(BaseModel):
     summary: str = ""
     emotion_score: int | None = None
     emotion_label: str = ""
+    push: bool = False  # 是否显式外发推送(manual 模式下需显式传 true)
 
 
 @router.get("/reports")
@@ -89,7 +133,7 @@ def list_reports(request: Request):
 
 @router.post("/reports")
 def save_report(request: Request, req: SaveReportRequest):
-    """保存一条复盘报告。"""
+    """保存一条复盘报告。req.push=True 或 review_push_mode=auto 时才推送到外部渠道。"""
     report = market_recap_reports.save_report({
         "as_of": req.as_of,
         "focus": req.focus,
@@ -98,13 +142,14 @@ def save_report(request: Request, req: SaveReportRequest):
         "emotion_score": req.emotion_score,
         "emotion_label": req.emotion_label,
     })
-    # 推送到飞书(可选): 与定时复盘共用同一开关 review_push_enabled 与 _maybe_push_review。
+    # 推送门控: manual 模式需显式 push=True; auto 模式保持归档即推。
     # 内部 try/except 静默降级, 不影响归档返回值。
-    from app.jobs.daily_pipeline import _maybe_push_review
-    _maybe_push_review(req.content, {
-        "as_of": req.as_of,
-        "emotion_label": req.emotion_label,
-    })
+    if req.push or preferences.get_review_push_mode() == "auto":
+        from app.jobs.daily_pipeline import _maybe_push_review
+        _maybe_push_review(req.content, {
+            "as_of": req.as_of,
+            "emotion_label": req.emotion_label,
+        })
     return {"ok": True, "report": report}
 
 

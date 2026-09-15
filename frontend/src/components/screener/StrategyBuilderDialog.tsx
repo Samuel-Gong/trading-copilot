@@ -94,9 +94,13 @@ META = {
     "asset_types": ["stock"],
     "timeframes": ["1d"],
     "basic_filter": {
-        "price_min": 3, "price_max": 200,
-        "market_cap_min": 10e8, "amount_min": 0.5e8,
+        "price_min": 5, "price_max": 200,
+        "market_cap_min": None,
+        "float_cap_min": 30e8, "float_cap_max": 1500e8,
+        "amount_min": None,
+        "turnover_min": 1,
         "exclude_st": True, "exclude_new_days": 30,
+        "boards": ["沪主板", "深主板", "创业板", "科创板"],
     },
     "params": [],
     "scoring": {
@@ -112,7 +116,6 @@ ENTRY_SIGNALS = ["signal_n_day_high"]
 EXIT_SIGNALS = ["signal_ma20_breakdown"]
 STOP_LOSS = -0.05
 MAX_HOLD_DAYS = 20
-ALERTS = []
 
 RULES = """
 1. 规则一
@@ -138,6 +141,15 @@ META = {
     "tags": ["自定义", "矩阵"],
     "asset_types": ["stock"],
     "timeframes": ["1d"],
+    "basic_filter": {
+        "price_min": 5, "price_max": 200,
+        "market_cap_min": None,
+        "float_cap_min": 30e8, "float_cap_max": 1500e8,
+        "amount_min": None,
+        "turnover_min": 1,
+        "exclude_st": True, "exclude_new_days": 30,
+        "boards": ["沪主板", "深主板", "创业板", "科创板"],
+    },
     "params": [],
     "scoring": {},
     "order_by": "score",
@@ -150,7 +162,6 @@ ENTRY_SIGNALS = []
 EXIT_SIGNALS = []
 STOP_LOSS = -0.05
 MAX_HOLD_DAYS = 20
-ALERTS = []
 
 class CustomMatrixStrategy:
     def required_fields(self) -> frozenset[str]:
@@ -169,7 +180,7 @@ MATRIX_STRATEGY = CustomMatrixStrategy()
 interface Props {
   open: boolean
   onClose: () => void
-  onSavedId?: (id: string) => void | Promise<void>
+  onSavedId?: (id: string, researchOnly?: boolean) => void | Promise<void>
   mode?: 'create' | 'modify'
   existingStrategyIds?: ReadonlySet<string>
 }
@@ -363,7 +374,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
       const target = mode === 'modify' ? source : (tab === 'custom' ? 'custom' : 'ai')
       const id = resolveStrategyId(target)
       setStrategyId(id); setSource(target)
-      await api.strategySaveCodeV2({
+      const savedResult = await api.strategySaveCodeV2({
         strategy_id: id,
         code: draftCode,
         target_source: target,
@@ -376,7 +387,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
       const genRules = parseRules(draftCode)
       const finalRules = (genRules || rules).trim()
       if (finalRules) { const saved = storage.strategyRules.get({}); saved[id] = finalRules; storage.strategyRules.set(saved) }
-      await onSavedId?.(id)
+      await onSavedId?.(id, savedResult.research_only)
       setTimeout(() => onClose(), 1000)
     } catch (e: any) { setError(String(e?.message ?? '保存失败')) }
     setSaving(false)
@@ -598,7 +609,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                     AI 修改
                   </button>
                 </div>
-                <p className="text-[10px] text-muted/40">修改指令可调整参数、信号、告警、评分等任意内容。确认无误后点击「保存策略」。</p>
+                <p className="text-[10px] text-muted/40">修改指令可调整参数、信号、评分等任意内容。确认无误后点击「保存策略」。</p>
               </>
             )}
             </>

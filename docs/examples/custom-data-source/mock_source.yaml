@@ -4,11 +4,20 @@ auth:
   type: none
 
 datasets:
+  instruments:
+    url: http://127.0.0.1:3021/instruments
+    method: GET
+    response_path: data
+    field_map:
+      ts_code: symbol
+      name: name
+
   daily:
     url: http://127.0.0.1:3021/daily
     method: POST
     batch: 100
     rpm: 200
+    volume_unit: lots
     response_path: data
     field_map:
       ts_code: symbol
@@ -27,6 +36,7 @@ datasets:
     method: POST
     batch: 100
     rpm: 200
+    adj_factor_kind: event_ratio
     response_path: data
     field_map:
       ts_code: symbol
@@ -39,6 +49,8 @@ datasets:
     url: http://127.0.0.1:3021/realtime
     method: GET
     rpm: 60
+    pct_unit: decimal
+    volume_unit: lots
     response_path: data
     field_map:
       ts_code: symbol

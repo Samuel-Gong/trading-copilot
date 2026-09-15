@@ -110,3 +110,12 @@ export function createScreenerRequestCoordinator<T extends object>() {
     },
   }
 }
+
+/** 只有本轮计算完成的摘要才能解除等待，旧缓存和监控覆盖值不代表后台进度。 */
+export function isProgressiveResultCurrent(
+  result: { as_of?: string; computed_at?: number | null } | undefined,
+  asOf: string,
+  startedAt: number,
+): boolean {
+  return result?.as_of === asOf && result.computed_at != null && result.computed_at >= startedAt
+}

@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import re
+import logging
+from collections.abc import Callable
 from pathlib import Path
 
+from app.services.definition_transactions import definitions_transaction
+from app.services.fs_utils import atomic_write_text
 from app.strategy import monitor_rules
+
+logger = logging.getLogger(__name__)
 
 _SYMBOL_RE = re.compile(r"^\d{6}\.(SH|SZ|BJ)$")
 _STOP_PREFIX = "pf_stop_"
@@ -111,6 +117,7 @@ def save_monitor(
     stop_loss_price: float,
     add_position_price: float | None,
     webhook_channels: list[str],
+    reload_rules: Callable[[], None] | None = None,
 ) -> dict:
     normalized_symbol = symbol.strip().upper()
     if not _SYMBOL_RE.fullmatch(normalized_symbol):
@@ -172,16 +179,41 @@ def save_monitor(
     if add_rule is not None:
         monitor_rules.validate(add_rule)
 
-    for rule in (stop_rule, add_rule):
-        if rule is None:
-            continue
-        existing = monitor_rules.load_one(data_dir, rule["id"])
-        if existing and existing.get("created_at"):
-            rule["created_at"] = existing["created_at"]
-        monitor_rules.save_one(data_dir, rule)
-    if add_rule is None:
-        monitor_rules.delete_one(data_dir, _rule_id("add_position", normalized_symbol))
-
-    return next(
-        item for item in list_monitors(data_dir) if item["symbol"] == normalized_symbol
+    rule_paths = tuple(
+        data_dir / "user_data" / "monitor_rules" / f"{_rule_id(kind, normalized_symbol)}.json"
+        for kind in ("stop_loss", "add_position")
     )
+    with definitions_transaction(data_dir), monitor_rules.locked():
+        snapshot = {
+            path: path.read_bytes() if path.exists() else None
+            for path in rule_paths
+        }
+        try:
+            for rule in (stop_rule, add_rule):
+                if rule is None:
+                    continue
+                existing = monitor_rules.load_one(data_dir, rule["id"])
+                if existing and existing.get("created_at"):
+                    rule["created_at"] = existing["created_at"]
+                monitor_rules.save_one(data_dir, rule)
+            if add_rule is None:
+                monitor_rules.delete_one(data_dir, _rule_id("add_position", normalized_symbol))
+            item = next(
+                value for value in list_monitors(data_dir)
+                if value["symbol"] == normalized_symbol
+            )
+            if reload_rules is not None:
+                reload_rules()
+            return item
+        except Exception:
+            for path, content in snapshot.items():
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write_text(path, content.decode("utf-8"))
+            if reload_rules is not None:
+                try:
+                    reload_rules()
+                except Exception:
+                    logger.exception("恢复持仓价格监控规则后重载引擎失败")
+            raise

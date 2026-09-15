@@ -2,7 +2,8 @@
 
 调度:
   09:10 盘前 — 同步个股维表 instruments (全量覆盖)
-  15:30 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
+  15:35 盘后 — 日K同步 + 增量除权因子 + enriched 计算 + 刷新视图
+  (默认 15:35: 盘后固定价 15:30 终止 + 供应商日线定稿缓冲, 见 preferences)
 
 盘后同步策略:
   日 K: QuoteService 交易时段已实时落盘 → 有数据时跳过 batch,首次拉 1 年区间
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -19,9 +21,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.indicators.pipeline import run_pipeline
+from app.indicators.pipeline import filter_halt_days, run_pipeline
+from app.enriched_generation import EnrichedPublication
 from app.config import settings
+from app.market_time import cn_today
 from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
+from app.services.enriched_job import run_enriched_job_with_repository_refresh
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
 from app.tickflow.repository import KlineRepository
@@ -29,6 +34,106 @@ from app.tickflow.repository import KlineRepository
 logger = logging.getLogger(__name__)
 
 ProgressCb = Callable[..., None]
+
+
+def _prune_partial_enriched_partitions(
+    daily_dir: Path,
+    enriched_dir: Path,
+    publication: EnrichedPublication | None = None,
+) -> list[str]:
+    """删除 symbol 覆盖不完整的 enriched 日期分区, 返回被删的日期 (#223)。
+
+    自选实时路径会在全市场 enriched 生成前提前创建当日分区 (只有几只自选),
+    仅按日期目录计数比较会把它误判为完整分区而跳过计算, 造成日K缺失与
+    均线错误。按与加工相同的停牌过滤口径检查 symbol 覆盖, 不能直接比较
+    行数: 正常剔除停牌记录会让 enriched 少行, 导致每次管道都删除重算。
+    删除后 run_pipeline(new_dates_only=True) 会把它们当"新日期"全市场补齐。
+    daily 同日分区不存在 (今日日K尚未同步) 时不处理, 留给当日正常流程。
+    """
+
+    owned = publication is None
+    publication = publication or EnrichedPublication(
+        enriched_dir.parent, "stock", recover=True, scope="pipeline-prune"
+    )
+
+
+    pruned: list[str] = []
+    for part in enriched_dir.glob("date=*"):
+        daily_part = daily_dir / part.stem
+        if not daily_part.exists():
+            continue
+        try:
+            expected: set[str] = set()
+            # 每次只读单文件的停牌判定列, 不加载全历史或指标宽表。
+            for path in daily_part.glob("*.parquet"):
+                schema = pl.read_parquet_schema(path)
+                if not {"symbol", "open", "high"}.issubset(schema):
+                    raise ValueError("daily 缺少 symbol/open/high, 无法判断有效标的覆盖")
+                columns = [c for c in ("symbol", "open", "high", "volume", "amount") if c in schema]
+                daily = pl.read_parquet(path, columns=columns)
+                expected.update(filter_halt_days(daily)["symbol"].drop_nulls().to_list())
+            actual: set[str] = set()
+            for path in part.glob("*.parquet"):
+                actual.update(pl.read_parquet(path, columns=["symbol"])["symbol"].drop_nulls().to_list())
+        except Exception as e:
+            logger.warning("enriched 覆盖检查跳过 %s, 保留分区: %s", part.name, e)
+            continue
+        if expected - actual:
+            publication.delete_tree(part)
+            pruned.append(part.stem.split("=")[1])
+    if owned:
+        publication.commit()
+    return pruned
+
+
+def _prune_stale_price_partitions(
+    daily_dir: Path,
+    enriched_dir: Path,
+    max_dates: int = 5,
+    publication: EnrichedPublication | None = None,
+) -> list[str]:
+    """删除收盘价与官方日线不一致的 enriched 日期分区。
+
+    实时 flush 写入的当日分区行数与 daily 相同, 但收盘价可能停留在收盘集合
+    竞价前的快照 (实测: TickFlow 实时端点收盘后仍长期返回旧价, 3392/5554 只
+    股票当日收盘价与官方日线不符), #223 的行数校验识别不到。对最近若干交易日
+    做值级比对: enriched.raw_close 与 daily.close 任一标的差超过半个最小报价
+    单位即删分区, 由后续增量重算按官方日线全市场重建。
+    """
+    owned = publication is None
+    publication = publication or EnrichedPublication(
+        enriched_dir.parent, "stock", recover=True, scope="pipeline-prune"
+    )
+
+    common = sorted(
+        (
+            p.stem.split("=", 1)[1]
+            for p in enriched_dir.glob("date=*")
+            if (daily_dir / p.stem).exists()
+        ),
+        reverse=True,
+    )[:max_dates]
+    pruned: list[str] = []
+    for ds in common:
+        try:
+            daily = pl.read_parquet(
+                daily_dir / f"date={ds}" / "*.parquet", columns=["symbol", "close"]
+            )
+            enr = pl.read_parquet(
+                enriched_dir / f"date={ds}" / "*.parquet", columns=["symbol", "raw_close"]
+            )
+        except Exception:
+            continue  # 列缺失/不可读 → 交给既有完整性检查兜底
+        joined = enr.join(daily, on="symbol", how="inner").drop_nulls()
+        if joined.is_empty():
+            continue
+        bad = joined.filter((pl.col("raw_close") - pl.col("close")).abs() > 0.005)
+        if not bad.is_empty():
+            publication.delete_tree(enriched_dir / f"date={ds}")
+            pruned.append(ds)
+    if owned:
+        publication.commit()
+    return pruned
 
 
 class PipelineStageError(RuntimeError):
@@ -63,12 +168,17 @@ def _resolve_universe(capset: CapabilitySet, repo=None) -> list[str]:
     repo 传入时过滤自选兜底里的指数 symbol (指数日K走独立 kline_index_* 存储,
     进股票池会污染 kline_daily/kline_minute)。ETF 刻意保留 (既有行为)。
     """
-    if capset.has(Cap.KLINE_DAILY_BATCH):
+    from app.services import preferences as _provider_preferences
+
+    if (
+        _provider_preferences.get_daily_data_provider() == "tickflow"
+        and capset.has(Cap.KLINE_DAILY_BATCH)
+    ):
         try:
             all_a = get_pool("CN_Equity_A", refresh=True)
             if all_a:
                 return sorted(all_a)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("CN_Equity_A pool unavailable, fallback: %s", e)
 
     # Free 用户兜底: instruments parquet + watchlist + demo
@@ -80,7 +190,7 @@ def _resolve_universe(capset: CapabilitySet, repo=None) -> list[str]:
         try:
             inst = pl.read_parquet(inst_path, columns=["symbol"])
             base.update(inst["symbol"].to_list())
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("instruments supplement failed: %s", e)
     # 过滤自选兜底里的指数 symbol (指数日K走独立 kline_index_* 存储,
     # 进股票池会污染 kline_daily/kline_minute)。ETF 刻意保留 (既有行为)。
@@ -109,7 +219,7 @@ def run_now(
     repo: KlineRepository,
     capset: CapabilitySet,
     on_progress: ProgressCb | None = None,
-    override_start_date: _date | None = None,
+    override_start_date: date | None = None,
 ) -> dict:
     """立即执行一次盘后管道,支持进度回调。
 
@@ -144,12 +254,46 @@ def run_now(
     #   无任何数据 → batch K-line API 拉首次 1 年
     from datetime import date as _date, timedelta as _td, datetime as _dt
     latest_daily = repo.latest_daily_date()
-    today = _date.today()
+    today = cn_today()
     today_exists = latest_daily and latest_daily >= today
     new_daily_days = 0
+
+    # 完整性自愈: 检测最近交易日的盘中快照/缺口 (盘中停机后次日开实时会留下
+    # 中午快照, 而下方"今天已有数据→只刷今天"分支会让它永久留存)。
+    # 命中 → 本次管道放弃实时覆写分支, 降级为从最早坏日起的范围拉取。
+    integrity_issues: list = []
+    stale_day: _date | None = None
+    etf_stale_day: _date | None = None
+    index_stale_day: _date | None = None
+    if override_start_date is None:
+        try:
+            from app.services import data_integrity
+            integrity_issues = data_integrity.scan_recent_integrity(
+                repo.store.data_dir, today=today,
+            )
+            if integrity_issues:
+                stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_daily",))
+                etf_stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_etf_daily",))
+                index_stale_day = data_integrity.earliest_issue_day(integrity_issues, ("kline_index_daily",))
+                logger.warning(
+                    "integrity: 检测到 %d 个不完整分区(%s), 本次管道改走范围拉取修复",
+                    len(integrity_issues), data_integrity.describe_issues(integrity_issues),
+                )
+        except Exception as e:
+            logger.warning("integrity scan failed (soft, 按无坏数据处理): %s", e)
+            integrity_issues = []
     # 日K范围拉取的起点(分支3补缺口/分支4首次/数据修正); 实时增量/跳过时为 None。
     # 供 Step 1.5 除权因子回溯范围对齐: 范围拉取→用日K范围, 非范围→最近N天兜底。
     daily_range_start: _date | None = None
+    daily_failures: list[str] = []
+
+    def _require_complete_daily_range() -> None:
+        if not daily_failures:
+            return
+        failed = sorted(set(daily_failures))
+        raise PipelineStageError([
+            f"日K范围同步不完整: {len(failed)} 只标的所在批次失败"
+        ])
 
     # A 股日K拉取开关(默认开);关闭时跳过日K同步,保留已有数据。
     # 数据修正(override_start_date)时即使关闭开关也强制拉取 — 修正就是来补数据的。
@@ -172,13 +316,22 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
+        _require_complete_daily_range()
         gap_days = (today - start_date).days
         new_daily_days = gap_days
         emit("sync_daily", 45, f"日K 完成,覆盖 {gap_days} 天")
         logger.info("sync_daily: [%s ~ %s] done, %d days", start_date, today, gap_days)
-    elif today_exists and capset.has(Cap.QUOTE_POOL) and _prefs.get_daily_data_provider() == "tickflow":
+    elif (
+        today_exists
+        and stale_day is None
+        and capset.has(Cap.QUOTE_POOL)
+        and _prefs.get_daily_data_provider() == "tickflow"
+    ):
         # 付费档:今天有数据(QuoteService 已落盘)→ 实时行情覆写,确保最新。
+        # stale_day 非空时禁用本分支: "只刷今天"会让停机日的盘中快照永久留存,
+        # 降级到下方 batch 路径从坏日起重拉。
         # free/none 档无 quote.pool 能力,即便今天已有数据(如从 expert 降级),
         # 也降级到下方 batch 路径刷新,避免调用无权限的实时行情接口。
         emit("sync_daily", 12, f"获取日K [{today} ~ {today}] 实时行情…")
@@ -186,11 +339,13 @@ def run_now(
         new_daily_days = 1
         emit("sync_daily", 45, f"日K 完成,{written_daily} 只标的")
         logger.info("sync_daily: [%s ~ %s] live quotes, %d symbols", today, today, written_daily)
-    elif latest_daily:
+    elif latest_daily or stale_day:
         # 有历史 → batch 补齐缺口。
         # 也覆盖"今天已有数据但无实时行情权限(free/none)"的降级场景:
         #   此时 start_date = latest_daily = today,batch 刷新当天日K。
-        start_date = latest_daily
+        # 完整性修复场景: start_date = min(本地最新日, 最早坏日) —
+        #   today_exists 时 latest_daily=今天, 不取 min 会漏掉坏日。
+        start_date = min(d for d in (latest_daily, stale_day) if d is not None)
         daily_range_start = start_date
         emit("sync_daily", 12, f"获取日K [{start_date} ~ {today}]…")
         logger.info("sync_daily: [%s ~ %s] %s", start_date, today,
@@ -204,7 +359,9 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
+        _require_complete_daily_range()
         gap_days = (today - start_date).days
         new_daily_days = gap_days
         emit("sync_daily", 45, f"日K 完成,覆盖 {gap_days} 天")
@@ -224,11 +381,29 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
+        _require_complete_daily_range()
         new_daily_days = 365
         emit("sync_daily", 45, "日K 完成")
         logger.info("sync_daily: [%s ~ %s] done", start_date, today)
     _invalidate("daily")
+
+    # 完整性修复时删除股票 enriched 的坏分区: 增量重算只算 enriched 里不存在
+    # 的日期, 盘中快照日分区已存在(虽是错的), 不删永远不会被重算。删除后
+    # Step 2 把这些日期当"新日期"重算 (剩余分区最近 60 天做历史前缀, 窗口 ≤5 天回看充足)。
+    repair_start = override_start_date if override_start_date is not None else stale_day
+    if repair_start is not None:
+        try:
+            from app.services.data_integrity import prune_enriched_partitions
+            pruned = prune_enriched_partitions(
+                repo.store.data_dir, repair_start, "kline_daily_enriched",
+            )
+            if pruned:
+                logger.info("integrity: 已删除 %d 个待重算的 enriched 分区 (≥ %s)", pruned, repair_start)
+        except Exception as e:
+            logger.warning("enriched prune failed (soft): %s", e)
+
 
     # 单标的新鲜度: 全局 max(date) 会被任一有今日数据的标的"拉高", 掩盖停牌/复牌/
     # 一直拉失败而掉队的个股缺口(全局判据只刷"今天", 永不回补掉队标的的历史缺口)。
@@ -253,8 +428,6 @@ def run_now(
     written_adj = 0
     affected_symbols: list[str] = []
     adj_provider = _prefs.get_adj_factor_provider()
-    if adj_provider == "same_as_daily":
-        adj_provider = _prefs.get_daily_data_provider()
     can_sync_adj = capset.has(Cap.ADJ_FACTOR) or adj_provider != "tickflow"
     if can_sync_adj:
         from datetime import datetime, timedelta
@@ -295,7 +468,7 @@ def run_now(
     #     - 首次 (enriched 目录不存在) → 全量
     #     - 往前扩展历史 (新日期 < enriched 已有最早日期) → 全量
     #       前面的除权因子会改变累积因子链,影响后面所有日期的复权价格
-    #     - 往后新增日期 (新日期 > enriched 已有最晚日期)
+    #     - 往后新增日期或已有历史区间内的缺口
     #       → 增量补新区块(所有标的) + 受除权影响个股全日期重算
     #     - 无新日期 + 有新除权因子 → 增量: 只重算受影响个股的全部日期
     #     - 无新日期 + 无变化 → 跳过
@@ -305,6 +478,35 @@ def run_now(
     daily_days = len(list(daily_dir.glob("date=*"))) if daily_dir.exists() else 0
     prev_enriched_days = len(list(enriched_dir.glob("date=*"))) if enriched_exists else 0
 
+    # 部分分区修复 (#223) + 收盘价过期分区修复: 删除被实时合并提前创建、覆盖不全
+    # 或收盘价停留在竞价前快照的 enriched 分区, 让下方计数比较与增量计算把它们
+    # 重新当新日期处理 (值级比对以官方日线为准, 实时源不纠错也能自愈)
+    enriched_publication: EnrichedPublication | None = None
+    if enriched_exists:
+        enriched_publication = EnrichedPublication(
+            repo.store.data_dir,
+            "stock",
+            recover=True,
+            scope="pipeline-prune-and-rebuild",
+            allow_scope_takeover=True,
+        )
+        partial_pruned = _prune_partial_enriched_partitions(
+            daily_dir, enriched_dir, enriched_publication
+        )
+        stale_pruned = _prune_stale_price_partitions(
+            daily_dir, enriched_dir, publication=enriched_publication
+        )
+        pruned_dates = sorted(set(partial_pruned) | set(stale_pruned))
+        if pruned_dates:
+            logger.warning(
+                "compute_enriched: 发现 %d 个异常 enriched 分区 (覆盖不全 %d / 收盘价过期 %d), "
+                "已删除待重算: %s",
+                len(pruned_dates), len(partial_pruned), len(stale_pruned),
+                ", ".join(pruned_dates[:10]),
+            )
+            enriched_exists = enriched_dir.exists() and any(enriched_dir.glob("date=*"))
+            prev_enriched_days = len(list(enriched_dir.glob("date=*"))) if enriched_exists else 0
+
     # 判断新日期方向: 找 daily 和 enriched 的日期集合做比较
     forward_incremental = False
     backward_extension = False
@@ -313,15 +515,14 @@ def run_now(
         daily_dates = sorted(d.stem.split("=")[1] for d in daily_dir.glob("date=*"))
         enriched_dates = sorted(d.stem.split("=")[1] for d in enriched_dir.glob("date=*"))
         earliest_enriched = enriched_dates[0]
-        latest_enriched = enriched_dates[-1]
         new_dates = set(daily_dates) - set(enriched_dates)
         if new_dates:
             # 有新日期早于 enriched 最早日期 → 往前扩展
             if any(d < earliest_enriched for d in new_dates):
                 backward_extension = True
-            # 有新日期晚于 enriched 最晚日期 → 往后新增
-            if any(d > latest_enriched for d in new_dates):
-                forward_incremental = True
+            # 包含中间被删的异常分区; 没有新增末日也必须补算。
+            # 往前扩展仍由下方优先走全量分支。
+            forward_incremental = True
 
     def _enriched_batch_progress(cur: int, tot: int) -> None:
         emit("compute_enriched", 65 + int(23 * cur / tot),
@@ -332,7 +533,10 @@ def run_now(
         emit("compute_enriched", 65, "全量计算 enriched…")
         logger.info("compute_enriched: full rebuild (first=%s, backward=%s, daily=%d, enriched=%d)",
                     not enriched_exists, backward_extension, daily_days, prev_enriched_days)
-        written_enriched = run_pipeline(on_batch_done=_enriched_batch_progress)
+        written_enriched = run_pipeline(
+            on_batch_done=_enriched_batch_progress,
+            publication=enriched_publication,
+        )
         new_enriched_days = len(list(enriched_dir.glob("date=*")))
         emit("compute_enriched", 88, f"enriched 完成,覆盖 {new_enriched_days} 天")
         logger.info("compute_enriched: full rebuild done, %d days", new_enriched_days)
@@ -348,6 +552,7 @@ def run_now(
             new_dates_only=True,
             symbols=symbols_to_recompute or None,
             on_batch_done=_enriched_batch_progress,
+            publication=enriched_publication,
         )
         new_enriched_days = len(list(enriched_dir.glob("date=*")))
         emit("compute_enriched", 88, f"enriched 完成,覆盖 {new_enriched_days} 天")
@@ -356,11 +561,17 @@ def run_now(
         # 无新日期,仅除权因子变更 → 只重算受影响个股的全部日期
         emit("compute_enriched", 65, f"增量计算 enriched ({len(affected_symbols)} 只个股)…")
         logger.info("compute_enriched: adj_factor incremental, %d symbols", len(affected_symbols))
-        written_enriched = run_pipeline(symbols=affected_symbols, on_batch_done=_enriched_batch_progress)
+        written_enriched = run_pipeline(
+            symbols=affected_symbols,
+            on_batch_done=_enriched_batch_progress,
+            publication=enriched_publication,
+        )
         emit("compute_enriched", 88, f"enriched 完成,{len(affected_symbols)} 只个股")
     else:
         written_enriched = 0
         logger.info("compute_enriched: skip (no new daily, no adj_factor changes)")
+    if enriched_publication is not None:
+        enriched_publication.commit()
     _refresh_single_view(repo, "kline_enriched")
     _invalidate("enriched")
 
@@ -391,11 +602,15 @@ def run_now(
                     d.name[5:] for d in index_dir.glob("date=*")
                     if d.is_dir() and d.name.startswith("date=")
                 ) if index_dir.exists() else []
-                # 数据修正模式下用传入起点; 否则用本地指数最新日期补到今天
+                # 数据修正模式下用传入起点; 否则用本地指数最新日期补到今天;
+                # 完整性修复时起点再提前到最早坏日 (实时写过今天的指数分区时,
+                # "最新日期=今天"会让停机日的快照/缺口永久留存)
                 if override_start_date:
                     index_start = override_start_date
                 else:
                     index_start = _date.fromisoformat(index_dates[-1]) if index_dates else today - _td(days=365)
+                if index_stale_day is not None and index_start > index_stale_day:
+                    index_start = index_stale_day
 
                 def _index_chunk(cur: int, tot: int) -> None:
                     emit("sync_index", 88, f"指数日K批次 {cur}/{tot}",
@@ -456,6 +671,9 @@ def run_now(
                     if d.is_dir() and d.name.startswith("date=")
                 ) if etf_dir.exists() else []
                 etf_start = _date.fromisoformat(etf_dates[-1]) if etf_dates else today - _td(days=365)
+                # 同指数: 完整性修复时把 ETF 起点提前到最早坏日
+                if etf_stale_day is not None and etf_start > etf_stale_day:
+                    etf_start = etf_stale_day
 
                 def _etf_chunk(cur: int, tot: int) -> None:
                     emit("sync_index", 88, f"ETF 日K批次 {cur}/{tot}",
@@ -537,10 +755,46 @@ def run_now(
                 invalidate_regime_cache()
                 logger.info("compute_regime: %d days", regime_days)
             emit("compute_regime", 92, f"市场环境 {regime_days} 天")
+            # 阶段切换推送监控通知 (软失败, 不影响管道): 仅推送本次重算且发生在
+            # 当前业务日的切换；历史回填/stale 修复不得重放旧通知。
+            # 切入退潮/冰点为风险信号, 用 warn 级别; 其余 info。
+            if regime_days:
+                try:
+                    computed_dates = set(
+                        new_regime["date"].cast(pl.Date).to_list()
+                    ) if "date" in new_regime.columns else set()
+                    _push_phase_change_alert(
+                        repo.store.data_dir,
+                        computed_dates=computed_dates,
+                    )
+                except Exception as e:
+                    logger.warning("phase change alert failed (soft): %s", e)
         except Exception as e:  # noqa: BLE001
             logger.warning("compute_regime failed (soft): %s", e)
             stage_errors.append(f"compute_regime: {e}")
             skipped.append("regime")
+
+    # Step 2.7: 市场主线(概念/行业涨停梯队聚合) 增量计算 — regime 同开关。
+    # 只窄扫连板 >=1 的行, 增量通常 1 天, 开销可忽略。软失败: 不阻断主管道。
+    mainline_rows = 0
+    if not _prefs_regime.get_pipeline_regime_enabled():
+        skipped.append("mainline")
+    else:
+        try:
+            emit("compute_mainline", 93, "计算市场主线…")
+            from app.services import market_mainline
+            for _kind in ("concept", "industry"):
+                rows = market_mainline.compute_mainline_incremental(
+                    repo, repo.store.data_dir, kind=_kind
+                )
+                mainline_rows += rows.height if not rows.is_empty() else 0
+            if mainline_rows:
+                logger.info("compute_mainline: %d rows", mainline_rows)
+            emit("compute_mainline", 94, f"市场主线 {mainline_rows} 行")
+        except Exception as e:
+            logger.warning("compute_mainline failed (soft): %s", e)
+            stage_errors.append(f"compute_mainline: {e}")
+            skipped.append("mainline")
 
     # Step 3: 刷新视图
     emit("refresh_views", 95, "刷新 DuckDB 视图…")
@@ -561,7 +815,10 @@ def run_now(
         "etf_adj_factor_symbols": etf_adj_symbols,
         "minute_rows": written_minute,
         "regime_days": regime_days,
+        "mainline_rows": mainline_rows,
         "lagging_symbols": len(lagging_symbols),
+        "integrity_repair_from": repair_start.isoformat() if repair_start else None,
+        "integrity_issues": len(integrity_issues),
         "skipped_stages": skipped,
         "stage_errors": stage_errors,
     }
@@ -626,37 +883,90 @@ def _refresh_instruments_view(repo: KlineRepository) -> None:
         logger.warning("refresh instruments view failed: %s", e)
 
 
-def _run_tracked(fn, job_label: str) -> None:
+def _push_phase_change_alert(data_dir, *, computed_dates: set[date]) -> None:
+    """情绪周期阶段切换 → 推送监控通知(SSE toast + 监控中心)。
+
+    阶段切换(如 退潮→冰点)是重要的市场信号, 原先只有打开市场环境页才能看到。
+    复用 quote_service.push_alerts 广播通道; 未发生切换静默返回。
+    """
+    from app.services.market_phase import PHASE_LABELS
+    from app.services.regime_builder import latest_phase_transition
+
+    tr = latest_phase_transition(data_dir)
+    if not tr:
+        return
+    prev, cur, d = tr
+    try:
+        transition_date = date.fromisoformat(d)
+    except ValueError:
+        logger.warning("invalid phase transition date: %s", d)
+        return
+    if transition_date != cn_today() or transition_date not in computed_dates:
+        return
+    msg = f"情绪周期阶段切换: {PHASE_LABELS.get(prev, prev)} → {PHASE_LABELS.get(cur, cur)} ({d})"
+    severity = "warn" if cur in ("ebb", "ice") else "info"
+    app_state = _get_app_state()
+    qs = getattr(app_state, "quote_service", None) if app_state else None
+    if qs:
+        qs.push_alerts([{
+            "source": "market",
+            "type": "phase_change",
+            "message": msg,
+            "severity": severity,
+        }])
+    logger.info("phase change alert: %s (severity=%s)", msg, severity)
+
+
+def _run_tracked(fn, job_label: str) -> bool:
     """调度触发时包装 JobStore 跟踪，确保同步历史有记录。
 
     单飞: 若已有活跃(pending∨running)任务(手动同步中), 本次调度直接跳过, 不并发。
     重任务执行槽: 再挡一层僵尸并发(reap 后线程仍活时不得并行写 parquet)。
+    返回 True 仅表示任务已成功并且执行槽已释放。
     """
-    from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
+    from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
 
     job_id, is_new = job_store.create()
     if not is_new:
         logger.info("scheduled %s 跳过: 已有活跃任务在运行 (job_id=%s)", job_label, job_id)
-        return
-    if not try_acquire_run_slot():
+        return False
+    if not try_acquire_run_slot(job_id):
         logger.warning("scheduled %s 跳过: 重任务执行槽被占用(疑似上次任务卡死)", job_label)
         job_store.fail(job_id, f"scheduled {job_label} skipped: 已有数据任务在运行")
-        return
+        return False
 
     def progress(stage: str, pct: int, msg: str, stage_pct: int | None = None,
                  skip_log: bool = False) -> None:
         job_store.progress(job_id, stage, pct, msg, stage_pct=stage_pct, skip_log=skip_log)
 
+    succeeded = False
     try:
-        job_store.start(job_id)
-        result = fn(on_progress=progress)
+        result = run_with_capacity(job_id, lambda: fn(on_progress=progress))
         job_store.succeed(job_id, result)
+        succeeded = True
         logger.info("scheduled %s completed: job_id=%s", job_label, job_id)
+    except JobCancelledError:
+        # 已由 terminate() 标记失败(卡死/手动取消), 拉取线程在分块回调处自行退出
+        logger.warning("scheduled %s cancelled: job_id=%s", job_label, job_id)
     except Exception:
         logger.exception("scheduled %s failed: job_id=%s", job_label, job_id)
         job_store.fail(job_id, f"scheduled {job_label} failed")
     finally:
-        release_run_slot()
+        release_run_slot(job_id)
+    return succeeded
+
+
+def _scheduled_pipeline_task(pipeline_fn) -> None:
+    """Run weekly mining only after the tracked daily pipeline has fully succeeded."""
+    if not _run_tracked(pipeline_fn, "daily_pipeline"):
+        return
+    try:
+        from app.services.mining_schedule import run_weekly_mining
+
+        result = run_weekly_mining(_get_app_state())
+        logger.info("scheduled mining result: %s", result)
+    except Exception:
+        logger.exception("scheduled mining enqueue failed; daily pipeline remains succeeded")
 
 
 # ================================================================
@@ -716,9 +1026,11 @@ async def _run_scheduled_review(repo) -> None:
             quote_service.push_review_event(json.dumps(
                 {"type": "done", "archived": True}, ensure_ascii=False))
 
-        # 推送到飞书(可选): 运行时读取配置, 用户改设置下次触发即生效。
+        # 推送门控: review_push_mode=manual 时定时复盘只归档不推送,
+        # 由用户对当日报告显式确认后才推; auto 时保持既有自动推送行为。
         # 失败静默降级, 不影响已归档的报告。
-        _maybe_push_review(content, meta)
+        if _prefs.get_review_push_mode() == "auto":
+            _maybe_push_review(content, meta)
     except Exception as e:  # noqa: BLE001
         logger.exception("scheduled review failed: %s", e)
         # 兜底: 异常时通知前端停止「生成中」状态, 避免页面卡在 streaming
@@ -742,6 +1054,7 @@ async def _stream_review_with_retry(repo, quote_service, depth_service) -> tuple
     """
     import asyncio
     import json
+
     from app.services.market_recap import recap_market_stream
 
     max_attempts = 3  # 初次 + 2 次重试
@@ -798,11 +1111,12 @@ def _maybe_push_review(content: str, meta: dict) -> None:
     """复盘报告归档后, 按 review_push_channels 选定的外部工具逐个推送完整报告。
 
     定时生成与手动生成共用本函数 (手动归档端点 POST /api/market-recap/reports 也会调用)。
-    channels 为空则不推送; 'feishu' 复用监控中心的全局飞书 Webhook 通道。
+    channels 为空则不推送; 复用监控中心的全局外部渠道配置。
     推送失败静默降级 (Webhook 是辅助通道), 不影响已归档的报告。
     """
     try:
-        from app.services import preferences, webhook_adapter
+        from app import secrets_store
+        from app.services import email_adapter, preferences, webhook_adapter
 
         channels = preferences.get_review_push_channels()
         if not channels:
@@ -834,6 +1148,33 @@ def _maybe_push_review(content: str, meta: dict) -> None:
                     url, "每日复盘", full_body
                 )
                 logger.info("review push(wecom) %s", "sent" if ok else "failed")
+            elif ch == "custom":
+                url = preferences.get_custom_webhook_url()
+                if not url:
+                    logger.info("review push(custom) skipped: webhook not configured")
+                    continue
+                ok = webhook_adapter.send_custom(
+                    url,
+                    "每日复盘",
+                    content,
+                    "market_review",
+                    meta,
+                    secrets_store.get_custom_webhook_secret(),
+                )
+                logger.info("review push(custom) %s", "sent" if ok else "failed")
+            elif ch == "email":
+                config = preferences.get_email_smtp_config()
+                if not email_adapter.is_configured(config):
+                    logger.info("review push(email) skipped: SMTP not configured")
+                    continue
+                email_body = (f"{subtitle}\n\n{content}" if subtitle else content)
+                ok = email_adapter.send_email(
+                    config,
+                    secrets_store.get_email_smtp_password(),
+                    "每日复盘",
+                    email_body,
+                )
+                logger.info("review push(email) %s", "sent" if ok else "failed")
             # 未来更多渠道在此追加分支
     except Exception as e:  # noqa: BLE001
         logger.warning("review push error: %s", e)
@@ -861,11 +1202,27 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
     )
 
 
+def _run_scheduled_pipeline_with_refresh(
+    repo: KlineRepository,
+    fallback_capset: CapabilitySet,
+    on_progress: ProgressCb | None = None,
+) -> dict:
+    """在暂停实时行情的同一边界内运行定时管道并恢复 Repository。"""
+    app_state = _get_app_state()
+    capset_live = getattr(app_state, "capabilities", None) or fallback_capset
+    quote_service = getattr(app_state, "quote_service", None)
+    return run_enriched_job_with_repository_refresh(
+        repo,
+        lambda: run_now(repo, capset_live, on_progress=on_progress),
+        quote_service,
+    )
+
+
 def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOScheduler:
     """启动调度器。
 
     工作日 09:10 — 同步个股维表
-    工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 15:30）
+    工作日 HH:MM — 盘后管道（时间由用户偏好决定，默认 15:35）
     """
     from app.services import preferences
     sched = preferences.get_pipeline_schedule()
@@ -898,25 +1255,10 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         # 整体少算一档 (仅手动触发或重启才会刷缓存, cron 调度路径此前漏了这步)。
         # 用 app.state 上的**实时** capset(周期重探会热更新它), 而非启动时捕获的
         # 旧 capset —— 否则 Key 中途过期/续费后, 调度管道仍按旧档位打端点。
-        app_state = _get_app_state()
-        capset_live = getattr(app_state, "capabilities", None) or capset
-        # 管道运行期间暂停实时行情取数, 防止覆写同一批 parquet 竞态
-        qs = getattr(app_state, "quote_service", None)
-        try:
-            if qs:
-                with qs.paused():
-                    result = run_now(repo, capset_live, on_progress=on_progress)
-            else:
-                result = run_now(repo, capset_live, on_progress=on_progress)
-        finally:
-            # 即便有阶段软失败(run_now 末尾抛 PipelineStageError), 已落盘的日K/enriched
-            # 仍需刷进内存缓存, 否则 live_agg 基准列停留在旧交易日。放 finally 保证部分
-            # 成功也生效; 随后异常继续上抛, 由 _run_tracked 标记任务 failed。
-            repo.refresh_cache()
-        return result
+        return _run_scheduled_pipeline_with_refresh(repo, capset, on_progress)
 
     scheduler.add_job(
-        lambda: _run_tracked(_pipeline_then_refresh, "daily_pipeline"),
+        lambda: _scheduled_pipeline_task(_pipeline_then_refresh),
         trigger=CronTrigger(day_of_week="mon-fri",
                             hour=sched["hour"], minute=sched["minute"],
                             timezone="Asia/Shanghai"),

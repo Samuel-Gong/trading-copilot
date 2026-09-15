@@ -110,7 +110,7 @@ def current_mode() -> str:
     """供 UI 显示当前模式。三态:
 
     - "none"    : 无 key / 无效 key(走 free-api,仅历史日K)
-    - "free"    : 免费有效 key(走 free-api,仅历史日K)
+    - "free"    : 免费有效 key(历史走 free-api,实时按自选标的走付费端点)
     - "api_key" : 付费 key(starter+,走付费端点,有实时行情)
     """
     if not secrets_store.get_tickflow_key():

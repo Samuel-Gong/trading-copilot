@@ -2,45 +2,35 @@
 
 本项目的几种运行方式，按推荐程度排序。配置项详解见 [configuration.md](./configuration.md)。
 
-> 📌 前置依赖:Python ≥ 3.11 · Node ≥ 20 · [`uv`](https://docs.astral.sh/uv/) · `pnpm`（`npm i -g pnpm`）
+> 📌 前置依赖(仅方式 D 需要):Python ≥ 3.11 · Node ≥ 20 · [`uv`](https://docs.astral.sh/uv/) · `pnpm`（`npm i -g pnpm`）
 
 ---
 
-## 方式 A:Dev 模式(二次开发推荐)
+## 方式 A:GHCR 现成镜像(免本地构建,多数用户推荐)
 
-由于刚开源近期更新频繁,推荐开发模式运行,可随时 `git pull` 同步最新代码。
+upstream 发布的多架构镜像不包含本仓库独有功能。本仓库生产环境使用下述 UCloud 流程；仅体验 upstream 时可直接拉取镜像：
 
 ```bash
-git clone https://github.com/shy3130/tickflow-stock-panel.git
-cd tickflow-stock-panel
-cp .env.example .env       # 按需填 TICKFLOW_API_KEY(留空 = None 模式)
-./dev.sh                   # Windows: .\dev.ps1
+docker run -d --name tsp -p 3018:3018 -v ${PWD}/data:/app/data ghcr.io/shy3130/tick-stock-panel:latest
+# 打开 http://localhost:3018
 ```
 
-`dev.sh` 自动检查 / 下载依赖、释放端口、同时起前后端,Ctrl-C 一并关闭。默认:
+- 需要配置时:从 `.env.example` 复制出 `.env`,命令里加 `--env-file .env`。
+- 镜像默认**不含** stock-sdk 插件(合规考虑),也不含 `legacy-cpu` / `backtest` extras —— 老 CPU(无 AVX2)或需要 vectorbt 回测时,请用方式 B 通过 `BACKEND_EXTRAS` 自构建。
+- 运行本仓库修改过的代码请使用方式 B 本地构建。
+- 想要 compose 全套挂载(`.env` / `tiers.yaml` / 数据卷):参考根目录 `docker-compose.yml`,把 `build:` 段换成 `image: ghcr.io/shy3130/tick-stock-panel:latest`。
 
-- 后端 → <http://localhost:3018> · 前端 → <http://localhost:3011>
-- 自定义端口:`BACKEND_PORT=8000 FRONTEND_PORT=5173 ./dev.sh`
-- 启动器会清除父进程继承的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 及其小写变量，依赖安装、后端和前端直接联网；`NO_PROXY`/`no_proxy` 固定为 `127.0.0.1,localhost,::1`。系统内执行 `codex exec` 时会单独强制注入 `CODEX_PROXY_URL`，不继承后端进程的代理状态。
-
-前端 Vite 配置中的 `server.proxy` 只负责把浏览器同源的 `/api` 和 `/health` 请求转发到本机 FastAPI，不是外网代理，因此继续保留。
-
-### 手动分别启动(不想用 dev.sh)
+更新到新版本:
 
 ```bash
-# 后端
-cd backend && uv sync --extra backtest   # 含回测依赖
-# 老 CPU: uv sync --extra legacy-cpu
-# 老 CPU + 回测: uv sync --extra legacy-cpu --extra backtest
-uv run uvicorn app.main:app --reload --port 3018
-
-# 前端
-cd frontend && pnpm install && pnpm dev   # http://localhost:3011
+docker pull ghcr.io/shy3130/tick-stock-panel:latest
+docker rm -f tsp
+# 重新执行上面的 docker run
 ```
 
 ---
 
-## 方式 B:UCloud 源码发布(当前生产环境)
+## 本仓库:UCloud 源码发布(当前生产环境)
 
 UCloud 生产环境不使用 Docker，也不在服务器工作目录执行 `git pull`。正式流程使用 GitHub Actions 构建经过校验的发布包，在服务器按 Git SHA 安装独立 `.venv`，由 systemd 运行并通过 Nginx 暴露服务；部署时自动备份数据、探活并在失败时回滚。release 目录由服务用户持有，以避免默认 `uv` cache 的共享 inode 被递归所有权变更污染。生产机和 `ubuntu` 管理账号视为可信运维边界，不另用文件权限强制 release 不可变。
 
@@ -48,7 +38,8 @@ UCloud 生产环境不使用 Docker，也不在服务器工作目录执行 `git 
 
 ---
 
-## 方式 C:Docker(其他用户可选)
+
+## 方式 B:Docker Compose(本地构建,全套挂载)
 
 ```bash
 cp .env.example .env
@@ -80,6 +71,44 @@ docker compose up --build -d
 
 ---
 
+## 方式 C:本机 AI 代部署(小白推荐)
+
+装一个本机 AI 编程助手(Trae / Codex / OpenCode / ZCode / WorkBuddy 等,任选其一),把 [README · 快速开始](../README.md#-快速开始) 里方式 C 的提示词原样发给它,AI 会自动完成克隆、装依赖、启动服务。适合完全不想碰命令行的用户;AI 最终执行的仍是方式 A / B / D 之一。
+
+---
+
+
+## 方式 D:Dev 模式(二次开发推荐)
+
+由于刚开源近期更新频繁,推荐开发模式运行,可随时 `git pull` 同步最新代码。
+
+```bash
+git clone https://github.com/shy3130/tick-stock-panel.git
+cd tick-stock-panel
+cp .env.example .env       # 按需填 TICKFLOW_API_KEY(留空 = None 模式)
+./dev.sh                   # Windows: .\dev.ps1
+```
+
+`dev.sh` 自动检查 / 下载依赖、释放端口、同时起前后端,Ctrl-C 一并关闭。默认:
+
+- 后端 → <http://localhost:3018> · 前端 → <http://localhost:3011>
+- 自定义端口:`BACKEND_PORT=8000 FRONTEND_PORT=5173 ./dev.sh`
+
+### 手动分别启动(不想用 dev.sh)
+
+```bash
+# 后端
+cd backend && uv sync --extra backtest   # 含回测依赖
+# 老 CPU: uv sync --extra legacy-cpu
+# 老 CPU + 回测: uv sync --extra legacy-cpu --extra backtest
+uv run uvicorn app.main:app --reload --port 3018
+
+# 前端
+cd frontend && pnpm install && pnpm dev   # http://localhost:3011
+```
+
+---
+
 ## 老 CPU 兼容(avx2/fma 缺失)
 
 如果运行时报 `avx2`/`fma` 缺失,或进程 `exit 132`,说明 CPU 不支持 AVX2 指令集(常见于老 VPS)。解决:
@@ -102,11 +131,13 @@ vectorbt → numba 体积较大,作为可选 extras(`uv sync --extra backtest`)�
 
 ## 更新代码(已部署用户必读)
 
-拉取新版本只需一条命令:
+拉取新版本只需一条命令(Dev / Compose 本地构建用户):
 
 ```bash
 git pull
 ```
+
+> 用方式 A 镜像直跑(无本地仓库)的用户:`docker pull ghcr.io/shy3130/tick-stock-panel:latest` 后删除旧容器重跑;compose 换 `image:` 的用户执行 `docker compose pull && docker compose up -d`。
 
 **整个 `data/` 目录都不纳入 git** —— 行情 K线、财务、自选、回测、监控记录,乃至概念/行业扩展数据,全部是程序运行时生成/拉取的用户数据,`git pull` 物理上无法影响它们。新用户首次启动时,概念/行业两份扩展数据会自动从远程接口拉取,无需任何手动操作。
 
@@ -134,7 +165,7 @@ git pull
 在 `.env` 文件(或 Docker / 系统环境变量)里设置 `AUTH_PASSWORD`:
 
 ```bash
-AUTH_PASSWORD=你的密码
+AUTH_PASSWORD='你的密码'
 ```
 
 然后重启服务。启动时会自动:
@@ -149,6 +180,7 @@ AUTH_PASSWORD=你的密码
 
 - **密码至少 6 位**,否则会被跳过并记一条 warning 日志
 - **仅在未设过密码时生效**。已设过密码后,改这里不会覆盖(避免重启时重置你在 UI 改的密码)
+- Docker Compose 需为 2.30+；项目以 `env_file.format: raw` 按字面值注入密码，不会把完整 `.env` 挂入应用容器
 - `.env` 文件权限保持 `600`,**不要提交到 Git**
 - 明文密码只存在于 `.env` / 环境变量中,落盘的是哈希,安全性等同 `auth.json`
 
