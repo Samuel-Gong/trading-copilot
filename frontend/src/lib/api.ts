@@ -965,6 +965,14 @@ export interface ScreenerCachedSummary {
 }
 
 /** run_all 渐进式返回: 快策略已算完, 慢策略后台继续算 */
+export interface ScreenerRunStatus {
+  run_id: string
+  pending: string[]
+  errors: Record<string, string>
+  done: boolean
+  error: string | null
+}
+
 export interface ScreenerRunAllSummary {
   as_of: string | null
   results: Record<string, ScreenerResultSummary>
@@ -976,6 +984,8 @@ export interface ScreenerRunAllSummary {
   error?: string | null
   /** 本次执行起点 (Unix ms, 后端时钟), 用于判断缓存结果是否属于本轮 */
   started_at?: number | null
+  run_id?: string
+  errors?: Record<string, string>
 }
 
 export interface ScreenerCachedResult {
@@ -3375,6 +3385,8 @@ export const api = {
     request<ScreenerRunAllSummary & { results: Record<string, ScreenerRunAllResult> }>(
       '/api/screener/run_all', { method: 'POST', timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS, body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe: '1d', summary_only: summaryOnly, ext_columns: extColumns || null }) },
     ),
+  screenerRunStatus: (runId: string) =>
+    request<ScreenerRunStatus>(`/api/screener/run_status?run_id=${encodeURIComponent(runId)}`, { quiet: true }),
   screenerCachedSummary: () =>
     request<ScreenerCachedSummary>('/api/screener/cached-summary'),
   screenerExport: (strategyIds: string[], asOf: string) =>

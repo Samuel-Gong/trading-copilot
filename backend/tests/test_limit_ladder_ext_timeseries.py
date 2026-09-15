@@ -73,6 +73,7 @@ def _write_timeseries_ext(data_dir, partitions: dict[str, pl.DataFrame]) -> pl.D
 def _request(data_dir, view_df: pl.DataFrame):
     repo = SimpleNamespace(
         store=SimpleNamespace(data_dir=data_dir, db=_FakeDB(view_df)),
+        enriched_latest_date=lambda: _AS_OF,
     )
     state = SimpleNamespace(repo=repo, depth_service=_NoDepth())
     return SimpleNamespace(app=SimpleNamespace(state=state))
@@ -123,7 +124,8 @@ def test_timeseries_ext_column_does_not_duplicate_ladder_rows(tmp_path, _stub_en
     assert stocks[0]["concept_ts__concept"] == "最新概念"
 
 
-def test_snapshot_ext_column_still_joins(tmp_path, _stub_enriched):
+@pytest.mark.parametrize("as_of", [_AS_OF, date(2026, 9, 9)])
+def test_snapshot_ext_column_still_joins(tmp_path, _stub_enriched, as_of):
     """snapshot 模式扩展表照常挂列 (回归保护)。"""
     cfg_dir = tmp_path / "ext_data" / "concept_snap"
     cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -141,11 +143,25 @@ def test_snapshot_ext_column_still_joins(tmp_path, _stub_enriched):
 
     payload = screener_api.limit_ladder(
         _request(tmp_path, snap),
-        as_of=_AS_OF,
+        as_of=as_of,
         direction="up",
         ext_columns="concept_snap.concept",
     )
 
     stocks = payload["tiers"][0]["stocks"]
     assert len(stocks) == 1
-    assert stocks[0]["concept_snap__concept"] == "人工智能"
+    assert stocks[0].get("concept_snap__concept") == ("人工智能" if as_of == _AS_OF else None)
+
+
+@pytest.mark.parametrize("past", [None, "2026-09-08"])
+def test_historical_ladder_never_reads_future_partition(tmp_path, _stub_enriched, past):
+    partitions = {"2026-09-10": pl.DataFrame({"symbol": ["600000.SH"], "concept": ["未来概念"]})}
+    if past:
+        partitions[past] = pl.DataFrame({"symbol": ["600000.SH"], "concept": ["历史概念"]})
+    view_df = _write_timeseries_ext(tmp_path, partitions)
+    result = screener_api.limit_ladder(
+        _request(tmp_path, view_df), as_of=date(2026, 9, 9), direction="up",
+        ext_columns="concept_ts.concept",
+    )
+    stock = result["tiers"][0]["stocks"][0]
+    assert stock.get("concept_ts__concept") == ("历史概念" if past else None)

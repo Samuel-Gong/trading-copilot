@@ -61,11 +61,12 @@ def _request(tmp_path, engine):
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
-def _wait_cache_results(tmp_path, want_ids, timeout=8.0) -> dict:
+def _wait_cache_results(tmp_path, want_ids, timeout=8.0, *, run_id=None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
         results = (strategy_cache.read_cache(tmp_path) or {}).get("results") or {}
-        if all(i in results for i in want_ids):
+        status = strategy_run_queue.MANAGER.get_status(run_id, str(tmp_path.resolve())) if run_id else None
+        if all(i in results for i in want_ids) and (run_id is None or (status and status["done"])):
             return results
         time.sleep(0.05)
     return (strategy_cache.read_cache(tmp_path) or {}).get("results") or {}
@@ -101,7 +102,7 @@ def test_run_all_returns_fast_first_then_background_fills_cache(
     assert isinstance(resp["started_at"], int)
 
     # 后台继续: 慢策略最终也落进缓存, 且带 computed_at
-    results = _wait_cache_results(tmp_path, ["fast_a", "fast_b", "slow_c"])
+    results = _wait_cache_results(tmp_path, ["fast_a", "fast_b", "slow_c"], run_id=resp["run_id"])
     assert set(results) == {"fast_a", "fast_b", "slow_c"}
     assert all(r.get("computed_at") for r in results.values())
 
@@ -155,8 +156,9 @@ def test_run_all_second_run_orders_by_recorded_timings(
     assert engine.executed == ["fast_b", "slow_a"]
 
 
+@pytest.mark.parametrize("reverse_ids", [False, True])
 def test_run_all_same_key_piggybacks_running_execution(
-    monkeypatch, tmp_path, fast_first_return
+    monkeypatch, tmp_path, fast_first_return, reverse_ids
 ):
     engine = _FakeEngine({"fast_a": 0.02, "slow_c": 1.2})
     monkeypatch.setattr(screener_api, "ScreenerService", _FakeService)
@@ -170,7 +172,8 @@ def test_run_all_same_key_piggybacks_running_execution(
     req = _request(tmp_path, engine)
     resp1 = screener_api.run_all(req, body)
     # 第一笔仍在后台跑 slow_c 时, 相同请求搭车: 同一起点, 不重复执行
-    resp2 = screener_api.run_all(_request(tmp_path, engine), body)
+    repeated = {**body, "strategy_ids": list(reversed(body["strategy_ids"]))} if reverse_ids else body
+    resp2 = screener_api.run_all(_request(tmp_path, engine), repeated)
     assert resp2["started_at"] == resp1["started_at"]
     assert engine.executed.count("fast_a") == 1
     _wait_cache_results(tmp_path, ["fast_a", "slow_c"])
@@ -333,3 +336,61 @@ def test_run_all_isolates_single_strategy_failure(
     assert set(results) == {"ok_a", "ok_b"}
     assert "broken" not in results
     assert "boom: schema mismatch" in (resp["errors"] or {}).get("broken", "")
+
+
+def test_progressive_keeps_generation_captured_before_loading_overrides(monkeypatch, tmp_path):
+    """读取参数期间配置失效后，旧参数结果不能以新 generation 重新入缓存。"""
+    monkeypatch.setattr(screener_api, "ScreenerService", _FakeService)
+    monkeypatch.setattr(settings, "strategy_run_all_first_return_s", 1.0)
+    engine = _FakeEngine({"fast": 0})
+
+    def changed_overrides(data_dir):
+        strategy_cache.clear_strategy_results(data_dir, {"fast"})
+        return {"fast": {"params": {"window": 5}}}
+
+    monkeypatch.setattr(screener_api.strategy_config, "list_overrides", changed_overrides)
+    response = screener_api.run_all(
+        _request(tmp_path, engine),
+        {"as_of": AS_OF, "strategy_ids": ["fast"], "summary_only": True},
+    )
+    assert response["complete"] is True
+    assert engine.executed == ["fast"]
+    assert response["results"] == {}
+    assert "fast" in response["errors"]
+    assert not (strategy_cache.read_cache(tmp_path) or {}).get("results")
+
+
+def test_run_status_reports_failure_after_first_response(monkeypatch, tmp_path):
+    """首次返回 pending 后的失败必须能查询到，无需等待前端兜底超时。"""
+    import threading
+
+    release = threading.Event()
+
+    class LateFailure(_FakeEngine):
+        def run_all(self, *args, **kwargs):
+            assert release.wait(timeout=5)
+            raise ValueError("合成后台失败")
+
+    monkeypatch.setattr(screener_api, "ScreenerService", _FakeService)
+    monkeypatch.setattr(settings, "strategy_run_all_first_return_s", 0.01)
+    monkeypatch.setattr(strategy_run_queue, "MANAGER", strategy_run_queue.StrategyRunManager())
+    request = _request(tmp_path, LateFailure({"slow": 0}))
+    try:
+        response = screener_api.run_all(request, {"strategy_ids": ["slow"], "summary_only": True})
+        run_id = response["run_id"]
+        assert response["pending"] == ["slow"]
+        assert screener_api.get_run_status(request, run_id)["pending"] == ["slow"]
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        status = screener_api.get_run_status(request, run_id)
+        if status["done"]:
+            break
+        time.sleep(0.01)
+    assert status["done"] is True
+    assert status["pending"] == []
+    assert status["errors"] == {"slow": "合成后台失败"}
+    other = _request(tmp_path / "other", request.app.state.strategy_engine)
+    assert screener_api.get_run_status(other, run_id)["errors"] == {}
+    assert screener_api.get_run_status(other, run_id)["error"]

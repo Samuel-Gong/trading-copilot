@@ -50,6 +50,7 @@ const {
   createScreenerRequestContext,
   createScreenerRequestCoordinator,
   isCurrentScreenerRequest,
+  isProgressiveResultCurrent,
   mergeScreenerRunAllStrategyIds,
   shouldPreserveScreenerConfigReruns,
 } = await import(requestCoordinatorUrl)
@@ -373,4 +374,17 @@ test('重置策略配置会通知页面清理历史批量明细', () => {
 test('切换资产类型会废弃旧请求和历史批量结果', () => {
   assert.match(pageSource, /createScreenerRequestCoordinator/)
   assert.match(pageSource, /invalidateScreenerRequests\(\)[\s\S]*?setTransientBatchResults\(null\)[\s\S]*?setAssetType\(nextAssetType\)/)
+})
+
+
+test('渐进扫描只接受同日且属于本轮的完成时间', () => {
+  const day = '2026-09-10'
+  const start = 10000
+  assert.equal(isProgressiveResultCurrent(undefined, day, start), false)
+  assert.equal(isProgressiveResultCurrent({ as_of: day }, day, start), false)
+  assert.equal(isProgressiveResultCurrent({ as_of: day, computed_at: null }, day, start), false)
+  assert.equal(isProgressiveResultCurrent({ as_of: day, computed_at: start - 1 }, day, start), false)
+  assert.equal(isProgressiveResultCurrent({ as_of: '2026-09-09', computed_at: start + 1 }, day, start), false)
+  assert.equal(isProgressiveResultCurrent({ as_of: day, computed_at: start }, day, start), true)
+  assert.equal(isProgressiveResultCurrent({ as_of: day, computed_at: start + 1 }, day, start), true)
 })

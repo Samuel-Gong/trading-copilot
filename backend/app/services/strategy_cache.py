@@ -394,8 +394,10 @@ def write_cache(
     latest_available_as_of: str | date | Callable[[], str | date | None] | None = None,
     only_latest_available: bool = False,
     expected_generation: CacheGeneration | int | None = None,
-) -> None:
+) -> bool:
     """将策略结果写入缓存文件, 同时更新今日曾命中集合。
+
+    返回 True 表示至少有结果被接受写入；版本或日期检查拒绝写入时返回 False。
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol, 并用最新行数据更新
@@ -412,7 +414,7 @@ def write_cache(
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
     with _file_lock, _process_file_lock(path):
         try:
-            _write_cache_locked(
+            return _write_cache_locked(
                 path,
                 data_dir,
                 as_of,
@@ -436,27 +438,27 @@ def _write_cache_locked(
     latest_available_as_of: str | date | Callable[[], str | date | None] | None,
     only_latest_available: bool,
     expected_generation: CacheGeneration | int | None,
-) -> None:
+) -> bool:
     """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。"""
     current_full_generation, current_strategy_generations = _read_generation_state(path)
     if expected_generation is not None:
         if isinstance(expected_generation, int):
             if expected_generation != current_full_generation:
-                return
+                return False
         else:
             full_generation, strategy_generations = expected_generation
             if full_generation != current_full_generation:
-                return
+                return False
             results = {
                 strategy_id: result
                 for strategy_id, result in results.items()
                 if strategy_generations.get(strategy_id) == current_strategy_generations.get(strategy_id, 0)
             }
             if not results:
-                return
+                return False
     elif _invalid_cache_path(path).exists():
         # tombstone 只能由在失效后重新捕获代际的任务清除, 避免旧进程重新发布。
-        return
+        return False
     # 读取旧缓存 (已持锁, 走不重入的 _read_cache_unlocked)
     old = _read_cache_unlocked(data_dir)
     old_as_of = old.get("as_of") if old else None
@@ -465,7 +467,7 @@ def _write_cache_locked(
         incoming_date = date.fromisoformat(as_of)
     except (TypeError, ValueError):
         if only_latest_available:
-            return
+            return False
         incoming_date = None
 
     try:
@@ -482,11 +484,11 @@ def _write_cache_locked(
     except Exception as e:
         if only_latest_available:
             logger.warning("无法确认最新可用交易日, 拒绝写入策略缓存: %s", e)
-            return
+            return False
         latest_available_date = None
 
     if only_latest_available and (incoming_date is None or incoming_date != latest_available_date):
-        return
+        return False
 
     if preserve_newer and old_as_of and incoming_date is not None:
         try:
@@ -494,7 +496,7 @@ def _write_cache_locked(
             if old_date > incoming_date and (
                 latest_available_date is None or old_date <= latest_available_date
             ):
-                return
+                return False
         except (TypeError, ValueError):
             # 旧缓存日期无效时允许新运行修复它。
             pass
@@ -558,3 +560,5 @@ def _write_cache_locked(
         logger.warning("写入策略缓存失败: %s", e)
         _invalidate_and_remove_cache_files(path)
         raise
+
+    return True

@@ -239,3 +239,81 @@ def test_get_ext_api_key_env_fallback(monkeypatch) -> None:
     monkeypatch.setattr("app.secrets_store.load", lambda: {})
     monkeypatch.setenv("EXT_DEMO_API_KEY", "env-key-123456")
     assert get_ext_api_key("demo") == "env-key-123456"
+
+
+@pytest.mark.parametrize("entry", ["test", "run", "scheduler", "backfill"])
+def test_query_auth_errors_are_redacted_in_all_surfaces(monkeypatch, tmp_path, caplog, entry):
+    """合成 query 密钥不得进入响应、持久化状态、历史失败明细和调度日志。"""
+    from datetime import date
+
+    import httpx
+    from fastapi import HTTPException
+
+    from app.api import ext_data as api
+
+    secret = "synthetic-query-secret"
+    request = httpx.Request("GET", f"https://example.invalid/data?apikey={secret}")
+    response = httpx.Response(503, request=request)
+    error = httpx.HTTPStatusError(f"failed URL {request.url}", request=request, response=response)
+
+    async def fail(*args, **kwargs):
+        raise error
+
+    config = _auth_config({"type": "query", "param": "apikey"}, date_param="date", enabled=True)
+    config.mode = "timeseries"
+    store = ExtConfigStore(tmp_path)
+    store.create(config)
+    monkeypatch.setattr(ext_pull, "_request_json", fail)
+    monkeypatch.setattr(api, "_request_json", fail)
+    monkeypatch.setattr("app.services.dragon_tiger._local_trading_days", lambda _: [date(2026, 1, 5)])
+    outputs = []
+    if entry in {"test", "run"}:
+        endpoint = api.test_pull if entry == "test" else api.run_pull
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(endpoint(_request(tmp_path), config.id))
+        outputs.append(str(caught.value.detail))
+    elif entry == "backfill":
+        result = asyncio.run(ext_pull.backfill_history(config, tmp_path, date(2026, 1, 5), date(2026, 1, 5)))
+        assert len(result["failed"]) == 1
+        outputs.append(str(result))
+    else:
+        scheduler = ext_pull.PullScheduler()
+        scheduler._running = True
+        scheduler._data_dir = tmp_path
+        monkeypatch.setattr(ext_pull, "_in_time_window", lambda *args: True)
+
+        async def stop(_seconds):
+            scheduler._running = False
+
+        monkeypatch.setattr(ext_pull.asyncio, "sleep", stop)
+        asyncio.run(scheduler._run_loop(config))
+    outputs.extend([store.get(config.id).to_dict().__repr__(), caplog.text])
+    assert "503" in " ".join(outputs)
+    assert all(secret not in output for output in outputs)
+
+
+@pytest.mark.parametrize("status", [200, 503])
+def test_httpx_request_log_hides_query_credentials(monkeypatch, caplog, status):
+    """httpx 自身的请求日志在成功和失败时均不得输出 query 鉴权值。"""
+    import httpx
+
+    secret = "synthetic-query-log-secret"
+    _seed_key(monkeypatch, secret)
+    client_type = httpx.AsyncClient
+
+    def transport(request):
+        assert request.url.params["apikey"] == secret
+        return httpx.Response(status, json=[])
+
+    monkeypatch.setattr(ext_pull.httpx, "AsyncClient", lambda **kw: client_type(
+        **kw, transport=httpx.MockTransport(transport),
+    ))
+    caplog.set_level("INFO", logger="httpx")
+    pull = PullConfig(url="https://example.invalid/data", auth={"type": "query", "param": "apikey"})
+    if status == 200:
+        assert asyncio.run(ext_pull._request_json(pull, "demo")) == []
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(ext_pull._request_json(pull, "demo"))
+    assert "HTTP Request" in caplog.text
+    assert secret not in caplog.text

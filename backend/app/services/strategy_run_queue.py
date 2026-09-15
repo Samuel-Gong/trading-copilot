@@ -19,6 +19,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -79,6 +80,8 @@ class StrategyRunHandle:
 
     def __init__(self, key: tuple, ordered_ids: list[str]) -> None:
         self.key = key
+        self.run_id = uuid.uuid4().hex
+        self.finished_at: float | None = None
         self.started_at_ms = int(time.time() * 1000)
         self._lock = threading.Lock()
         self._results: dict[str, dict] = {}
@@ -104,20 +107,24 @@ class StrategyRunHandle:
         with self._lock:
             self._error = message
             self._done = True
+            self.finished_at = time.monotonic()
 
     def finish(self) -> None:
         with self._lock:
             self._done = True
+            self.finished_at = time.monotonic()
 
     def snapshot(self) -> dict:
         """线程安全快照: 结果拷贝 + 剩余/逐策略错误/整体错误/完成状态。"""
         with self._lock:
             return {
+                "run_id": self.run_id,
                 "results": dict(self._results),
                 "pending": list(self._remaining),
                 "errors": dict(self._errors),
                 "error": self._error,
                 "done": self._done,
+                "finished_at": self.finished_at,
                 "started_at_ms": self.started_at_ms,
             }
 
@@ -136,6 +143,7 @@ class StrategyRunManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._handles: dict[tuple, StrategyRunHandle] = {}
+        self._statuses: dict[str, StrategyRunHandle] = {}
         self._queue: queue.Queue[tuple[StrategyRunHandle, Callable]] = queue.Queue()
         self._worker: threading.Thread | None = None
 
@@ -146,6 +154,7 @@ class StrategyRunManager:
         job: Callable[[StrategyRunHandle], None],
     ) -> StrategyRunHandle:
         with self._lock:
+            self._prune_statuses_locked()
             # 顺手清理已完成的 handle, 防止字典随不同 key 无限增长
             for k in [k for k, h in self._handles.items() if h.snapshot()["done"]]:
                 del self._handles[k]
@@ -154,9 +163,30 @@ class StrategyRunManager:
                 return existing
             handle = StrategyRunHandle(key, ordered_ids)
             self._handles[key] = handle
+            self._statuses[handle.run_id] = handle
         self._ensure_worker()
         self._queue.put((handle, job))
         return handle
+
+    def _prune_statuses_locked(self) -> None:
+        completed = sorted(
+            ((h, h.snapshot()["finished_at"]) for h in self._statuses.values()
+             if h.snapshot()["done"]),
+            key=lambda item: item[1],
+        )
+        now = time.monotonic()
+        # 已结束状态最多保留 128 份和 10 分钟，覆盖前端 8 分钟等待窗口。
+        for index, (handle, finished_at) in enumerate(completed):
+            if now - finished_at > 600 or index < len(completed) - 128:
+                self._statuses.pop(handle.run_id, None)
+
+    def get_status(self, run_id: str, data_scope: str) -> dict | None:
+        with self._lock:
+            self._prune_statuses_locked()
+            handle = self._statuses.get(run_id)
+            if handle is None or not handle.key or handle.key[0] != data_scope:
+                return None
+            return handle.snapshot()
 
     def _ensure_worker(self) -> None:
         with self._lock:

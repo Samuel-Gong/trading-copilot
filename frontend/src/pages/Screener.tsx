@@ -5,7 +5,7 @@ import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles,
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { fetchMinuteBatchIncremental } from '@/lib/minuteBatchIncremental'
 import { mergeTransientBatchResults, removeTransientBatchResults, requiresTransientBatchRows, resultsForSelectedDate, transientBatchColumnRefreshKey, transientBatchColumnRetryParams, updateTransientBatchResult, type ScreenerBatchResultSource } from '@/lib/screenerBatchResults'
-import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, isCurrentScreenerRequest, mergeScreenerRunAllStrategyIds, shouldPreserveScreenerConfigReruns, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
+import { bindScreenerRequestContext, createScreenerRequestContext, createScreenerRequestCoordinator, isCurrentScreenerRequest, isProgressiveResultCurrent, mergeScreenerRunAllStrategyIds, shouldPreserveScreenerConfigReruns, type CoordinatedRequest, type ScreenerRequestContext } from '@/lib/screenerRequestCoordinator'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus, useTradingDates } from '@/lib/useSharedQueries'
@@ -157,6 +157,7 @@ export function Screener() {
     if (!preserveReruns) configRerunStrategyIdsRef.current = []
     const context = requestContext.invalidate(next)
     const epoch = requestCoordinator.invalidate()
+    setPendingRun(null)
     runAllDateRef.current = null
     transientColumnRefreshRef.current = null
     if (preserveReruns && configRerunStrategyIdsRef.current.length > 0) {
@@ -191,7 +192,7 @@ export function Screener() {
   // 各策略显示上限 (null = 全部)
   const [strategyLimits, setStrategyLimits] = useState<Record<string, number | null>>({})
   // run_all 渐进式返回后仍在后台计算的策略 (startedAt 为后端时钟, 用于判断缓存新旧)
-  const [pendingRun, setPendingRun] = useState<{ ids: string[]; startedAt: number } | null>(null)
+  const [pendingRun, setPendingRun] = useState<{ ids: string[]; startedAt: number; runId?: string } | null>(null)
   const pendingRunIds = useMemo(() => new Set(pendingRun?.ids ?? []), [pendingRun])
 
   // 筛选条件变化时同步到 map（供切换策略时读取最新值）
@@ -243,6 +244,26 @@ export function Screener() {
     enabled: assetType === 'stock',
     refetchInterval: pendingRun ? 2000 : false,
   })
+
+  const runStatusQuery = useQuery({
+    queryKey: ['screener-run-status', pendingRun?.runId],
+    queryFn: () => api.screenerRunStatus(pendingRun!.runId!),
+    enabled: Boolean(pendingRun?.runId),
+    refetchInterval: pendingRun?.runId ? 2000 : false,
+  })
+
+  useEffect(() => {
+    const status = runStatusQuery.data
+    if (!pendingRun?.runId || status?.run_id !== pendingRun.runId) return
+    const failed = pendingRun.ids.filter(id => status.errors[id])
+    for (const id of failed) toast(`${id}：${status.errors[id]}`, 'error')
+    if (status.error) toast(status.error, 'error')
+    const rest = pendingRun.ids.filter(id => status.pending.includes(id))
+    if (status.done || rest.length !== pendingRun.ids.length) {
+      setPendingRun(status.done || !rest.length ? null : { ...pendingRun, ids: rest })
+      qc.invalidateQueries({ queryKey: QK.screenerCachedSummary })
+    }
+  }, [runStatusQuery.data, pendingRun, qc])
 
   const fullCachedQuery = useQuery({
     queryKey: QK.screenerCached(asOf, extColumnsParam),
@@ -446,10 +467,11 @@ export function Screener() {
       // 渐进式返回: 慢策略后台继续算, 开启摘要轮询逐个点亮
       setPendingRun(
         data.pending?.length
-          ? { ids: [...data.pending], startedAt: data.started_at ?? 0 }
+          ? { ids: [...data.pending], startedAt: data.started_at ?? 0, runId: data.run_id }
           : null,
       )
       if (data.error) toast(`策略计算失败：${data.error}`, 'error')
+      for (const [sid, message] of Object.entries(data.errors ?? {})) toast(`${sid}：${message}`, 'error')
       qc.invalidateQueries({ queryKey: ['screener-cached'] })
     },
   })
@@ -521,12 +543,11 @@ export function Screener() {
     setHitCounts(counts)
     setExpiredCounts(expired)
     // 渐进式: computed_at 晚于本轮起点的策略已算完, 从 pending 中移除;
-    // 无 computed_at (监控实时叠加/旧缓存) 视为新鲜。容差吸收前后端时钟差。
+    // 旧缓存和监控叠加没有本轮完成时间，不能据此结束等待。
     if (pendingRun) {
       const arrived = (id: string) => {
         const r = summaryQuery.data!.results[id]
-        if (!r || r.as_of !== asOf) return false
-        return r.computed_at == null || r.computed_at >= pendingRun.startedAt - 2000
+        return isProgressiveResultCurrent(r, asOf, pendingRun.startedAt)
       }
       const rest = pendingRun.ids.filter(id => !arrived(id))
       if (rest.length !== pendingRun.ids.length) {

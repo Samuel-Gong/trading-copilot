@@ -436,7 +436,14 @@ def _cached_with_realtime(request: Request) -> dict:
         realtime_results = monitor_engine.latest_strategy_results()
         if realtime_results:
             results = dict(cached.get("results") or {})
-            results.update(realtime_results)
+            for sid, live in realtime_results.items():
+                previous = results.get(sid) or {}
+                completed_at = (
+                    previous.get("computed_at")
+                    if previous.get("as_of") == live.get("as_of") else None
+                )
+                # 实时行情可覆盖数量和明细，但不能抹掉同日已落盘扫描的完成凭据。
+                results[sid] = {**live, "computed_at": completed_at}
             cached = dict(cached)
             cached["results"] = results
             # 有实时数据时, 以最新时间戳为准
@@ -648,6 +655,7 @@ def _run_all_progressive(
     overrides_map: dict,
     first_return_s: float,
     t_total: float,
+    generation: strategy_cache.CacheGeneration,
 ) -> dict:
     """run_all 渐进式执行: 快策略随响应先返回, 慢策略后台算完逐个落缓存。
 
@@ -655,8 +663,7 @@ def _run_all_progressive(
     搭车现有执行, 不同请求排队; HTTP 侧只轮询状态快照到首返时限。
     """
     data_dir = repo.store.data_dir
-    generation = strategy_cache.cache_generation(data_dir, all_ids)
-    key = (str(data_dir.resolve()), asset_type, timeframe, str(as_of), tuple(sorted(all_ids)), repr(generation))
+    key = (str(data_dir.resolve()), asset_type, timeframe, str(as_of), tuple(sorted(all_ids)), (generation[0], tuple(sorted(generation[1].items()))))
     ordered_ids = strategy_run_queue.order_strategy_ids(
         all_ids, strategy_run_queue.load_run_timings(data_dir)
     )
@@ -712,15 +719,20 @@ def _run_all_progressive(
                 "asset_type": asset_type,
                 "timeframe": timeframe,
             }
-            all_results[sid] = payload
             elapsed_map[sid] = (time.perf_counter() - t0) * 1000
             # 逐策略增量落盘 (write_cache 同日按 sid 合并), 前端轮询即可逐个看到
             try:
-                strategy_cache.write_cache(data_dir, str(as_of), {sid: payload},
+                accepted = strategy_cache.write_cache(data_dir, str(as_of), {sid: payload},
                     preserve_newer=True, latest_available_as_of=repo.enriched_latest_date,
                     only_latest_available=True, expected_generation=generation)
+                if accepted is False:
+                    handle.fail_one(sid, "策略配置或数据版本已变化，请重新扫描")
+                    continue
             except Exception:
                 logger.warning("run_all 渐进写入缓存失败: %s", sid, exc_info=True)
+                handle.fail_one(sid, "策略结果缓存写入失败，请重新扫描")
+                continue
+            all_results[sid] = payload
             handle.complete(sid, {k: v for k, v in payload.items() if k != "rows"})
         # 收尾: 与旧版口径一致的整体重写 + 耗时落盘供下次排序
         if all_results:
@@ -754,7 +766,19 @@ def _run_all_progressive(
         "complete": snap["done"] and not snap["error"],
         "error": snap["error"],
         "started_at": snap["started_at_ms"],
+        "run_id": snap["run_id"],
     }
+
+
+@router.get("/run_status")
+def get_run_status(request: Request, run_id: str = Query(..., min_length=1, max_length=64)):
+    """读取当前数据目录内一次渐进扫描的状态，包括首次响应后的逐策略失败。"""
+    scope = str(request.app.state.repo.store.data_dir.resolve())
+    status = strategy_run_queue.MANAGER.get_status(run_id, scope)
+    if status is None:
+        return {"run_id": run_id, "pending": [], "errors": {}, "done": True,
+                "error": "扫描状态已过期或服务已重启，请重新扫描"}
+    return {key: status[key] for key in ("run_id", "pending", "errors", "done", "error")}
 
 
 @router.post("/run_all")
@@ -852,6 +876,7 @@ def run_all(request: Request, body: Optional[dict] = None):
             overrides_map=overrides_map,
             first_return_s=first_return_s,
             t_total=t_total,
+            generation=cache_generation,
         )
 
     try:
@@ -1087,57 +1112,13 @@ def limit_ladder(
 
     df = df.with_columns(_one_word_limit_expr(status_main, df.columns).alias("is_one_word"))
 
-    # 动态 JOIN 扩展数据
-    ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []
+    # 复用策略结果的业务日期投影，历史请求不得读取未来分区或当前快照。
     ext_col_names: list[str] = []
-    if ext_specs:
-        db = repo.store.db
-        data_dir = repo.store.data_dir
-        from app.api.ext_data import _read_ext_dataframe
-        from app.services.ext_data import ExtConfigStore
-
-        ext_store = ExtConfigStore(data_dir)
-        configs = {c.id: c for c in ext_store.load_all()}
-
-        def _dedup_ext(frame: pl.DataFrame, field: str, out_col: str) -> pl.DataFrame | None:
-            """(symbol, 字段) 两列并按 symbol 去重; 缺列时返回 None。"""
-            if frame.is_empty() or "symbol" not in frame.columns or field not in frame.columns:
-                return None
-            return (
-                frame
-                .select(["symbol", field])
-                .unique(subset=["symbol"], keep="last")
-                .rename({field: out_col})
-            )
-
-        for config_id, field_name in ext_specs:
-            view_name = f"ext_{config_id}"
-            ext_col_name = f"{config_id}__{field_name}"
-            try:
-                # 扩展时序数据必须只取最新分区; 否则一个 symbol 会按历史分区数被 JOIN 放大
-                # (ext_{id} 视图覆盖 timeseries/**), 与自选股列表同口径。
-                cfg = configs.get(config_id)
-                if cfg:
-                    ext_df, _ = _read_ext_dataframe(cfg, data_dir)
-                else:
-                    ext_df = pl.from_arrow(db.query(
-                        f"SELECT symbol, {quote_ident(field_name)} FROM {view_name}"
-                    ).arrow())
-                joined = _dedup_ext(ext_df, field_name, ext_col_name)
-                if joined is not None:
-                    df = df.join(joined, on="symbol", how="left")
-                    ext_col_names.append(ext_col_name)
-            except Exception:
-                cfg = configs.get(config_id)
-                if cfg:
-                    try:
-                        ext_df, _ = _read_ext_dataframe(cfg, data_dir)
-                        joined = _dedup_ext(ext_df, field_name, ext_col_name)
-                        if joined is not None:
-                            df = df.join(joined, on="symbol", how="left")
-                            ext_col_names.append(ext_col_name)
-                    except Exception:
-                        pass
+    for out_col, values in _load_ext_value_maps(repo, ext_columns, as_of).items():
+        ext_frame = pl.DataFrame({"symbol": list(values), out_col: list(values.values())})
+        if not ext_frame.is_empty():
+            df = df.join(ext_frame, on="symbol", how="left")
+            ext_col_names.append(out_col)
 
     # 选择输出列
     cols = ["symbol", "name", "close", "change_pct", "boards", "status", consec_col, "sealed_status", "sealed_vol", "is_one_word"] + ext_col_names

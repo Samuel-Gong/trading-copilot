@@ -385,3 +385,17 @@ async def test_backfill_404_after_429_retry_counts_as_empty(tmp_path, fake_http,
     assert result["fetched"] == 1 and result["empty"] == 1
     assert result["failed"] == []
     assert fake_http.calls.count(u5) == 2  # 确认重试确实发生
+
+
+async def test_tail_date_mismatch_rejects_entire_history_partition(fake_http, tmp_path):
+    """第 21 行以后的日期也必须校验，不能把未来数据写入历史分区。"""
+    from app.services.ext_pull import fetch_and_ingest
+
+    cfg = _saved_cfg(tmp_path)
+    fake_http.responses["https://example.test/rank?date=2026-01-05"] = [
+        *[_row(f"S{i}", "2026-01-05") for i in range(25)],
+        _row("FUTURE", "2026-01-06"),
+    ]
+    with pytest.raises(ValueError, match="不一致"):
+        await fetch_and_ingest(cfg, tmp_path, target_date=date(2026, 1, 5))
+    assert not list((tmp_path / "ext_data" / cfg.id).rglob("*.parquet"))

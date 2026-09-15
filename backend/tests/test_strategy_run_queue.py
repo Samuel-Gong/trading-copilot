@@ -127,3 +127,39 @@ def test_manager_serializes_different_keys():
     _wait_done(h1, timeout=10)
     _wait_done(h2, timeout=10)
     assert overlap == []
+
+
+def test_completed_status_survives_next_run_then_expires():
+    manager = q.StrategyRunManager()
+    first = manager.get_or_submit(("scope", "a"), ["a"], lambda handle: handle.fail_one("a", "失败"))
+    _wait_done(first)
+    second = manager.get_or_submit(("scope", "b"), ["b"], lambda handle: handle.complete("b", {"total": 0}))
+    _wait_done(second)
+    assert manager.get_status(first.run_id, "scope")["errors"] == {"a": "失败"}
+    assert manager.get_status(first.run_id, "other") is None
+    first.finished_at -= 601
+    assert manager.get_status(first.run_id, "scope") is None
+    assert manager.get_status(second.run_id, "scope")["done"] is True
+
+
+def test_long_queued_run_keeps_status_after_completion(monkeypatch):
+    manager = q.StrategyRunManager()
+    entered = threading.Event()
+    release = threading.Event()
+    clock = {"now": 0.0}
+    monkeypatch.setattr(q.time, "monotonic", lambda: clock["now"])
+
+    def job(handle):
+        entered.set()
+        assert release.wait(timeout=5)
+
+    handle = manager.get_or_submit(("scope",), ["slow"], job)
+    assert entered.wait(timeout=5)
+    clock["now"] = 1200.0
+    release.set()
+    _wait_done(handle)
+    assert manager.get_status(handle.run_id, "scope")["done"] is True
+    clock["now"] = 1799.0
+    assert manager.get_status(handle.run_id, "scope") is not None
+    clock["now"] = 1801.0
+    assert manager.get_status(handle.run_id, "scope") is None

@@ -1068,6 +1068,8 @@ def set_pull_api_key(request: Request, config_id: str, body: ApiKeyReq):
 @router.post("/{config_id}/pull/test")
 async def test_pull(request: Request, config_id: str):
     """测试拉取：请求外部 API 并返回预览数据，不写入。"""
+    from app.services.ext_pull import safe_pull_error
+
     store = _store(request)
     config = store.get(config_id)
     if not config:
@@ -1090,12 +1092,14 @@ async def test_pull(request: Request, config_id: str):
             "has_symbol": bool(rows and "symbol" in rows[0]),
         }
     except Exception as e:
-        raise HTTPException(400, f"测试失败: {e}") from e
+        raise HTTPException(400, f"测试失败: {safe_pull_error(e)}") from e
 
 
 @router.post("/{config_id}/pull/run")
 async def run_pull(request: Request, config_id: str):
     """手动触发一次拉取并写入。"""
+    from app.services.ext_pull import safe_pull_error
+
     store = _store(request)
     config = store.get(config_id)
     if not config:
@@ -1123,9 +1127,9 @@ async def run_pull(request: Request, config_id: str):
             from datetime import datetime, timezone
             failed.pull.last_run = datetime.now(timezone.utc).isoformat()
             failed.pull.last_status = "error"
-            failed.pull.last_message = str(e)[:200]
+            failed.pull.last_message = safe_pull_error(e)
             store.update(failed)
-        raise HTTPException(400, f"拉取失败: {e}") from e
+        raise HTTPException(400, f"拉取失败: {safe_pull_error(e)}") from e
 
 
 @router.post("/{config_id}/backfill")
@@ -1140,6 +1144,8 @@ async def backfill_history_ep(
     前提: 配置为 timeseries 模式且拉取配置了 date_param (接口支持按日期
     查询)。幂等 —— 已存在的分区跳过, 失败单日不中断, 结果逐项返回。
     """
+    from app.services.ext_pull import safe_pull_error
+
     store = _store(request)
     config = store.get(config_id)
     if not config:
@@ -1155,7 +1161,7 @@ async def backfill_history_ep(
     try:
         result = await backfill_history(config, _data_dir(request), start_d, end_d)
     except ValueError as e:
-        raise HTTPException(400, str(e)) from e
+        raise HTTPException(400, safe_pull_error(e)) from e
     _refresh_views(request)
     return {"status": "ok", **result}
 

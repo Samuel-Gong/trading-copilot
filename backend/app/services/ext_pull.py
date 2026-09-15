@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from datetime import UTC, date, datetime, timedelta, timezone
 from functools import reduce
@@ -218,7 +219,7 @@ def _assert_rows_date(rows: list[dict], day: date) -> None:
     ?date= 的接口)。date 字段缺省的接口不做校验。
     """
     want = day.isoformat()
-    for r in rows[:20]:
+    for r in rows:
         if not isinstance(r, dict):
             continue
         raw = r.get("date")
@@ -229,6 +230,27 @@ def _assert_rows_date(rows: list[dict], day: date) -> None:
                 f"接口返回的日期 {str(raw)[:10]!r} 与请求日期 {want} 不一致 "
                 "(接口可能不支持日期参数), 已拒绝写入该分区"
             )
+
+
+class _PullRequestLogFilter(logging.Filter):
+    """httpx 请求摘要也可能包含 query 密钥，统一隐藏 URL 后再交给日志处理器。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = re.sub(r"https?://[^\s\"'<>]+", "[URL已隐藏]", record.getMessage())
+        record.args = ()
+        return True
+
+
+logging.getLogger("httpx").addFilter(_PullRequestLogFilter())
+
+
+def safe_pull_error(exc: Exception) -> str:
+    """面向响应、状态和日志的错误摘要，不暴露请求 URL 中的鉴权信息。"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"外部接口返回 HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.RequestError):
+        return f"外部请求失败 ({type(exc).__name__})"
+    return re.sub(r"https?://[^\s\"'<>]+", "[URL已隐藏]", str(exc))[:200]
 
 
 async def _request_json(pull: PullConfig, config_id: str, day: date | None = None) -> Any:
@@ -390,7 +412,7 @@ async def backfill_history(
                 # 返回 404 —— 视为该日无数据跳过, 不计入失败
                 empty += 1
             elif _status_code(e) != 429:
-                failed.append({"date": d.isoformat(), "reason": str(e)[:200]})
+                failed.append({"date": d.isoformat(), "reason": safe_pull_error(e)})
             else:
                 # 服务端按分钟配额限流: 退避后原地重试一次; 连续多日 429
                 # 说明配额窗口已耗尽, 中止剩余天数 (幂等, 重跑即可续补)。
@@ -413,9 +435,9 @@ async def backfill_history(
                     if _status_code(e2) == 404:  # 退避重试后无该日快照 → 同样视为无数据
                         empty += 1
                     else:
-                        failed.append({"date": d.isoformat(), "reason": str(e2)[:200]})
+                        failed.append({"date": d.isoformat(), "reason": safe_pull_error(e2)})
         except Exception as e:
-            failed.append({"date": d.isoformat(), "reason": str(e)[:200]})
+            failed.append({"date": d.isoformat(), "reason": safe_pull_error(e)})
         if i + 1 < len(days):
             await asyncio.sleep(_BACKFILL_DAY_INTERVAL_S)  # 限速, 对数据源礼貌
     return {
@@ -571,9 +593,9 @@ class PullScheduler:
                     if fresh2 and fresh2.pull:
                         fresh2.pull.last_run = datetime.now(timezone.utc).isoformat()
                         fresh2.pull.last_status = "error"
-                        fresh2.pull.last_message = str(e)[:200]
+                        fresh2.pull.last_message = safe_pull_error(e)
                         store.upsert(fresh2, keep_strategy_cache=True)
-                    logger.warning("PullScheduler: %s error: %s", config.id, e)
+                    logger.warning("PullScheduler: %s error: %s", config.id, safe_pull_error(e))
 
                 # 间隔取自最新配置 (每次重新读取, 修复改间隔不生效)
                 interval = max(pull.schedule_minutes * 60, 60)  # 至少 60s
