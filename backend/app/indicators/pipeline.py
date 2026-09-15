@@ -494,16 +494,21 @@ def compute_indicators(
 
     # Pass 3: KDJ
     if "kdj_k" in want:
-        _kdj_rsv = (
-            100 * (pl.col("close") - pl.col("_kdj_ln"))
-            / (pl.col("_kdj_hn") - pl.col("_kdj_ln")).fill_null(1e-12)
+        # 9 日内最高价=最低价 (场内货币 ETF、长期无成交标的) 时分母是 0 而不是空值,
+        # fill_null 拦不住: 0/0 得到 NaN, 再被 ewm 递推永久传染。与矩阵路径口径一致 ——
+        # 该日 RSV 置空, EWM 跳过空值后继续递推。
+        _kdj_range = pl.col("_kdj_hn") - pl.col("_kdj_ln")
+        _kdj_rsv = pl.when(_kdj_range > 0).then(
+            100 * (pl.col("close") - pl.col("_kdj_ln")) / _kdj_range
         )
         df = df.with_columns([
-            _kdj_rsv.ewm_mean(alpha=1.0 / 3, adjust=False).over("symbol").alias("kdj_k"),
+            _kdj_rsv.ewm_mean(alpha=1.0 / 3, adjust=False, ignore_nulls=True)
+            .over("symbol").alias("kdj_k"),
         ])
     if "kdj_d" in want:
         df = df.with_columns([
-            pl.col("kdj_k").ewm_mean(alpha=1.0 / 3, adjust=False).over("symbol").alias("kdj_d"),
+            pl.col("kdj_k").ewm_mean(alpha=1.0 / 3, adjust=False, ignore_nulls=True)
+            .over("symbol").alias("kdj_d"),
         ])
     if "kdj_j" in want:
         df = df.with_columns([
@@ -694,6 +699,11 @@ def compute_signals(df: pl.DataFrame, needed: set[str] | None = None) -> pl.Data
         df = df.with_columns([expressions[name] for name in SIGNAL_DEPENDENCIES if name in want])
 
     # 自定义信号（用户配置的字段+运算符+值组合，编译为布尔列）。
+    # 扩展表数值列先行 join (ext_ 因子列 = 帧上已有列): 信号条件与评分引用
+    # 都按列存在性解析。历史多日帧仅注入时序模式 —— 快照代表"最新值",
+    # 历史回看注入会引入未来数据 (CONTRIBUTING §5.3)。
+    from app.factors import ext_factors
+    df = ext_factors.attach_ext_columns(df, include_snapshot=False)
     # 条件引用的注册表因子列先复用评分物化管线补算 (虚拟/自定义/复合均可)。
     from app.strategy import custom_signals
     exprs = _get_custom_signal_exprs()
@@ -825,9 +835,13 @@ def compute_limit_signals(
     else:
         authoritative_date = pl.col("date") == pl.col("date").max()
     if "limit_up" in df.columns:
+        # >0 与实时路径 (_compute_limit_signals_today) 同守卫: 维表 limit_up 为 0
+        # (数据源未提供该字段的占位值) 不是权威价, 直接采用会让 raw_close >= -0.005
+        # 恒成立, 全部标的被判涨停。
         effective_limit_up = pl.when(
             authoritative_date
             & pl.col("limit_up").is_not_null()
+            & (pl.col("limit_up") > 0)
             & (pl.col("limit_up") < _SENTINEL)
         ).then(pl.col("limit_up")).otherwise(pl.col("_theoretical_limit_up"))
     else:
@@ -836,6 +850,7 @@ def compute_limit_signals(
         effective_limit_down = pl.when(
             authoritative_date
             & pl.col("limit_down").is_not_null()
+            & (pl.col("limit_down") > 0)
             & (pl.col("limit_down") < _SENTINEL)
         ).then(pl.col("limit_down")).otherwise(pl.col("_theoretical_limit_down"))
     else:
@@ -1425,12 +1440,13 @@ def compute_enriched_history_window(
     instruments: pl.DataFrame | None = None,
     historical_shares: pl.DataFrame | None = None,
     sym_batch: int | None = None,
+    *,
+    include_instrument_metadata: bool = False,
 ) -> pl.DataFrame:
     """按 symbol 分批执行历史窗口计算: 指标 → 偏离列 → 信号 → 涨跌停。
 
-    与整帧顺序执行完全等价 (各步骤均 over("symbol") 分组), 分批只约束
-    峰值内存: repository._refresh_enriched 的 300 天窗口在 5500 只、
-    210 交易日下整帧宽表 ~1.2GB, 小内存机器启动即 OOM (#208)。
+    分批约束计算中间表, 最终完整历史仍常驻内存。排序和可选元数据关联
+    均在单批完成, 避免合并后再复制整张宽表。
     sym_batch 显式传入时跳过自适应 (测试用)。
     """
     if df_hist.is_empty() or "symbol" not in df_hist.columns:
@@ -1454,9 +1470,52 @@ def compute_enriched_history_window(
                 else historical_shares
             )
             part = compute_limit_signals(part, inst_batch, historical_shares=shares_batch)
-        parts.append(part)
-    out = parts[0] if len(parts) == 1 else pl.concat(parts, how="diagonal_relaxed")
-    return out.sort(["symbol", "date"])
+            if include_instrument_metadata:
+                inst_cols = [c for c in ("name", "total_shares", "float_shares")
+                             if c in inst_batch.columns and c not in part.columns]
+                if inst_cols:
+                    part = part.join(
+                        inst_batch.select("symbol", *inst_cols).unique(subset=["symbol"]),
+                        on="symbol", how="left",
+                    )
+        # 连续、互不重叠的已排序 symbol 批次, 拼接后天然有序。
+        parts.append(part.sort(["symbol", "date"]))
+    return parts[0] if len(parts) == 1 else pl.concat(parts, how="diagonal_relaxed", rechunk=False)
+
+
+def _compute_storage_batches(
+    raw: pl.DataFrame,
+    *,
+    factors: pl.DataFrame,
+    instruments: pl.DataFrame,
+    historical_shares: pl.DataFrame,
+) -> pl.DataFrame:
+    """保留完整标的历史输入, 单批计算宽表后仅累积落盘窄表。"""
+    from app.services import preferences
+
+    if raw.is_empty():
+        return _select_storage_cols(raw)
+    symbols = raw["symbol"].unique().sort().to_list()
+    rows_per_sym = max(1, -(-raw.height // len(symbols)))
+    batch_size = _adaptive_sym_batch(preferences.get_enriched_batch_size(), rows_per_sym)
+    parts = []
+    for start in range(0, len(symbols), batch_size):
+        batch = symbols[start:start + batch_size]
+        part = compute_enriched(
+            raw.filter(pl.col("symbol").is_in(batch)),
+            factors=factors.filter(pl.col("symbol").is_in(batch)) if not factors.is_empty() else factors,
+            instruments=(instruments.filter(pl.col("symbol").is_in(batch))
+                         if not instruments.is_empty() else instruments),
+            historical_shares=(historical_shares.filter(pl.col("symbol").is_in(batch))
+                               if not historical_shares.is_empty() else historical_shares),
+        )
+        # 下一批开始前释放宽表; 分区发布仍在所有计算批次成功之后。
+        if not part.is_empty():
+            parts.append(_select_storage_cols(part))
+        del part
+    if not parts:
+        return _select_storage_cols(raw.head(0))
+    return pl.concat(parts, how="diagonal_relaxed", rechunk=False)
 
 
 def run_pipeline(data_dir: Path | None = None,
@@ -1561,7 +1620,7 @@ def run_pipeline(data_dir: Path | None = None,
             else:
                 raw_full = raw_new
 
-            enriched_new = compute_enriched(
+            enriched_new = _compute_storage_batches(
                 raw_full,
                 factors=factors,
                 instruments=instruments,
@@ -1592,6 +1651,7 @@ def run_pipeline(data_dir: Path | None = None,
                     written += date_df.height
                 t_write_new = _t.perf_counter()
                 logger.info("增量写入: %.2fs, %d 行", t_write_new - t_new, written)
+            del raw_new, hist_df, raw_full, enriched_new
 
         # 3. 受除权因子影响的个股: 重算全部已有日期 (累积因子链变了)
         if symbols:
@@ -1603,7 +1663,7 @@ def run_pipeline(data_dir: Path | None = None,
                 factors_sym = factors.filter(pl.col("symbol").is_in(list(sym_set))) if not factors.is_empty() else factors
                 inst_sym = instruments.filter(pl.col("symbol").is_in(list(sym_set))) if not instruments.is_empty() else instruments
                 shares_sym = historical_shares.filter(pl.col("symbol").is_in(list(sym_set))) if not historical_shares.is_empty() else historical_shares
-                enriched_sym = compute_enriched(
+                enriched_sym = _compute_storage_batches(
                     raw_sym,
                     factors=factors_sym,
                     instruments=inst_sym,
@@ -1724,7 +1784,7 @@ def run_pipeline(data_dir: Path | None = None,
             if not enriched.is_empty():
                 if symbols:
                     # 局部模式: 直接按日期合并写入
-                    for date_df in enriched.partition_by("date"):
+                    for date_df in _select_storage_cols(enriched).partition_by("date"):
                         dt = date_df["date"][0]
                         ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
                         out = base / f"date={ds}" / "part.parquet"
@@ -2174,6 +2234,12 @@ def compute_enriched_today(
         "_has_history_state",
     ]
     df = df.drop([c for c in drop_cols if c in df.columns])
+
+    # 扩展表数值列注入: 当日单日帧, 时序按当日分区对齐 + 快照最新值
+    # (include_snapshot 仅此处为 True —— 单日帧不存在"回看历史"的未来函数问题)。
+    # 帧缓存由 ext_factors 按分区/文件签名管理, 写入端变更自动失效。
+    from app.factors import ext_factors
+    df = ext_factors.attach_ext_columns(df, include_snapshot=True)
 
     # 自定义信号（日级实时路径同样注入, 但不支持日期偏移条件 → allow_shift=False）
     # 复用模块级缓存 _custom_signal_exprs_today: 增量热路径每秒级执行,

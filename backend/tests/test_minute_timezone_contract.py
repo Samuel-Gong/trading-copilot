@@ -171,7 +171,7 @@ def _setup_custom_provider(monkeypatch, provider: object) -> None:
 
 
 def test_custom_provider_utc_naive_frame_fails_closed(monkeypatch):
-    """插件返回无时区 UTC 墙钟帧 → 拒绝，不猜测且不跨源回退。"""
+    """插件返回无时区 UTC 墙钟帧 → 拒绝，不猜测并允许 TickFlow 回退。"""
     mock_provider = MagicMock()
     mock_provider.get_minute = MagicMock(return_value=_minute_frame(
         [datetime(2026, 1, 15, 1, 30), datetime(2026, 1, 15, 5, 0)]))
@@ -181,12 +181,12 @@ def test_custom_provider_utc_naive_frame_fails_closed(monkeypatch):
         ["600519.SH"], datetime(2026, 1, 15, 9, 25), datetime(2026, 1, 15, 15, 5),
         asset_type="stock",
     )
-    assert fallback is False
-    assert df.is_empty()
+    assert fallback is True
+    assert df is None
 
 
 def test_custom_provider_garbage_datetime_fails_closed(monkeypatch):
-    """插件返回无法识别口径 → 返回空帧且不越界回退 TickFlow。"""
+    """插件返回无法识别口径 → 返回空帧且允许回退 TickFlow。"""
     mock_provider = MagicMock()
     mock_provider.get_minute = MagicMock(return_value=_minute_frame(
         [datetime(2026, 1, 15, 21, 30)]))
@@ -196,5 +196,5 @@ def test_custom_provider_garbage_datetime_fails_closed(monkeypatch):
         ["600519.SH"], datetime(2026, 1, 15, 9, 25), datetime(2026, 1, 15, 15, 5),
         asset_type="stock",
     )
-    assert fallback is False
-    assert df is not None and df.is_empty()
+    assert fallback is True
+    assert df is None

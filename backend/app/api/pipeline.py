@@ -14,6 +14,7 @@ from app.services.pipeline_jobs import (
     JobCancelledError,
     job_store,
     release_run_slot,
+    run_with_capacity,
     try_acquire_run_slot,
 )
 
@@ -53,7 +54,6 @@ async def run_now(request: Request) -> dict:
         # 管道运行期间暂停实时行情取数, 防止覆写同一批 parquet 竞态
         qs = getattr(request.app.state, "quote_service", None)
         try:
-            job_store.start(job_id)
             loop = asyncio.get_event_loop()
 
             def progress(stage: str, pct: int, msg: str, stage_pct: int | None = None,
@@ -71,7 +71,7 @@ async def run_now(request: Request) -> dict:
                     qs,
                 )
 
-            result = await loop.run_in_executor(_long_task_executor, _run)
+            result = await loop.run_in_executor(_long_task_executor, run_with_capacity, job_id, _run)
             job_store.succeed(job_id, result)
             invalidate_storage_cache()
         except JobCancelledError:

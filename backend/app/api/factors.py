@@ -96,8 +96,6 @@ def trial_formula(req: FormulaTrialRequest, request: Request) -> dict:
 
     fundamental_names = sorted(fundamental_dependencies(compiled.referenced_factors))
     base_columns = ["symbol", "date", "open", "high", "low", "close", "volume", "amount", "turnover_rate"]
-    if "pb_latest" in fundamental_names:
-        base_columns.append("raw_close")
     if "consecutive_limit_ups" in compiled.dependencies:
         base_columns.append("consecutive_limit_ups")
     engine = _get_engine(request)
@@ -470,8 +468,6 @@ def _trial_nonempty(request: Request, formula: str, asset_type: str = "stock") -
     calendar_days = int((compiled.warmup_bars + 40) * 1.6) + 15
     fundamental_names = sorted(fundamental_dependencies(compiled.referenced_factors))
     base_columns = ["symbol", "date", "open", "high", "low", "close", "volume", "amount", "turnover_rate"]
-    if "pb_latest" in fundamental_names:
-        base_columns.append("raw_close")
     engine = _get_engine(request)
     today = cn_today()
     panel = engine.load_panel(

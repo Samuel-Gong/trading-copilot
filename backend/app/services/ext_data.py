@@ -1,6 +1,7 @@
 """扩展数据服务 — 配置管理 + 文件解析 + Parquet 存储。"""
 from __future__ import annotations
 
+import codecs
 import copy
 import json
 import logging
@@ -71,13 +72,20 @@ class ExtField:
         return cls(d["name"], d.get("dtype", "string"), d.get("label", ""))
 
 
+# 日期参数值的序列化格式 (date_format):
+#   iso=YYYY-MM-DD (默认) / compact=YYYYMMDD / ts_s=unix秒 / ts_ms=unix毫秒
+# 时间戳约定为该交易日北京时间 00:00:00
+PULL_DATE_FORMATS = ("iso", "compact", "ts_s", "ts_ms")
+
+
 class PullConfig:
     """定时拉取配置。"""
     __slots__ = (
         "url", "method", "headers", "body", "response_path",
         "field_map", "schedule_minutes", "enabled",
         "last_run", "last_status", "last_message", "last_rows",
-        "next_run", "time_window_start", "time_window_end",
+        "next_run", "time_window_start", "time_window_end", "date_param",
+        "date_format", "auth",
     )
 
     def __init__(
@@ -97,6 +105,9 @@ class PullConfig:
         next_run: str | None = None,
         time_window_start: str | None = None,
         time_window_end: str | None = None,
+        date_param: str | None = None,
+        date_format: str = "iso",
+        auth: dict | None = None,
     ) -> None:
         self.url = url
         self.method = method              # GET | POST
@@ -113,6 +124,14 @@ class PullConfig:
         self.next_run = next_run            # 下次预计运行 (ISO, 调度器写入)
         self.time_window_start = time_window_start  # 每日拉取窗口起始 "HH:MM", None=不限
         self.time_window_end = time_window_end      # 每日拉取窗口结束 "HH:MM", None=不限
+        # 接口按日期查询的参数名 (如 "date"): 非 None 时请求
+        # 带 ?{date_param}={按 date_format 序列化的日期}, 支持历史回补; None = 接口只有当日快照
+        self.date_param = date_param
+        # 日期参数值的格式; config.json 被手改写入非法值时归一为 iso (fail-closed)
+        self.date_format = date_format if date_format in PULL_DATE_FORMATS else "iso"
+        # 拉取接口鉴权方式 {"type": "none|bearer|header|query", "header": ..., "param": ...},
+        # 与自定义行情源 AuthConfig 同口径; Key 本体存 secrets_store, 不落 config.json
+        self.auth = auth
 
     def to_dict(self) -> dict:
         return {
@@ -131,6 +150,9 @@ class PullConfig:
             "next_run": self.next_run,
             "time_window_start": self.time_window_start,
             "time_window_end": self.time_window_end,
+            "date_param": self.date_param,
+            "date_format": self.date_format,
+            "auth": self.auth,
         }
 
     @classmethod
@@ -153,7 +175,24 @@ class PullConfig:
             next_run=d.get("next_run"),
             time_window_start=d.get("time_window_start"),
             time_window_end=d.get("time_window_end"),
+            date_param=d.get("date_param"),
+            date_format=d.get("date_format", "iso"),
+            auth=d.get("auth"),
         )
+
+
+def ext_api_key_field(config_id: str) -> str:
+    """扩展数据拉取 API Key 在 secrets.json 中的字段名。"""
+    return f"ext_{config_id}_api_key"
+
+
+def get_ext_api_key(config_id: str) -> str:
+    """取扩展数据拉取接口的 API Key: secrets.json 优先, 环境变量 EXT_{ID}_API_KEY 兜底。"""
+    from app import secrets_store
+
+    return secrets_store.get_env_backed_secret(
+        ext_api_key_field(config_id), f"EXT_{config_id.upper()}_API_KEY"
+    )
 
 
 class ExtConfig:
@@ -309,7 +348,7 @@ class ExtConfigStore:
         except Exception:
             return None
 
-    def _write_locked(self, config: ExtConfig) -> None:
+    def _write_locked(self, config: ExtConfig, *, keep_strategy_cache: bool = False) -> None:
         config.updated_at = datetime.now().isoformat()
         revision = uuid.uuid4().hex
         payload = config.to_dict()
@@ -321,16 +360,17 @@ class ExtConfigStore:
             encoding="utf-8",
         )
         config._storage_revision = revision
+        _invalidate_ext_derived(self._base.parent, keep_strategy_cache=keep_strategy_cache)
 
-    def create(self, config: ExtConfig) -> None:
+    def create(self, config: ExtConfig, *, keep_strategy_cache: bool = False) -> None:
         """仅在 id 尚不存在时创建配置。"""
         with ext_source_update(self._base.parent), _ext_data_lock(config.id, self._base.parent):
             cp = self._config_path(config.id)
             if cp.exists():
                 raise ExtConfigChangedError(f"扩展配置 '{config.id}' 已存在")
-            self._write_locked(config)
+            self._write_locked(config, keep_strategy_cache=keep_strategy_cache)
 
-    def update(self, config: ExtConfig) -> None:
+    def update(self, config: ExtConfig, *, keep_strategy_cache: bool = False) -> None:
         """仅在磁盘修订号仍匹配时更新配置。"""
         with ext_source_update(self._base.parent), _ext_data_lock(config.id, self._base.parent):
             if config._storage_revision is None:
@@ -338,14 +378,14 @@ class ExtConfigStore:
                     f"扩展配置 '{config.id}' 缺少持久化修订号，请重新读取后更新"
                 )
             _assert_current_config(config, self._base.parent)
-            self._write_locked(config)
+            self._write_locked(config, keep_strategy_cache=keep_strategy_cache)
 
-    def upsert(self, config: ExtConfig) -> None:
+    def upsert(self, config: ExtConfig, *, keep_strategy_cache: bool = False) -> None:
         """兼容入口：无修订号时仅创建，有修订号时执行 CAS 更新。"""
         if config._storage_revision is None:
-            self.create(config)
+            self.create(config, keep_strategy_cache=keep_strategy_cache)
         else:
-            self.update(config)
+            self.update(config, keep_strategy_cache=keep_strategy_cache)
 
     def delete(self, config_id: str) -> bool:
         import shutil
@@ -359,6 +399,7 @@ class ExtConfigStore:
             shutil.rmtree(cp.parent)
             if cp.parent.exists():
                 raise OSError(f"扩展配置目录删除失败: {cp.parent}")
+            _invalidate_ext_derived(self._base.parent)
             return True
 
     def _migrate_legacy(self, old_path: Path) -> None:
@@ -520,6 +561,44 @@ def apply_config_mapping(df: pl.DataFrame, config: ExtConfig, data_dir: Path) ->
     return df
 
 
+# 编码识别与转换的分块大小，与 ext_data 上传写入用的块大小一致。
+_TRANSCODE_CHUNK_BYTES = 1024 * 1024
+
+
+def _decodes_as(file_path: Path, encoding: str) -> bool:
+    """整个文件能否按 encoding 完整解码，逐块判断，不把文件读进内存。"""
+    decoder = codecs.getincrementaldecoder(encoding)()
+    try:
+        with file_path.open("rb") as src:
+            while chunk := src.read(_TRANSCODE_CHUNK_BYTES):
+                decoder.decode(chunk)
+            decoder.decode(b"", True)  # 结尾处的半个字符也算解码失败
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _transcode_to_utf8(file_path: Path, out_path: Path, encoding: str) -> bool:
+    """按 encoding 逐块转成 UTF-8 写入 out_path；解码失败则删除半成品返回 False。
+
+    增量解码器负责跨块边界的多字节字符：GBK 一个汉字两字节，正好落在块边界
+    上时前半截会被留到下一块，不会被误判成解码失败。
+    """
+    decoder = codecs.getincrementaldecoder(encoding)()
+    try:
+        with (
+            file_path.open("rb") as src,
+            out_path.open("w", encoding="utf-8", newline="") as dst,
+        ):
+            while chunk := src.read(_TRANSCODE_CHUNK_BYTES):
+                dst.write(decoder.decode(chunk))
+            dst.write(decoder.decode(b"", True))
+    except UnicodeDecodeError:
+        out_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
 def ensure_utf8_csv(file_path: Path) -> Path:
     """确保 CSV 文件以 UTF-8 编码可读，非 UTF-8（如 GBK/GB18030）则转换。
 
@@ -530,21 +609,14 @@ def ensure_utf8_csv(file_path: Path) -> Path:
     返回值：若已是 UTF-8 则返回原路径；否则在同目录写一个 *.utf8 文件并返回它
     （调用方用临时目录，随目录一起清理）。
     """
-    raw = file_path.read_bytes()
     # BOM 处理：UTF-8-SIG 等带 BOM 文件直接交给 Polars（它认识 BOM）
-    try:
-        raw.decode("utf-8")
+    if _decodes_as(file_path, "utf-8"):
         return file_path  # 已是合法 UTF-8
-    except UnicodeDecodeError:
-        pass
     # 依次尝试常见中文编码，第一个能完整解码的即为命中
     for enc in ("gb18030", "gbk", "gb2312", "big5"):
-        try:
-            text = raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
         out_path = file_path.with_suffix(file_path.suffix + ".utf8")
-        out_path.write_text(text, encoding="utf-8")
+        if not _transcode_to_utf8(file_path, out_path, enc):
+            continue
         logger.info("CSV 编码转换 %s → %s (%s)", file_path.name, out_path.name, enc)
         return out_path
     # 都无法解码：返回原路径，让 Polars 抛出更精确的原始错误
@@ -688,6 +760,8 @@ def write_ext_parquet(
     config: ExtConfig,
     data_dir: Path,
     snapshot_date: date | None = None,
+    *,
+    keep_strategy_cache: bool = False,
 ) -> int:
     """将 DataFrame 写入扩展数据 Parquet。
 
@@ -742,7 +816,23 @@ def write_ext_parquet(
         _atomic_write_parquet(df, out_path)
         _bump_ext_data_generation(config.id, data_dir)
         logger.info("扩展表写入: %s → %s (%d 行)", config.id, out_path, len(df))
+        _invalidate_ext_derived(data_dir, keep_strategy_cache=keep_strategy_cache)
         return len(df)
+
+
+def _invalidate_ext_derived(data_dir: Path, *, keep_strategy_cache: bool = False) -> None:
+    """扩展数据/配置变更 → 扩展帧缓存 + 因子同步状态 + 策略结果缓存。
+
+    惰性导入避免与 ext_factors (反向惰性引用本模块) 构成模块级环。
+    repo 内存 enriched 缓存由 API 层 repo.clear_cache() 补充清理。
+    keep_strategy_cache 语义见 ext_factors.invalidate_ext_caches。
+    """
+    try:
+        from app.factors.ext_factors import invalidate_ext_caches
+
+        invalidate_ext_caches(data_dir, keep_strategy_cache=keep_strategy_cache)
+    except Exception as e:
+        logger.warning("扩展数据缓存失效失败: %s", e)
 
 
 def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
@@ -767,6 +857,7 @@ def delete_ext_parquet(config_id: str, data_dir: Path) -> None:
             changed = True
         if changed:
             _bump_ext_data_generation(config_id, data_dir)
+    _invalidate_ext_derived(data_dir)
 
 
 def fix_symbol_format(config: ExtConfig, data_dir: Path) -> int:
@@ -832,6 +923,8 @@ def rows_to_parquet(
     config: ExtConfig,
     data_dir: Path,
     snapshot_date: date | None = None,
+    *,
+    keep_strategy_cache: bool = False,
 ) -> int:
     """将 JSON 行列表转为 DataFrame 写入 Parquet，复用 write_ext_parquet 的存储逻辑。
 
@@ -842,4 +935,7 @@ def rows_to_parquet(
     df = apply_config_mapping(df, config, data_dir)
     if "symbol" in df.columns:
         df = df.with_columns(pl.col("symbol").cast(pl.Utf8))
-    return write_ext_parquet(df, config, data_dir, snapshot_date=snapshot_date)
+    return write_ext_parquet(
+        df, config, data_dir, snapshot_date=snapshot_date,
+        keep_strategy_cache=keep_strategy_cache,
+    )

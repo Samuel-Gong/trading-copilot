@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from app.api import screener as screener_api
 
 
@@ -48,7 +50,9 @@ def test_cached_summary_omits_rows_and_counts_realtime_expirations(monkeypatch, 
 
     payload = screener_api.get_cached_summary(_request(tmp_path, realtime))
 
-    assert payload["results"] == {"strategy_a": {"total": 2, "as_of": "2026-07-20"}}
+    assert payload["results"] == {
+        "strategy_a": {"total": 2, "as_of": "2026-07-20", "computed_at": None}
+    }
     assert payload["today_ever_counts"] == {"strategy_a": 4}
     assert "rows" not in payload["results"]["strategy_a"]
 
@@ -93,3 +97,16 @@ def test_cached_result_returns_only_requested_rows_with_ext_and_strategy_members
     assert payload["result"]["rows"] == [{"symbol": "000001.SZ", "concept.concept": "银行"}]
     assert payload["today_ever_rows"]["000002.SZ"]["concept.concept"] == "科技"
     assert payload["strategy_ids_by_symbol"] == {"000001.SZ": ["strategy_a", "strategy_b"]}
+
+
+@pytest.mark.parametrize("live_date, expected", [("2026-07-20", 1000), ("2026-07-21", None)])
+def test_realtime_summary_preserves_only_same_day_scan_completion(monkeypatch, tmp_path, live_date, expected):
+    """监控结果不伪造扫描完成时间，也不抹掉同日已经持久化的完成凭据。"""
+    monkeypatch.setattr(screener_api.strategy_cache, "read_cache", lambda _: {
+        "as_of": "2026-07-20",
+        "results": {"strategy_a": {"as_of": "2026-07-20", "total": 1, "computed_at": 1000}},
+    })
+    live = {"strategy_a": {"as_of": live_date, "total": 2, "rows": []}}
+    result = screener_api.get_cached_summary(_request(tmp_path, live))
+    assert result["results"]["strategy_a"]["computed_at"] == expected
+    assert result["results"]["strategy_a"]["total"] == 2

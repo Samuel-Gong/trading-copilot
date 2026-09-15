@@ -41,7 +41,7 @@ async def test_scheduler_waits_until_window_start_after_skip(monkeypatch, tmp_pa
         def get(self, config_id: str):
             return config if config_id == config.id else None
 
-        def update(self, _config) -> None:
+        def update(self, _config, **kwargs) -> None:
             pass
 
     scheduler = ext_pull.PullScheduler()
@@ -54,6 +54,8 @@ async def test_scheduler_waits_until_window_start_after_skip(monkeypatch, tmp_pa
         scheduler._running = False
 
     monkeypatch.setattr(ext_pull, "datetime", _FixedDateTime)
+    monkeypatch.setattr(ext_pull, "cn_now", lambda: _FixedDateTime.now(CN_TZ))
+    monkeypatch.setattr(ext_pull, "cn_today", lambda: date(2026, 8, 24))
     monkeypatch.setattr(ext_pull, "ExtConfigStore", _Store)
     monkeypatch.setattr(ext_pull.asyncio, "sleep", _sleep)
 
@@ -113,11 +115,13 @@ async def test_snapshot_partition_date_uses_beijing_calendar(monkeypatch, tmp_pa
 
     captured: list[date] = []
     monkeypatch.setattr(ext_pull, "datetime", _FixedDateTime)
+    monkeypatch.setattr(ext_pull, "cn_now", lambda: _FixedDateTime.now(CN_TZ))
+    monkeypatch.setattr(ext_pull, "cn_today", lambda: date(2026, 8, 24))
     monkeypatch.setattr(ext_pull.httpx, "AsyncClient", lambda **_kwargs: _Client())
     monkeypatch.setattr(
         ext_pull,
         "rows_to_parquet",
-        lambda rows, config, data_dir, *, snapshot_date: (
+        lambda rows, config, data_dir, *, snapshot_date, **kwargs: (
             captured.append(snapshot_date) or len(rows)
         ),
     )

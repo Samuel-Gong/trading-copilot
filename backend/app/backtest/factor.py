@@ -224,6 +224,17 @@ class FactorBacktestService:
         *,
         regime_by_date: Mapping[object, Any] | None = None,
     ) -> FactorResult:
+        from app.services.heavy_job_limiter import shared_heavy_job_limiter
+
+        with shared_heavy_job_limiter.slot("exclusive"):
+            return self._run(config, regime_by_date=regime_by_date)
+
+    def _run(
+        self,
+        config: FactorConfig,
+        *,
+        regime_by_date: Mapping[object, Any] | None = None,
+    ) -> FactorResult:
         validate_factor_asset_types([config.factor_name], config.asset_type)
         t0 = time.perf_counter()
         run_id = uuid.uuid4().hex[:10]
@@ -264,6 +275,17 @@ class FactorBacktestService:
         )
 
     def run_batch(
+        self,
+        config: FactorBatchConfig,
+        *,
+        regime_by_date: Mapping[object, Any] | None = None,
+    ) -> FactorBatchResult:
+        from app.services.heavy_job_limiter import shared_heavy_job_limiter
+
+        with shared_heavy_job_limiter.slot("exclusive"):
+            return self._run_batch(config, regime_by_date=regime_by_date)
+
+    def _run_batch(
         self,
         config: FactorBatchConfig,
         *,
@@ -439,8 +461,6 @@ class FactorBacktestService:
             "turnover_rate",
         ]
         fundamental_names = sorted(fundamental_dependencies(factor_names))
-        if "pb_latest" in fundamental_names:
-            panel_columns.append("raw_close")
         if any(
             name in ("limit_up_count_20d", "limit_up_count_60d")
             for name in factor_names
@@ -757,6 +777,14 @@ class FactorBacktestService:
             missing = sorted(required - set(panel.columns))
             logger.warning("factors %s cannot be computed, missing columns: %s", factor_cols, missing)
             return panel
+
+        # 扩展表因子 (ext_ base 条目) = 外部物化列, 指标补算管线不认识;
+        # 请求的因子集合命中时在此按 (symbol, date) 时序对齐注入 (与
+        # compute_signals 同一原语, 历史帧不含快照 → 无未来函数)。
+        from app.factors import ext_factors
+
+        if factor_cols & ext_factors.ext_factor_ids():
+            panel = ext_factors.attach_ext_columns(panel, include_snapshot=False)
 
         from app.factors.registry import get_factor
         from app.indicators.pipeline import compute_indicators

@@ -7,10 +7,14 @@
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import os
+import shutil
 import tempfile
+import time
+import uuid
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
@@ -294,6 +298,17 @@ def sync_and_persist_daily_batch(
         custom_provider: object | None,
         generation: int | None,
     ) -> int:
+        iter_daily = getattr(custom_provider, "iter_daily", None)
+        if callable(iter_daily):
+            end_time = end_date or cn_now()
+            start_time = start_date or (end_time - timedelta(days=count or 365))
+            return _persist_daily_chunks(
+                iter_daily(symbols, start_time=start_time, end_time=end_time,
+                           on_chunk_done=on_chunk_done), repo,
+                commit_guard=provider_route_commit_guard(
+                    provider_name, generation, preferences.get_daily_data_provider, "daily",
+                ),
+            )
         failures: list[str] = []
         df = fetch_daily_routed(
             symbols,
@@ -357,6 +372,50 @@ def sync_and_persist_daily_batch(
     return written
 
 
+def _persist_daily_chunks(chunks, repo: KlineRepository, *, commit_guard=None) -> int:
+    """先把流式 provider 结果写入私有 staging,完整取数后再提交正式分区。"""
+    staging_base = repo.store.data_dir / ".daily_sync_staging"
+    _sweep_stale_daily_staging(staging_base)
+    root = staging_base / uuid.uuid4().hex
+    written = 0
+    try:
+        for index, df in enumerate(chunks):
+            if df.is_empty():
+                continue
+            for date_df in df.partition_by("date"):
+                dt = date_df["date"][0]
+                ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+                out = root / f"date={ds}" / f"part-{index}.parquet"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                date_df.write_parquet(out)
+                written += date_df.height
+
+        with commit_guard if commit_guard is not None else nullcontext():
+            for date_dir in sorted(root.glob("date=*")):
+                files = sorted(date_dir.glob("*.parquet"))
+                if files:
+                    repo.append_daily(pl.scan_parquet(files).collect(engine="streaming"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            root.parent.rmdir()
+
+    return written
+
+
+def _sweep_stale_daily_staging(staging_base, max_age_s: int = 24 * 60 * 60) -> None:
+    """清理崩溃遗留的旧同步目录,不碰仍可能活跃的新目录。"""
+    if not staging_base.exists():
+        return
+    cutoff = time.time() - max_age_s
+    for run_dir in staging_base.iterdir():
+        try:
+            if run_dir.is_dir() and run_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(run_dir)
+        except OSError:
+            logger.warning("failed to clean stale daily staging: %s", run_dir)
+
+
 def sync_daily_by_quotes(repo: KlineRepository) -> int:
     """用实时行情接口拉全市场当日数据,覆写 kline_daily 今天分区。
 
@@ -389,11 +448,15 @@ def sync_daily_by_quotes(repo: KlineRepository) -> int:
             "close": q.get("last_price"),
             "volume": q.get("volume"),
             "amount": q.get("amount"),
+            # 快照时刻标记: data_integrity 靠 quote_ts 区分盘中快照与盘后权威历史,
+            # 缺失会让盘中覆写的分区在停机后被当成完整历史, 永远不进修复。
+            "quote_ts": q.get("timestamp"),
         })
 
     df = pl.DataFrame(records)
     if df.is_empty():
         return 0
+    df = df.with_columns(pl.col("quote_ts").cast(pl.Int64, strict=False))
 
     # 分区日期用北京交易日 (与 quote_service._build_daily 的 cn_today 一致),
     # 避免 UTC 服务器在盘中把日分区写成服务器本地日期。
@@ -823,9 +886,16 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
             existing = pl.read_parquet(out)
             if "datetime" in existing.columns:
                 existing = existing.filter(pl.col("datetime").is_not_null())
-            day_df = pl.concat([existing, day_df.drop("_trade_date")]).unique(
+            new_rows = day_df.drop("_trade_date")
+            # 只对本次触及的 symbol 合并去重, 未触及行原样保留: 单股补齐时避免
+            # 为合并几行数据把全市场分区整体 unique 的写放大 (issue #305)。
+            touched = new_rows["symbol"].unique().to_list()
+            same = existing.filter(pl.col("symbol").is_in(touched))
+            other = existing.filter(~pl.col("symbol").is_in(touched))
+            merged = pl.concat([same, new_rows]).unique(
                 subset=["symbol", "datetime"], keep="last",
             )
+            day_df = pl.concat([other, merged])
         else:
             day_df = day_df.drop("_trade_date")
         day_df = day_df.sort("symbol", "datetime")
@@ -850,7 +920,7 @@ def _resolve_minute_provider(
 
     返回 (provider, should_fallback_to_tickflow, error_msg):
       - provider_name == "tickflow" → (None, True, None)
-      - 显式自定义源不可用 → (None, False, error)，不越界回退 TickFlow
+      - 显式自定义源不可用 → (None, True, error)，由调用方核对能力后回退 TickFlow
       - 成功 → (provider, False, None)
 
     上层依据 error_msg 决定是否 logger.warning (区分"未配"与"异常")。
@@ -861,10 +931,10 @@ def _resolve_minute_provider(
     from app.data_providers import custom as custom_sources
     try:
         if not custom_sources.provider_has_dataset(provider_name, "minute"):
-            return (None, False, f"provider '{provider_name}' does not provide minute")
+            return (None, True, f"provider '{provider_name}' does not provide minute")
         return (True, False, None)
     except Exception as e:
-        return (None, False, str(e))
+        return (None, True, str(e))
 
 
 def _try_custom_minute(
@@ -879,8 +949,12 @@ def _try_custom_minute(
 ) -> tuple[pl.DataFrame | None, bool]:
     """尝试从自定义分钟源拉取。返回 (df, should_fallback_to_tickflow)。
 
-    只有显式选择 TickFlow 才返回 fallback=True；自定义源解析、
-    调用或契约失败都返回空帧且 fallback=False。
+    返回契约:
+      (None, True)   → 未配自定义源 / 未配 minute dataset / 自定义源异常 → 走 TickFlow
+      (df, False)    → 自定义源成功(含空 df) → 直接用, 不回退
+
+    自定义源异常时返回 fallback=True。单股拉取调用方另行检查 TickFlow 原生
+    能力, 避免自定义源增广能力误放行无权限请求。
 
     resolver 异常边界由 _resolve_minute_provider 统一兜底; 业务调用
     (provider.get_minute) 仍在本函数 try 块内, 与 resolver 异常分离
@@ -900,7 +974,7 @@ def _try_custom_minute(
         return (None, True)
     if available is None:
         logger.warning("custom minute provider %s resolution failed: %s", provider_name, err)
-        return (pl.DataFrame(), False)
+        return (None, True)
 
     # 包装 on_chunk_done: provider 调 2 参 → 补 seg_label="custom" → 转发上层 3 参
     wrapped_cb: Callable[[int, int], None] | None = None
@@ -925,14 +999,14 @@ def _try_custom_minute(
                 )
     except Exception as e:
         logger.warning("custom minute provider %s call failed: %s", provider_name, e)
-        return (pl.DataFrame(), False)
+        return (None, True)
     try:
         # 时区契约守卫: 插件/自定义源帧同样收口为北京墙钟 (CONTRIBUTING §3.3)
         df = _enforce_minute_beijing_wallclock(df, source=provider_name)
     except Exception as e:
         logger.warning("custom minute provider %s datetime 契约校验失败: %s",
                        provider_name, e)
-        return (pl.DataFrame(), False)
+        return (None, True)
     return (df, False)
 
 
@@ -1377,8 +1451,14 @@ def fetch_minute_single(
     symbol: str,
     trade_date: date,
     asset_type: AssetType = "stock",
+    *,
+    capset: CapabilitySet,
 ) -> pl.DataFrame:
-    """实时拉取单股单日分钟 K；严格使用用户选定的数据源，不跨源回退。"""
+    """实时拉取单股单日分钟 K(不写入本地)。
+
+    优先使用当前自定义分钟源。仅当 TickFlow 原生单股分钟能力存在时才允许
+    回退 TickFlow; 自定义源增广只授予 batch 能力, 不会误放行该回退路径。
+    """
     from datetime import datetime
     # 北京时间窗口必须带时区: naive datetime 会被 .timestamp() 按服务器本地时区解释,
     # UTC 容器上窗口整体偏移 8 小时, 分时补拉必然为空。
@@ -1394,6 +1474,9 @@ def fetch_minute_single(
     if not fallback:
         # 见 sync_minute_batch 同分支注释: df 在此必非 None。
         return df if df is not None else pl.DataFrame()
+
+    if not capset.has(Cap.KLINE_MINUTE_BY_SYMBOL):
+        return pl.DataFrame()
 
     tf = get_client()
     try:
@@ -1457,29 +1540,38 @@ def fetch_adj_factor_single_routed(
     return fetch_adj_factor_single(symbol)
 
 
+def _as_beijing(d: datetime) -> datetime:
+    """落盘的分钟 datetime 是北京墙钟 naive, 带上北京时区再交给取数窗口。
+
+    naive 值经 _datetime_to_ms 会被 .timestamp() 按服务器本地时区解释, 与同
+    窗口另一端的服务器本地时间混用后整体错位 (UTC 容器上错 8 小时)。
+    """
+    return d if d.tzinfo is not None else d.replace(tzinfo=CN_TZ)
+
+
 def _latest_minute_datetime(repo: KlineRepository) -> datetime | None:
-    """本地分钟 K 数据的最新时间。"""
+    """本地分钟 K 数据的最新时间 (北京时区)。"""
     try:
         res = repo.execute_one("SELECT max(datetime) FROM kline_minute")
         if res and res[0]:
             d = res[0]
             if isinstance(d, datetime):
-                return d
-            return datetime.fromisoformat(str(d))
+                return _as_beijing(d)
+            return _as_beijing(datetime.fromisoformat(str(d)))
     except Exception:  # noqa: BLE001
         pass
     return None
 
 
 def _earliest_minute_datetime(repo: KlineRepository) -> datetime | None:
-    """本地分钟 K 数据的最早时间 (用于向前扩展的起点)。"""
+    """本地分钟 K 数据的最早时间 (北京时区, 用于向前扩展的起点)。"""
     try:
         res = repo.execute_one("SELECT min(datetime) FROM kline_minute")
         if res and res[0]:
             d = res[0]
             if isinstance(d, datetime):
-                return d
-            return datetime.fromisoformat(str(d))
+                return _as_beijing(d)
+            return _as_beijing(datetime.fromisoformat(str(d)))
     except Exception:  # noqa: BLE001
         pass
     return None

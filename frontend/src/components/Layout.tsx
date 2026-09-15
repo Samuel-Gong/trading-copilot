@@ -67,6 +67,7 @@ import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 import { resolveWatchlistGroupColor } from '@/lib/watchlist-group-colors'
 import { computeGroupPcts, groupPctColor, groupPctTitle } from '@/lib/watchlistGroupStats'
 import { fmtPct } from '@/lib/format'
+import { findDataSource } from '@/lib/dataSources'
 import { toggleTheme, useTheme } from '@/lib/theme'
 import { setCurrentTotal as setAlertTotal, useUnreadAlerts } from '@/lib/monitorBadge'
 import { ExtensionSlot } from '@/extensions/ExtensionSlot'
@@ -75,7 +76,8 @@ import { getFrontendExtensionNavigation } from '@/extensions/registry'
 // 品牌色 — 只用于 logo / brand 区域,不影响功能语义色
 const BRAND = '#8B5CF6'
 
-const CORE_INDEXES = [
+// 核心四只指数 — 与后端 index_const.py 单一权威对齐 (前端展示层固定清单)
+export const CORE_INDEXES = [
   { symbol: '000001.SH', name: '上证指数' },
   { symbol: '399001.SZ', name: '深证成指' },
   { symbol: '399006.SZ', name: '创业板指' },
@@ -503,10 +505,10 @@ export function Layout() {
   const realtimeUnavailable = quoteMode === 'none'
   const isWatchlistMode = quoteMode === 'watchlist'
   const realtimeModeLabel = isWatchlistMode ? '自选股' : '全市场'
-  // 当前实时行情数据源名称 (custom 时显示源名, tickflow 时不显示)
+  // 当前实时行情数据源名称 (插件/自定义源显示源名, tickflow 不显示)
   const realtimeProvider = prefs?.realtime_data_provider
   const realtimeProviderName = realtimeProvider && realtimeProvider !== 'tickflow'
-    ? (dataSources?.custom?.find(s => s.name === realtimeProvider)?.display_name || realtimeProvider)
+    ? (findDataSource(dataSources, realtimeProvider)?.display_name || realtimeProvider)
     : null
   const realtimeToggleDisabled = toggleQuote.isPending || isPaused
   const realtimeActive = realtimeEnabled && isRunning && isTrading

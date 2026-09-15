@@ -49,7 +49,7 @@ def test_first_metrics_sync_forward_fills_snapshot_only_bps_row(
     tmp_path,
     monkeypatch,
 ):
-    """首次同步也要补齐同报告期后续观测事件的非 bps 指标。"""
+    """同报告期按最新公告聚合，缺失字段补齐后仅从最新公告次日起生效。"""
     from app.backtest.fundamentals import attach_fundamental_factors
 
     symbol = "600000.SH"
@@ -71,16 +71,17 @@ def test_first_metrics_sync_forward_fills_snapshot_only_bps_row(
 
     monkeypatch.setattr(financial_sync, "_fetch_table", fake_fetch)
 
-    assert financial_sync.sync_metrics(tmp_path, CapabilitySet()) == 2
+    assert financial_sync.sync_metrics(tmp_path, CapabilitySet()) == 1
     stored = pl.read_parquet(
         tmp_path / "financials" / "metrics" / "part.parquet"
     ).sort("announce_date")
-    assert stored["roe"].to_list() == [16.0, 16.0]
-    assert stored["bps"].to_list() == [None, 5.0]
+    assert stored["roe"].to_list() == [16.0]
+    assert stored["bps"].to_list() == [5.0]
 
     panel = pl.DataFrame({
         "symbol": [symbol, symbol],
         "date": [report_day + timedelta(days=1), observed_day + timedelta(days=1)],
+        "close": [10.0, 10.0],
         "raw_close": [10.0, 10.0],
     })
     attached = attach_fundamental_factors(
@@ -88,7 +89,7 @@ def test_first_metrics_sync_forward_fills_snapshot_only_bps_row(
         stored,
         {"roe_latest", "pb_latest"},
     )
-    assert attached["roe_latest"].to_list() == [16.0, 16.0]
+    assert attached["roe_latest"].to_list() == [None, 16.0]
     assert attached["pb_latest"].to_list() == [None, pytest.approx(2.0)]
 
 
@@ -209,10 +210,10 @@ def test_incremental_financial_sync_discovers_older_period_revision(
     rows = financial_sync.sync_metrics(tmp_path, CapabilitySet())
 
     assert calls == [(["600000.SH"], False)]
-    assert rows == 3
+    assert rows == 2
     stored = pl.read_parquet(path).sort(["period_end", "announce_date"])
     revised = stored.filter(pl.col("period_end") == "2025-09-30")
-    assert revised["roe"].to_list() == [8.0, 8.5]
+    assert revised["roe"].to_list() == [8.5]
 
 
 def test_custom_financial_provider_receives_shares_contract(monkeypatch):

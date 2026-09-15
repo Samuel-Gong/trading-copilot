@@ -132,6 +132,9 @@ def is_trading_day(now: datetime | None = None) -> bool | None:
     route_key = (provider_name, generation)
 
     with _CACHE_LOCK:
+        # 「未知」(None) 也是一个结论, 同样按 TTL 缓存 —— 它正是 _TTL_UNKNOWN_S 要
+        # 挡住的场景 (未配 fuyao 且 tickflow 不可用时, 轮询每拍都会重打一次探测)。
+        # _CACHE.day 只在探测写回时设置, 因此「当天已探过」用它判定即可。
         if (
             _CACHE.day == now.date()
             and _CACHE.route_key == route_key

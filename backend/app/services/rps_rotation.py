@@ -42,6 +42,9 @@ _CACHE_TTL = 120.0
 _CACHE_MAX_ENTRIES = 16
 _cache: dict[str, dict] = {}
 _cache_ts: dict[str, float] = {}
+# 该条目实际覆盖的天数: enriched 只读 days 换算出的日历窗口, 缓存的"全量"因此
+# 以写入时的 days 为上限, 请求更长窗口时不能复用 (见 build_rps_rotation)。
+_cache_days: dict[str, int] = {}
 
 
 def invalidate_cache() -> None:
@@ -49,6 +52,7 @@ def invalidate_cache() -> None:
     _cache.clear()
     _cache_ts.clear()
     _map_cache.clear()
+    _cache_days.clear()
 
 
 def _ext_generation_signature(repo, kind: str) -> str:
@@ -251,7 +255,11 @@ def build_rps_rotation(repo, days: int = 12, kind: str = "concept", level: int |
     now = time.time()
     _prune_result_cache(now)
     cached = _cache.get(cache_key)
-    if cached and (now - _cache_ts.get(cache_key, 0)) < _CACHE_TTL:
+    if (
+        cached
+        and _cache_days.get(cache_key, 0) >= days
+        and (now - _cache_ts.get(cache_key, 0)) < _CACHE_TTL
+    ):
         return _slice_cached(cached, days)
 
     # 1. 维度映射(symbol → 维度成员), 已按 kind 缓存为 (map_df, count) 元组 (#186)。
@@ -317,10 +325,11 @@ def build_rps_rotation(repo, days: int = 12, kind: str = "concept", level: int |
         "membership_note": _MEMBERSHIP_NOTE,
     }
 
-    # 写缓存(存全量, 按需 slice)
+    # 写缓存(存本次窗口的全量, 按需 slice; 覆盖天数一并记下)
     _cache[cache_key] = full
     _cache_ts[cache_key] = now
     _prune_result_cache(now)
+    _cache_days[cache_key] = days
 
     return _slice_cached(full, days)
 

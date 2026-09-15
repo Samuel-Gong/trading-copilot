@@ -35,6 +35,7 @@ from app.api import (
     regime,
     rps,
     screener,
+    sector_rotation,
     signals,
     stock_analysis,
     strategy,
@@ -167,6 +168,7 @@ async def _application_lifespan(app: FastAPI):
     # Provider 注册表会影响已保存路由的能力增广，必须先加载再探测。
     capset = _load_data_sources_and_capabilities(app)
 
+
     # 全局行情服务
     qs = QuoteService()
     app.state.quote_service = qs
@@ -257,6 +259,10 @@ async def _application_lifespan(app: FastAPI):
     financial_scheduler.start(store.data_dir, capset)
     app.state.financial_scheduler = financial_scheduler
 
+    # 自愈看门狗: 探测 polars 闸与写锁, 僵死时退出交由 supervisor 拉起 (兜底层)。
+    from app.watchdog import start_watchdog
+    app.state.watchdog = start_watchdog(app.state, repo)
+
     # 策略引擎
     from app.strategy.engine import StrategyEngine
     from app.strategy import config as strategy_config
@@ -303,7 +309,7 @@ async def _application_lifespan(app: FastAPI):
                     return
 
                 with shared_heavy_job_limiter.slot(
-                    "normal",
+                    "exclusive",
                     cancel_event=matrix_prewarm_owner.cancel_event,
                 ):
                     result = prewarm_matrix_cache(
@@ -379,7 +385,10 @@ async def _application_lifespan(app: FastAPI):
         yield
     finally:
         portfolio.stop_monitor_engine_sync_retry(app)
-        repo._on_refresh_done = None
+        repo._on_refresh_done = None  # noqa: SLF001
+        wd = getattr(app.state, "watchdog", None)
+        if wd:
+            await wd.stop()
         if not matrix_prewarm_owner.shutdown(timeout=5.0):
             logger.warning("matrix cache prewarm did not stop within 5 seconds")
         mmanager = getattr(app.state, "mining_manager", None)
@@ -513,6 +522,7 @@ app.include_router(monitor_rules.router)
 app.include_router(lots.router)
 app.include_router(alerts.router)
 app.include_router(rps.router)
+app.include_router(sector_rotation.router)
 
 # 二次开发路由与小粒度策略在所有核心路由后注册, 禁止覆盖核心路径。
 extension_registry, extension_load_errors = configure_backend_extensions(app)
@@ -523,8 +533,6 @@ app.state.extension_load_errors = extension_load_errors
 # 能力门控异常 → 403(而非默认 500)
 # 业务代码用 capset.require(Cap.X) 断言能力,缺失时抛 CapabilityDenied;
 # 若不注册 handler 会冒泡成 500 Internal Server Error,对前端不友好且语义错误。
-from fastapi import Request
-from fastapi.responses import JSONResponse
 from app.tickflow.capabilities import CapabilityDenied
 
 
