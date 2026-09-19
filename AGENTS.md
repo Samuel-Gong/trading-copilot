@@ -8,6 +8,7 @@
 - 保持实现简单、改动范围最小，不处理无关问题。
 - 不覆盖工作区已有修改，不虚构测试或审查结果。
 - 以实际验证结果作为完成标准。
+- 用户询问某日是否选出某只股票时，使用项目技能 [verify-production-selection](.agents/skills/verify-production-selection/SKILL.md) 核实。
 - 用户说“添加策略”或“发布策略”时，默认添加、发布到当前部署机器的自定义策略中；仅在用户明确指定本机时使用本机。按 [生产运维文档](docs/ucloud-production.md) 确认目标实例，通过现有策略保存机制操作，并核实远端持久化和运行时加载后才报告完成。
 - GitHub 认证或推送结果在 Codex 与用户终端不一致时，必须完整执行 [`GitHub 认证分层诊断`](docs/github-auth-troubleshooting.md)；连接器、`gh` CLI 与 HTTPS Git Keychain 分开判断，不能根据沙箱内单次失败要求用户重新登录。
 - 登录本地 TickFlow 面板（`localhost` / `127.0.0.1`）时，读取根目录的 [`.agent-secrets.md`](.agent-secrets.md)，其中凭据仅限本机登录使用，不得复制到提交内容、日志或对外请求。
